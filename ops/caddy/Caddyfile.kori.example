@@ -1,0 +1,92 @@
+# Caddyfile.kori.example — the ai.qouver.com block for kori.
+#
+# This file is a TEMPLATE. deploy-vps.sh renders it to
+#   /srv/qouver/apps/kori/caddy/site.caddy   (mode 0640, root:caddy, httpd_sys_content_t)
+# with __KORI_EDGE_TOKEN__ replaced by the real bearer. /etc/caddy/Caddyfile then only carries
+# one line, added once by Dimas:
+#   import /srv/qouver/apps/kori/caddy/site.caddy
+# The token never enters this repository.
+#
+# Facts this block is built on (EDGE-cloudflare.md, 2026-11-14, checked from outside):
+#   - ai.qouver.com already resolves to Cloudflare and Cloudflare already terminates client TLS.
+#   - the origin behind it is this Caddy; it answers its own 404 today.
+#   - Cloudflare SSL mode to origin must read Full (strict). Unverified from the origin side.
+#
+# qouver1 runs SELinux Enforcing and Caddy as httpd_t: files Caddy imports from /srv need
+# httpd_sys_content_t, otherwise Caddy exits 1 with "File to import not found" and no journal
+# line. And /etc/caddy/Caddyfile sets `admin off`, so `caddy reload` always fails: apply with
+# `systemctl restart caddy`.
+
+ai.qouver.com {
+	log {
+		import log_access
+	}
+
+	# Cloudflare's published ranges, listed literally. A stale list fails closed (the peer is
+	# not trusted, the request is refused), which is the direction we want. Refreshed at deploy
+	# from cloudflare.com/ips-v4 and ips-v6 — a manual step until it is scripted.
+	@cloudflare remote_ip 173.245.48.0/20 103.21.244.0/22 103.22.200.0/22 103.31.4.0/22 \
+		141.101.64.0/18 108.162.192.0/18 190.93.240.0/20 188.114.96.0/20 197.234.240.0/22 \
+		198.41.128.0/17 162.158.0.0/15 104.16.0.0/13 104.24.0.0/14 172.64.0.0/13 \
+		131.0.72.0/22 \
+		2400:cb00::/32 2606:4700::/32 2803:f800::/32 2405:b500::/32 2405:8100::/32 \
+		2a06:98c0::/29 2c0f:f248::/32
+
+	# Fail closed: a peer outside the ranges is not the proxy, so it is refused outright rather
+	# than admitted with a spoofable CF-Connecting-IP bucket.
+	@not_cloudflare not remote_ip 173.245.48.0/20 103.21.244.0/22 103.22.200.0/22 103.31.4.0/22 \
+		141.101.64.0/18 108.162.192.0/18 190.93.240.0/20 188.114.96.0/20 197.234.240.0/22 \
+		198.41.128.0/17 162.158.0.0/15 104.16.0.0/13 104.24.0.0/14 172.64.0.0/13 \
+		131.0.72.0/22 \
+		2400:cb00::/32 2606:4700::/32 2803:f800::/32 2405:b500::/32 2405:8100::/32 \
+		2a06:98c0::/29 2c0f:f248::/32
+	respond @not_cloudflare "direct origin access is not allowed" 403
+
+	# Real client address only from the trusted proxy.
+	servers {
+		trusted_proxies static 173.245.48.0/20 103.21.244.0/22 103.22.200.0/22 103.31.4.0/22 \
+			141.101.64.0/18 108.162.192.0/18 190.93.240.0/20 188.114.96.0/20 197.234.240.0/22 \
+			198.41.128.0/17 162.158.0.0/15 104.16.0.0/13 104.24.0.0/14 172.64.0.0/13 \
+			131.0.72.0/22
+		client_ip_headers CF-Connecting-IP
+	}
+
+	encode zstd gzip
+
+	# Bearer gate. One token, one caller, one bill — there is no second password anywhere.
+	@no_bearer not header Authorization "Bearer __KORI_EDGE_TOKEN__"
+	respond @no_bearer "unauthorized" 401
+
+	# The dashboard is loopback-only by decision (EDGE §3.7). Refused at the edge so a mistake
+	# inside the binary cannot expose it.
+	@admin path /admin /admin/*
+	respond @admin "not found" 404
+
+	# Rate limit per real client IP. Needs the caddy-ratelimit module, which is NOT in a stock
+	# Caddy build; Dimas owns that binary. Until it is there, the same limit is a Cloudflare rule
+	# on ai.qouver.com (per-IP, 60 requests/minute) — recorded in OPS-SHIP §4.4 as the interim.
+	# rate_limit {
+	# 	zone kori_ip {
+	# 		key {client_ip}
+	# 		events 60
+	# 		window 1m
+	# 	}
+	# 	respond "too many requests" 429
+	# }
+
+	# No caching, ever: every path is an API path or a 404.
+	header Cache-Control "no-store"
+
+	reverse_proxy 127.0.0.1:8787 {
+		# SSE must not be buffered. Anything that holds a token stream for ten seconds is a bug,
+		# not a slow provider.
+		flush_interval -1
+		# Long body deadline: a 200k-token completion can stream for minutes. The binary enforces
+		# its own six deadlines (D2); Caddy must be the looser of the two or it cuts legs that are
+		# working.
+		transport http {
+			read_timeout 15m
+			write_timeout 15m
+		}
+	}
+}
