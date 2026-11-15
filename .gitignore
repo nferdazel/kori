@@ -1,0 +1,15 @@
+# Nim build output
+nimcache/
+*.o
+/apps/api/src/kori
+/out/
+
+# apps/web/dist is committed on purpose: the CI drift check compares it against a fresh
+# `vite build`, and a plain `nim c` embeds it without needing node.
+
+# Real env files live on qouver1 only (/srv/qouver/apps/kori/env/, mode 600).
+ops/env/*.env
+!ops/env/*.env.example
+
+# Deploy state written on the host
+.deployed_rev

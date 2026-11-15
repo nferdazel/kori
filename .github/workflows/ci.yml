@@ -1,0 +1,144 @@
+name: CI
+
+# Verification gate only. It builds nothing for the server and calls no webhook: the deploy
+# happens on qouver1 through the webhook -> deploy-vps.sh path.
+#
+# Golden CI/CD contract, applied here: every job has timeout-minutes: 15, every job caches its
+# package manager, and no GitHub context expression is interpolated into a shell script — the
+# values travel through env: and are read as shell variables.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  # gitleaks-action lists a pull request's commits; with contents:read alone that call is 403
+  # and the job dies before scanning anything.
+  pull-requests: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NIM_VERSION: "2.4.2"
+  NODE_VERSION: "22"
+
+jobs:
+  web:
+    name: "Web: vite build + dist drift"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+
+      - name: Install
+        working-directory: apps/web
+        run: npm ci --no-audit --no-fund
+
+      - name: Build
+        working-directory: apps/web
+        run: npm run build
+
+      # The committed dist is what a local `nim c` embeds. If someone edits a page and forgets
+      # the build, the binary quietly serves the old dashboard — this step turns that into a red
+      # check instead of a mystery in production.
+      - name: "Dist drift: committed dist must match a fresh build"
+        run: |
+          set -eu
+          if git diff --exit-code --quiet -- apps/web/dist; then
+            echo "committed dist matches a fresh build"
+          else
+            echo "::error::apps/web/dist is stale. Run 'npm run build' in apps/web and commit the result."
+            git --no-pager diff --stat -- apps/web/dist
+            exit 1
+          fi
+
+  nim:
+    name: "Nim: check + tests"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache Nim toolchain
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.nimble
+            ~/.cache/nim
+          key: nim-${{ env.NIM_VERSION }}-${{ hashFiles('kori.nimble') }}
+          restore-keys: |
+            nim-${{ env.NIM_VERSION }}-
+
+      - name: Install Nim
+        env:
+          NIM_VERSION: ${{ env.NIM_VERSION }}
+        run: |
+          set -eu
+          curl -fsSL "https://nim-lang.org/download/nim-${NIM_VERSION}-linux_x64.tar.xz" -o /tmp/nim.tar.xz
+          mkdir -p "$HOME/nim"
+          tar -xJf /tmp/nim.tar.xz -C "$HOME/nim" --strip-components=1
+          echo "$HOME/nim/bin" >> "$GITHUB_PATH"
+
+      # The dashboard must exist before the compiler reads the generated module; without this the
+      # build embeds an empty page table and still compiles.
+      - name: "Web build (for the embed step)"
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+
+      - name: Build dashboard
+        working-directory: apps/web
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+
+      - name: Generate static module
+        run: sh tools/gen-static.sh apps/web/dist src/generated/static_files.nim
+
+      - name: Install dependencies
+        run: nimble install -d -y
+
+      - name: Check
+        run: nim check --hints:off apps/api/src/kori.nim
+
+      - name: Tests
+        run: nimble test -y
+
+      # The acceptance harness from the scope folder runs against a real binary. It is the only
+      # thing that proves the router, so it is a gate and not an optional job.
+      - name: Acceptance harness
+        env:
+          KORI_BIN: ./apps/api/src/kori
+        run: |
+          set -eu
+          nim c -d:release --mm:orc --threads:on --hints:off -o:"$KORI_BIN" apps/api/src/kori.nim
+          sh acceptance/selftest.sh
+
+  security:
+    name: "Security: secrets scan"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Every repository here is public. A leaked token is public the moment it is pushed, so the
+      # scan runs on the full history and not just the diff.
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

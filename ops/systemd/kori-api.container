@@ -1,0 +1,51 @@
+# Quadlet unit — kori-api (Nim gateway, rootless podman + systemd user).
+# Install at ~/.config/containers/systemd/kori-api.container
+#   systemctl --user daemon-reload && systemctl --user restart kori-api
+#
+# Notes that are deliberate, each one paid for on another app on this host:
+#   - `PublishPort=127.0.0.1:8787:8787`: the host exposes loopback only. Inside the container
+#     the binary must listen on 0.0.0.0, because rootless podman forwards from the bridge
+#     address (10.89.0.x); binding 127.0.0.1 inside leaves the container alive and unreachable.
+#     The spec's "never 0.0.0.0" is satisfied by the publish address, not by the in-container
+#     bind — this is the one place the wording and the runtime disagree (OPS-SHIP §4.1).
+#   - `ReadOnly=true` + `Tmpfs=/tmp`: the gateway writes exactly two things, the append-only
+#     request log and stdout. The log is a bind mount; a write to the rootfs is a bug and should
+#     fail the container, not fill a layer.
+#   - Config file is mounted read-only from the host, mode 0600, outside every repo. It holds
+#     every provider credential, so it is never baked into an image.
+#   - No HealthCmd: the runtime image has no curl or wget, and podman healthchecks run inside the
+#     container. Health is `Restart=always` plus the deploy gate on /admin/state.
+
+[Unit]
+Description=kori — in-house LLM gateway (Nim)
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+Image=localhost/kori:local
+ContainerName=kori-api
+PublishPort=127.0.0.1:8787:8787
+Pull=never
+AutoUpdate=local
+EnvironmentFile=/srv/qouver/apps/kori/env/kori-prod.env
+Volume=/srv/qouver/apps/kori/etc/config.json:/etc/kori/config.json:ro,z
+Volume=/srv/qouver/apps/kori/logs:/var/log/kori:z
+Exec=--config=/etc/kori/config.json --port=8787 --address=0.0.0.0 --log=/var/log/kori/requests.jsonl
+NoNewPrivileges=true
+DropCapability=ALL
+ReadOnly=true
+Tmpfs=/tmp:size=32m
+PidsLimit=128
+
+[Service]
+Restart=always
+# Exit 2 is "bad config" — a permanent condition; restarting just repeats it and hides the cause.
+RestartPreventExitStatus=2
+RestartSec=3
+PrivateTmp=true
+# Leak guard, not a measurement. A gateway with one upstream per request should sit in the
+# tens of MB; 512M means a leak or an unbounded buffer.
+MemoryMax=512M
+
+[Install]
+WantedBy=default.target
