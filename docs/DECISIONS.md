@@ -149,3 +149,23 @@ to be defined, observable and testable.
 **Consequences.** A config never asks for a split the binary cannot honour. Turning on
 balancing is one boolean and it is round-robin, not weighted, so there is nothing to explain
 when the traffic does not land where someone expected.
+
+## DEC-9 — A failed credential refresh stops the request instead of failing over
+
+**Status:** accepted. This is a deliberate deviation from the failover rule.
+
+**Context.** Every other leg failure walks to the next leg, so a refresh failure looks like
+one more failure to fail over from. It is not: the refresh belongs to the credential, not to
+the leg's availability, and retrying the same leg with a stale bearer or asking a different
+provider for the same work hides a broken credential behind an answer that looks served.
+
+**Decision.** When the token endpoint refuses or the refresh deadline fires, the request
+ends with `502` and `{"error":{"type":"credential_refresh_failed"}}` (or `refresh_timeout`
+when the 5 s budget was spent). No fallback leg is dialled, no stale bearer is sent, and one
+line goes to stderr. A `401` from the leg itself is different and keeps the normal rule: one
+forced refresh, one retry, then the usual classification.
+
+**Consequences.** A dead token is visible in the answer and in the log instead of being
+absorbed by the failover chain. The cost is that a broken credential takes the route down
+even when another leg could have answered, which is the point: it is an operator problem,
+not a provider problem.
