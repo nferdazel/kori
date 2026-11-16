@@ -26,6 +26,7 @@ task_ops() {
   shellcheck -S warning -x ops/scripts/*.sh tools/gen-static.sh tests/dryrun-*.sh task
   bash tests/dryrun-deploy.sh
   bash tests/dryrun-smoke.sh
+  bash tests/dryrun-preflight.sh
 }
 
 task_web() {
