@@ -109,6 +109,13 @@ function headerSentence(state: AdminState): { text: string; dead: boolean } {
   }
 
   const parts: string[] = [];
+  if (w.requests === 1 && cooling.length === 0) {
+    // §3.4.3: one line must not be dressed as a trend.
+    return {
+      text: `1 request logged ${span}, ${w.failover_availability} failovers`,
+      dead: false,
+    };
+  }
   for (const leg of cooling) {
     const who = leg.role === "primary" && cooling.length === 1 ? "primary" : leg.name;
     if (leg.last_failure_class === "quota_429") {
@@ -122,8 +129,7 @@ function headerSentence(state: AdminState): { text: string; dead: boolean } {
 
   if (w.requests === 1) {
     parts.push(`${w.failover_availability} failovers in 1 request`);
-  } else if (w.failover_capacity > 0) {
-    parts.push(`${w.failover_availability} failovers, ${w.failover_capacity} quota failovers ${span}`);
+  } else if (w.failover_capacity > 0) {    parts.push(`${w.failover_availability} failovers, ${w.failover_capacity} quota failovers ${span}`);
   } else {
     parts.push(`${w.failover_availability} failovers ${span}`);
   }
@@ -322,7 +328,7 @@ function renderShare(): void {
   });
   const note = q("[data-share-note]");
   if (note) {
-    note.textContent = `Counts are the router's served_in_window over ${spanLabel(state)}; the bar splits the same counts.`;
+    note.textContent = `Counts are the router's served_in_window for ${spanLabel(state)}; the bar splits the same counts.`;
   }
 }
 

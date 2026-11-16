@@ -69,12 +69,86 @@ case "$1" in
     if [ "${2:-}" = "inspect" ]; then
       # The bytes just pulled claim this digest. The host must verify and tag the digest, not the
       # mutable sha-<7> tag, so the harness reports one and scenario 3b asserts it is what moved
-      # :local.
-      printf '%s@sha256:%s\n' "${5%%:*}" "${FAKE_DIGEST:-$(printf 'a%.0s' {1..64})}"
+      # :local. FAKE_REPO_DIGESTS replays the shape measured on qouver1, where one digest is
+      # recorded under both the registry and localhost.
+      if [ -n "${FAKE_REPO_DIGESTS:-}" ]; then
+        printf '%s\n' "$FAKE_REPO_DIGESTS"
+      else
+        printf '%s@sha256:%s\n' "${5%%:*}" "${FAKE_DIGEST:-$(printf 'a%.0s' {1..64})}"
+      fi
       exit 0
     fi
     [ "${2:-}" = "exists" ] || exit 0
     grep -qxF "${3##*:}" "$S/tags" 2>/dev/null && exit 0 || exit 1
+    ;;
+  manifest)
+    # podman manifest inspect <ref>: the document the registry serves for the tag, pretty-printed
+    # like the real command. Which digest the host tags :local from is decided by this document —
+    # its mediaType says whether it is an index, and its children say which RepoDigests entry is
+    # the leftover index. One value per line matters: pulled_digest reads the first mediaType line,
+    # so a single-line document would hand it a child's mediaType instead of the index's.
+    # Answering nothing here made every pull path abort as "reports no digest".
+    case "${FAKE_MANIFEST:-index}" in
+      index|docker-list)
+        if [ "${FAKE_MANIFEST:-index}" = "docker-list" ]; then
+          TOP="application/vnd.docker.distribution.manifest.list.v2+json"
+          CHILD="application/vnd.docker.distribution.manifest.v2+json"
+        else
+          TOP="application/vnd.oci.image.index.v1+json"
+          CHILD="application/vnd.oci.image.manifest.v1+json"
+        fi
+        cat <<EOF
+{
+    "schemaVersion": 2,
+    "mediaType": "$TOP",
+    "manifests": [
+        {
+            "mediaType": "$CHILD",
+            "digest": "sha256:$(printf 'b%.0s' {1..64})",
+            "size": 1873,
+            "platform": {
+                "architecture": "amd64",
+                "os": "linux"
+            }
+        },
+        {
+            "mediaType": "$CHILD",
+            "digest": "sha256:$(printf 'c%.0s' {1..64})",
+            "size": 1873,
+            "platform": {
+                "architecture": "arm64",
+                "os": "linux"
+            }
+        }
+    ]
+}
+EOF
+        ;;
+      image-manifest)
+        # A bare image manifest carries a config and layers, no child manifests: there is no
+        # signed index to select, so the host must abort instead of guessing.
+        cat <<EOF
+{
+    "schemaVersion": 2,
+    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+    "config": {
+        "mediaType": "application/vnd.oci.image.config.v1+json",
+        "digest": "sha256:$(printf 'd%.0s' {1..64})",
+        "size": 14718
+    },
+    "layers": [
+        {
+            "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+            "digest": "sha256:$(printf 'e%.0s' {1..64})",
+            "size": 6144
+        }
+    ]
+}
+EOF
+        ;;
+      *) printf 'stub manifest: unknown FAKE_MANIFEST %s\n' "$FAKE_MANIFEST" >&2; exit 125 ;;
+    esac
+    exit 0
     ;;
   tag)
     printf '%s\n' "${3##*:}" >>"$S/tags"
@@ -178,6 +252,7 @@ reset_state() {
   : >"$STATE/calls.log"
   rm -f "$STATE/rolled_back" "$STATE/pull_count"
   rm -f "$APP_DIR/.deployed_rev" "$APP_DIR/logs/deploy.log"
+  unset FAKE_MANIFEST FAKE_REPO_DIGESTS
 }
 
 run() { bash "$DEPLOY" kori "$@" >"$ROOT/out.txt" 2>&1; echo $?; }
@@ -250,6 +325,63 @@ grep -qF "cosign verify $DIGEST_REF" "$STATE/calls.log" && pass "signature verif
 grep -qxF "podman tag $DIGEST_REF localhost/kori:local" "$STATE/calls.log" \
   && pass ":local tagged from the digest, not from the tag" \
   || fail ":local not tagged from the digest: $(grep '^podman tag' "$STATE/calls.log")"
+
+# ── scenario 3c: one digest under two repository names is one candidate ─────
+# Measured on qouver1, 2026-11-16: once the image is also tagged :local, the same digest is
+# recorded as both ghcr.io/...@sha256:X and localhost/...@sha256:X. Counting lines instead of
+# distinct digests makes that read as two non-children, pulled_digest returns empty and a
+# redeploy of an unchanged commit aborts as "reports no digest". Remove the dedup and this fails.
+reset_state
+printf 'local\n' >"$STATE/tags"
+happy_image
+export FAKE_CURL=ok
+DUP_DIGEST="sha256:$(printf 'a%.0s' {1..64})"
+FAKE_REPO_DIGESTS="ghcr.io/nferdazel/kori-api@$DUP_DIGEST
+localhost/kori@$DUP_DIGEST"
+export FAKE_REPO_DIGESTS
+rc="$(run refs/heads/main)"
+[ "$rc" = "0" ] && pass "one digest under two repo names still deploys" \
+  || fail "duplicate RepoDigests exited $rc: $(tail -2 "$APP_DIR/logs/deploy.log")"
+grep -qxF "podman tag ghcr.io/nferdazel/kori-api@$DUP_DIGEST localhost/kori:local" "$STATE/calls.log" \
+  && pass "deduped candidate tagged :local once" \
+  || fail "duplicate digests were not resolved to one index: $(grep '^podman tag' "$STATE/calls.log")"
+[ "$(cat "$APP_DIR/.deployed_rev" 2>/dev/null)" = "$(head_sha)" ] \
+  && pass "deduped redeploy moved .deployed_rev" || fail "deduped redeploy never completed"
+
+# ── scenario 3d: a bare image manifest is not a signed index -> abort ───────
+# An image manifest has no children to subtract, so there is no index digest to verify. The host
+# must fail closed rather than present the per-arch digest as the signed one.
+reset_state
+printf 'local\n' >"$STATE/tags"
+happy_image
+export FAKE_CURL=ok FAKE_MANIFEST=image-manifest
+rc="$(run refs/heads/main)"
+[ "$rc" != "0" ] && pass "bare image manifest exits non-zero ($rc)" \
+  || fail "bare image manifest exited 0"
+grep -q "reports no digest" "$APP_DIR/logs/deploy.log" && pass "unknown shape aborts loudly" \
+  || fail "unknown shape message missing: $(tail -2 "$APP_DIR/logs/deploy.log")"
+[ "$(restarts)" = "0" ] && pass "unknown shape left the container running" \
+  || fail "unknown shape restarted the service"
+[ -f "$APP_DIR/.deployed_rev" ] && fail ".deployed_rev written for an unknown shape" \
+  || pass "unknown shape did not move .deployed_rev"
+[ "$(sort -u "$STATE/tags" | tr '\n' ' ')" = "local " ] && pass "unknown shape moved no tag" \
+  || fail "tags moved: $(sort -u "$STATE/tags" | tr '\n' ' ')"
+grep -q '^cosign' "$STATE/calls.log" && fail "cosign ran without a digest" \
+  || pass "cosign never ran without a digest"
+
+# ── scenario 3e: a docker manifest list is accepted like an OCI index ───────
+reset_state
+printf 'local\n' >"$STATE/tags"
+happy_image
+export FAKE_CURL=ok FAKE_MANIFEST=docker-list
+rc="$(run refs/heads/main)"
+[ "$rc" = "0" ] && pass "docker manifest list deploys" \
+  || fail "docker manifest list exited $rc: $(tail -2 "$APP_DIR/logs/deploy.log")"
+grep -qxF "podman tag ghcr.io/nferdazel/kori-api@$DUP_DIGEST localhost/kori:local" "$STATE/calls.log" \
+  && pass "docker manifest list tagged the index :local" \
+  || fail "docker manifest list did not tag the index: $(grep '^podman tag' "$STATE/calls.log")"
+[ "$(cat "$APP_DIR/.deployed_rev" 2>/dev/null)" = "$(head_sha)" ] \
+  && pass "docker manifest list moved .deployed_rev" || fail "docker manifest list never completed"
 
 # ── scenario 4: a redeploy rotates :local to :prev ──────────────────────────
 reset_state
