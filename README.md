@@ -89,8 +89,18 @@ the repository, in an image or in a log.
         "refresh_token": "…"
       }
     },
-    { "name": "commandcode", "base_url": "…", "api_key": "…", "role": "fallback" },
-    { "name": "sinarcloud",  "base_url": "…", "api_key": "…", "role": "fallback" }
+    {
+      "name": "commandcode",
+      "base_url": "https://api.commandcode.ai/provider/v1",
+      "api_key": "…",
+      "role": "fallback"
+    },
+    {
+      "name": "sinarcloud",
+      "base_url": "https://ai.sinarcloud.com/v1",
+      "api_key": "…",
+      "role": "fallback"
+    }
   ]
 }
 ```
@@ -124,6 +134,9 @@ with `token_endpoint_auth_method` `none`, so no client secret is sent. `refresh_
 the only secret in the block: it comes from the OpenCode credential store on the machine
 that owns the account (`opencode auth export`), never from the repository, and the refreshed
 values are written back into the running config file with mode `0600`.
+
+The `commandcode` and `sinarcloud` legs take a static `api_key` and nothing else: neither
+key expires, so neither leg has an `oauth` block and kori never refreshes them.
 
 
 The caller's body is forwarded byte for byte, with one exception: for a streaming request
