@@ -75,14 +75,18 @@ if [ -n "${KORI_EDGE_URL:-}" ] && [ -z "${KORI_EDGE_TOKEN:-}" ]; then
   bad "KORI_EDGE_URL is set but KORI_EDGE_TOKEN is empty; edge matrix cannot run"
 elif [ -n "${KORI_EDGE_URL:-}" ]; then
   code() { curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$@"; }
+  # The real bearer goes to curl as a config on stdin, never in argv: /proc/<pid>/cmdline is
+  # readable on the host, so an argument would hand the edge token to any local process for the
+  # life of the request. `printf` here is a shell builtin, so no second process sees it either.
+  code_auth() { printf 'header = "Authorization: Bearer %s"\n' "$KORI_EDGE_TOKEN" | code -K - "$@"; }
   c="$(code "$KORI_EDGE_URL/v1/models")"
   [ "$c" = "401" ] && ok "edge without bearer -> 401" || bad "edge without bearer -> $c (expected 401)"
   # The literal below is a deliberately wrong bearer: it must be rejected. Not a credential.
   c="$(code -H "Authorization: Bearer wrong-token" "$KORI_EDGE_URL/v1/models")"  # gitleaks:allow
   [ "$c" = "401" ] && ok "edge with wrong bearer -> 401" || bad "edge with wrong bearer -> $c (expected 401)"
-  c="$(code -H "Authorization: Bearer $KORI_EDGE_TOKEN" "$KORI_EDGE_URL/v1/models")"
+  c="$(code_auth "$KORI_EDGE_URL/v1/models")"
   [ "$c" = "200" ] && ok "edge with right bearer -> 200" || bad "edge with right bearer -> $c (expected 200)"
-  c="$(code -H "Authorization: Bearer $KORI_EDGE_TOKEN" "$KORI_EDGE_URL/admin/state")"
+  c="$(code_auth "$KORI_EDGE_URL/admin/state")"
   [ "$c" = "404" ] && ok "edge refuses /admin/state -> 404" || bad "edge answered /admin/state with $c (expected 404)"
 else
   warn "KORI_EDGE_URL/KORI_EDGE_TOKEN unset, edge checks skipped"

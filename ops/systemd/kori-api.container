@@ -17,6 +17,9 @@
 #     then rename), and a rename into a bind-mounted file fails even at :rw. Mounting the file
 #     read-only made every refresh succeed in memory and persist nowhere, so a container restart
 #     went back to the seed token.
+#   - `:Z` (private label), not `:z`: this directory is the only place provider credentials exist
+#     on the host. A shared label lets any other container on qouver1 carry the same category and
+#     read it; a private one is relabelled for this container alone.
 #   - No HealthCmd: the runtime image has no curl or wget, and podman healthchecks run inside the
 #     container. Health is `Restart=always` plus the deploy gate on /admin/state.
 #   - `OnFailure=alert@%N.service`: the host's Telegram alert with a 15-minute per-unit cooldown,
@@ -38,7 +41,7 @@ PublishPort=127.0.0.1:8787:8787
 Pull=never
 AutoUpdate=local
 EnvironmentFile=/srv/qouver/apps/kori/env/kori-prod.env
-Volume=/srv/qouver/apps/kori/etc:/etc/kori:rw,z
+Volume=/srv/qouver/apps/kori/etc:/etc/kori:rw,Z
 Volume=/srv/qouver/apps/kori/logs:/var/log/kori:z
 Exec=--config=/etc/kori/config.json --port=8787 --address=0.0.0.0 --log=/var/log/kori/requests.jsonl
 NoNewPrivileges=true

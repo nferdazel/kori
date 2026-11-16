@@ -54,6 +54,9 @@ command -v flock >/dev/null 2>&1 || {
 }
 
 mkdir -p "$APP_DIR/logs"
+# The deploy log carries journal lines from the units it restarts, and a service that logs a
+# credential would put it here. 0600 at creation; the directory stays 0755 for the smoke script.
+(umask 077; : >>"$LOG")
 # The config mount is a directory, so the OAuth refresh can write its temp file next to the
 # config and rename it into place. 0700 here, the file inside stays 0600.
 install -d -m 0700 "$APP_DIR/etc"
@@ -179,8 +182,10 @@ done
 # temp in the same directory and renames it over the config; a file bind cannot take that rename
 # even at :rw, and at :ro every refresh is lost at the next container restart. A unit that goes
 # back to the old shape silently disables token rotation, so it never reaches the host.
-grep -qE "^[[:space:]]*Volume=[^:]+:/etc/kori:rw(,z)?[[:space:]]*$" "$UNIT_SRC" \
-  || die "quadlet config mount is not a writable directory at /etc/kori — deploy aborted, unit on the host untouched"
+# The label must be private (`:Z`): a shared `:z` category is one any other container on this host
+# can carry, and this directory holds every provider credential kori has.
+grep -qE "^[[:space:]]*Volume=[^:]+:/etc/kori:rw,Z[[:space:]]*$" "$UNIT_SRC" \
+  || die "quadlet config mount is not a writable directory at /etc/kori with a private label — deploy aborted, unit on the host untouched"
 if grep -qE "^[[:space:]]*Volume=.*config\.json:/etc/kori/config\.json" "$UNIT_SRC"; then
   die "quadlet mounts config.json as a single file; OAuth rotation cannot persist — deploy aborted, unit on the host untouched"
 fi
@@ -381,7 +386,10 @@ if [ -n "${KORI_EDGE_TOKEN:-}" ]; then
   CADDY_BAK=""
   if [ -f "$RENDERED" ]; then
     CADDY_BAK="$RENDERED.prev.$$"
-    cp -p "$RENDERED" "$CADDY_BAK" || die "could not back up $RENDERED — edge block untouched"
+    # `cp -p` reapplies owner and group, and the deploy user is not in the caddy group, so a
+    # restore that is otherwise fine can die on an ownership call. install sets the mode and lets
+    # the setgid caddy dir supply the group: same end state, no ownership attempt.
+    install -m 0640 "$RENDERED" "$CADDY_BAK" || die "could not back up $RENDERED — edge block untouched"
   fi
   OLD_UMASK="$(umask)"
   umask 077

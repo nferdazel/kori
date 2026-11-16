@@ -33,16 +33,26 @@ cat >"$BIN/curl" <<'STUB'
 #!/usr/bin/env bash
 S="${SMOKE_STATE:?}"
 printf 'curl %s\n' "$*" >>"$S/calls.log"
-code_only=0; hdr=""; url=""
+code_only=0; hdr=""; url=""; cfg=""
 while [ $# -gt 0 ]; do
   case "$1" in
     -w) code_only=1; shift 2 ;;
     -H) hdr="$2"; shift 2 ;;
+    -K|--config) cfg="$2"; shift 2 ;;
     -o|--max-time|-s|-f|-S) shift 2 2>/dev/null || shift 1 ;;
     -*) shift ;;
     *) url="$1"; shift ;;
   esac
 done
+# A bearer handed over as `-K -` arrives on stdin, so it never shows up in this stub's argv log.
+if [ "$cfg" = "-" ]; then
+  while IFS= read -r cline; do
+    case "$cline" in
+      header*=*)
+        hdr="${cline#*\"}"; hdr="${hdr%\"*}" ;;
+    esac
+  done
+fi
 say() { printf '%s' "$1"; }
 if [ "${url#*"$FAKE_BASE_URL"}" != "$url" ]; then
   # loopback admin endpoint
@@ -119,6 +129,9 @@ grep -q 'edge without bearer -> 401' "$ROOT/out.txt" && pass "edge refuses a mis
   || fail "missing-bearer check absent"
 grep -q 'edge refuses /admin/state -> 404' "$ROOT/out.txt" && pass "edge refuses /admin from outside" \
   || fail "/admin edge check absent"
+grep -q "Bearer $FAKE_GOOD_TOKEN" "$STATE/calls.log" \
+  && fail "the edge token reached curl argv, where /proc/<pid>/cmdline exposes it" \
+  || pass "the edge token never reaches curl argv"
 
 # ── scenario 2: local run, edge not wired yet -> 0 with a warning ───────────
 reset_state

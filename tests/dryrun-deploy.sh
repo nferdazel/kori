@@ -434,8 +434,8 @@ rc="$(run refs/heads/main)"
 [ "$rc" = "0" ] && pass "config-dir deploy exits 0" \
   || fail "config-dir deploy exited $rc: $(tail -3 "$ROOT/out.txt")"
 UNIT_LIVE="$UNIT_DIR/kori-api.container"
-grep -qxF 'Volume=/srv/qouver/apps/kori/etc:/etc/kori:rw,z' "$UNIT_LIVE" \
-  && pass "unit mounts the config directory rw" \
+grep -qxF 'Volume=/srv/qouver/apps/kori/etc:/etc/kori:rw,Z' "$UNIT_LIVE" \
+  && pass "unit mounts the config directory rw with a private label" \
   || fail "unit mount line: $(grep '^Volume=' "$UNIT_LIVE" | tr '\n' ' ')"
 grep -q 'config.json:/etc/kori/config.json' "$UNIT_LIVE" \
   && fail "unit still single-file mounts config.json" || pass "no single-file config bind"
@@ -461,6 +461,12 @@ RENDERED="$APP_DIR/caddy/site.caddy"
   && pass "rendered edge block is 0640" || fail "rendered edge block mode is not 0640"
 leftovers="$(find "$APP_DIR/caddy" -mindepth 1 -maxdepth 1 ! -name site.caddy -print 2>/dev/null)"
 [ -z "$leftovers" ] && pass "no temp file left in caddy/" || fail "leftovers in caddy/: $leftovers"
+[ -n "$(find "$APP_DIR/logs/deploy.log" -maxdepth 0 -perm 0600 2>/dev/null)" ] \
+  && pass "deploy log is 0600, so a journal line carrying a credential is not world-readable" \
+  || fail "deploy log mode is not 0600"
+grep -qE '^[[:space:]]*cp -p .*RENDERED' "$DEPLOY" \
+  && fail "the caddy backup still uses cp -p, which needs caddy group membership" \
+  || pass "the caddy backup does not depend on the deploy user's group membership"
 grep -q 'Bearer dryrun-token' "$RENDERED" && pass "bearer line carries the rendered token" \
   || fail "bearer line not rendered: $(grep -n 'no_bearer' "$RENDERED" | head -2)"
 # An external process carrying the token in argv is the bug; a shell builtin substitution is not.
