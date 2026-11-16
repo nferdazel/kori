@@ -93,6 +93,12 @@ jobs:
           sh tools/gen-static.sh apps/web/dist apps/api/src/generated/static_files.nim
           git diff --exit-code -- apps/api/src/generated/static_files.nim
 
+      # VERSION is the only hand-written version number. This fails when VERSION, kori.nimble,
+      # the generated module or the newest CHANGELOG heading disagree, so a hand edit in one
+      # place cannot reach main unnoticed. It is the same check ./task nim runs locally.
+      - name: Version sync
+        run: ./task version-check
+
       - name: Check
         run: nim check --hints:off apps/api/src/kori.nim
 

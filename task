@@ -105,9 +105,9 @@ task_version_check() {
   echo "version: v$v (VERSION, kori.nimble, generated module, CHANGELOG agree)"
 }
 
-# Rilis = satu commit + satu tag anotasi, lokal. Tag adalah penanda, bukan pemicu deploy: tidak
-# ada satu pun git push di jalur ini. Perintah push dicetak di akhir untuk dijalankan dengan
-# sadar, karena push ke main memicu CI dan percobaan deploy.
+# A release is one local commit plus one annotated tag. The tag marks a version, it does not
+# trigger a deploy: there is no git push anywhere on this path. The push commands are printed at
+# the end to be run on purpose, because a push to main starts CI and a deploy attempt.
 task_release() {
   bump=""
   skip_check=0
