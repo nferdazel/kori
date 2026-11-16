@@ -30,7 +30,6 @@ concurrency:
 
 env:
   NIM_VERSION: "2.4.2"
-  NODE_VERSION: "22"
   SHELLCHECK_VERSION: "v0.10.0"
 
 jobs:
@@ -48,41 +47,6 @@ jobs:
 
       - name: "Contract: check this repo"
         run: ./ops/scripts/contract-check.sh .
-
-  web:
-    name: "Web: vite build + dist drift"
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: npm
-          cache-dependency-path: apps/web/package-lock.json
-
-      - name: Install
-        working-directory: apps/web
-        run: npm ci --no-audit --no-fund
-
-      - name: Build
-        working-directory: apps/web
-        run: npm run build
-
-      # The committed dist is what a local `nim c` embeds. If someone edits a page and forgets
-      # the build, the binary quietly serves the old dashboard — this step turns that into a red
-      # check instead of a mystery in production.
-      - name: "Dist drift: committed dist must match a fresh build"
-        run: |
-          set -eu
-          if git diff --exit-code --quiet -- apps/web/dist; then
-            echo "committed dist matches a fresh build"
-          else
-            echo "::error::apps/web/dist is stale. Run 'npm run build' in apps/web and commit the result."
-            git --no-pager diff --stat -- apps/web/dist
-            exit 1
-          fi
 
   nim:
     name: "Nim: check + tests"
@@ -111,24 +75,9 @@ jobs:
           tar -xJf /tmp/nim.tar.xz -C "$HOME/nim" --strip-components=1
           echo "$HOME/nim/bin" >> "$GITHUB_PATH"
 
-      # The dashboard must exist before the compiler reads the generated module; without this the
-      # build embeds an empty page table and still compiles.
-      - name: "Web build (for the embed step)"
-        uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: npm
-          cache-dependency-path: apps/web/package-lock.json
-
-      - name: Build dashboard
-        working-directory: apps/web
-        run: |
-          npm ci --no-audit --no-fund
-          npm run build
-
-      - name: Generate static module
-        run: sh tools/gen-static.sh apps/web/dist src/generated/static_files.nim
-
+      # No dashboard build here: apps/web does not exist in this tree yet, so the embed step and
+      # its node setup were removed rather than left pointing at a missing lockfile. Restore both
+      # (and the Dockerfile's node stage) when the vite dashboard lands.
       - name: Install dependencies
         run: nimble install -d -y
 
@@ -154,12 +103,11 @@ jobs:
   gate:
     name: Gate
     if: always()
-    needs: [contract, web, nim, security, ops]
+    needs: [contract, nim, security, ops]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     env:
       R_CONTRACT: ${{ needs.contract.result }}
-      R_WEB: ${{ needs.web.result }}
       R_NIM: ${{ needs.nim.result }}
       R_SECURITY: ${{ needs.security.result }}
       R_OPS: ${{ needs.ops.result }}
@@ -168,7 +116,7 @@ jobs:
         shell: bash
         run: |
           fail=0
-          for r in "$R_CONTRACT" "$R_WEB" "$R_NIM" "$R_SECURITY" "$R_OPS"; do
+          for r in "$R_CONTRACT" "$R_NIM" "$R_SECURITY" "$R_OPS"; do
             [ "$r" = "success" ] || { echo "required job: $r"; fail=1; }
           done
           exit "$fail"
@@ -213,10 +161,9 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # NODE_DIGEST and NIM_SHA256 have no default in apps/api/Dockerfile on purpose: the build
-      # must fail here, loudly, rather than pull whatever `node:22-bookworm-slim` resolves to
-      # today. Both values were read once and are bumped in review, never automatically.
-      #   NODE_DIGEST  podman manifest inspect node:22-bookworm-slim | jq -r .digest
+      # NIM_SHA256 has no default in apps/api/Dockerfile on purpose: the build must fail here,
+      # loudly, rather than trust whatever nim-lang.org serves today. The value was read once and
+      # is bumped in review, never automatically.
       #   NIM_SHA256   https://nim-lang.org/download/nim-2.4.2-linux_x64.tar.xz.sha256
       - name: Build and push
         id: push
@@ -227,7 +174,6 @@ jobs:
           platforms: linux/amd64
           push: ${{ github.event_name == 'push' }}
           build-args: |
-            NODE_DIGEST=sha256:e9f565d32859f0cbfb52125eafe8be39390f24dac302dc3cdf566e8ba3ab21ee
             NIM_SHA256=0ee5b16e81852a956d4fddb4aa44b5958c645c992132fa43be45f489573ee325
           tags: |
             ghcr.io/nferdazel/kori-api:sha-${{ steps.short.outputs.sha7 }}
@@ -260,7 +206,7 @@ jobs:
       # Every repository here is public. A leaked token is public the moment it is pushed, so the
       # scan runs on the full history and not just the diff.
       - name: gitleaks
-        uses: gitleaks/gitleaks-action@v2
+        uses: gitleaks/gitleaks-action@v3
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

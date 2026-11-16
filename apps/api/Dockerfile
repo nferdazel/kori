@@ -1,11 +1,14 @@
 # syntax=docker/dockerfile:1
 #
-# kori image: one Nim binary, dashboard embedded, no node and no npm in the runtime layer.
+# kori image: one Nim binary, no node and no npm in the runtime layer.
 #
-# Build context = repo root. Three stages:
-#   web     node + vite, produces apps/web/dist
-#   build   Nim, generates the staticRead module from dist, compiles kori
+# Build context = repo root. Two stages:
+#   build   Nim, compiles kori
 #   runtime debian-slim, binary only
+#
+# There is no dashboard stage: apps/web does not exist in this tree yet. When the vite dashboard
+# lands, add the node stage back here and the embed step in ci.yml (see qouver's Dockerfile for
+# the shape) — do not leave a COPY pointing at a directory that is not committed.
 #
 # Everything below is pinned. A floating base tag means two builds of the same commit can
 # produce different runtimes; the digests are the ones already used by the house images and
@@ -14,27 +17,8 @@
 # DEBIAN_DIGEST is the index digest the house images already pin (cbs apps/api/Dockerfile,
 # 21 Oct 2026) — copied, not invented.
 ARG DEBIAN_DIGEST=sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8
-# NODE_DIGEST has no default: read it with
-#   podman manifest inspect node:22-bookworm-slim | jq -r .digest
-# and pass it. A made-up digest fails the pull, but a made-up-looking one in a repo is worse than
-# none, because the next person copies it.
-ARG NODE_DIGEST=
 
-# ── stage 1: dashboard ───────────────────────────────────────────────────────
-FROM node:22-bookworm-slim@${NODE_DIGEST} AS web
-ARG NODE_DIGEST
-
-WORKDIR /web
-# `npm ci` needs the lockfile; without one the build is not reproducible and should fail here,
-# not in production.
-COPY apps/web/package.json apps/web/package-lock.json ./
-RUN npm ci --no-audit --no-fund
-COPY apps/web/ ./
-RUN npm run build
-# Vite writes apps/web/dist. Fixed filenames, no content hashes: the embed step needs a stable
-# file list, and the binary is the cache key anyway.
-
-# ── stage 2: nim ────────────────────────────────────────────────────────────
+# ── stage 1: nim ────────────────────────────────────────────────────────────
 FROM debian:bookworm-slim@${DEBIAN_DIGEST} AS build
 
 # Nim tarball is verified, not trusted: a swapped tarball builds "successfully" with code that
@@ -60,13 +44,9 @@ COPY kori.nimble ./
 RUN nimble install -d -y
 
 COPY . .
-# Dashboard first, then the module that embeds it, then the compiler. If dist is stale the
-# binary serves a stale page with no error anywhere — that is the failure this order prevents.
-COPY --from=web /web/dist ./apps/web/dist
-RUN sh tools/gen-static.sh apps/web/dist src/generated/static_files.nim
 RUN nim c -d:release --mm:orc --threads:on --hints:off --out:/out/kori apps/api/src/kori.nim
 
-# ── stage 3: runtime ────────────────────────────────────────────────────────
+# ── stage 2: runtime ────────────────────────────────────────────────────────
 FROM debian:bookworm-slim@${DEBIAN_DIGEST} AS runtime
 
 # libssl3 + ca-certificates: the gateway dials providers over TLS. Without them the binary starts
