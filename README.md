@@ -80,10 +80,14 @@ the repository, in an image or in a log.
     {
       "name": "opencode-go",
       "base_url": "https://opencode.ai/inference/go/openai/v1",
-      "api_key": "…",
       "model": "deepseek-v4.1-flash",
       "headers": { "x-opencode-session": "…" },
-      "role": "primary"
+      "role": "primary",
+      "oauth": {
+        "token_url": "<token endpoint URL, filled by the owner>",
+        "client_id": "<client id, filled by the owner>",
+        "refresh_token": "…"
+      }
     },
     { "name": "commandcode", "base_url": "…", "api_key": "…", "role": "fallback" },
     { "name": "sinarcloud",  "base_url": "…", "api_key": "…", "role": "fallback" }
@@ -96,13 +100,25 @@ the repository, in an image or in a log.
 | `legs` | yes | at least one; order in the array is the failover order |
 | `legs[].name` | yes | the name that appears in the log and on the dashboard |
 | `legs[].base_url` | yes | kori appends `/chat/completions` to its path |
-| `legs[].api_key` | no | sent as `Authorization: Bearer …` unless `headers` already sets one |
+| `legs[].api_key` | no | sent as `Authorization: Bearer …` unless `headers` already sets one, or the leg has an `oauth` block |
 | `legs[].model` | no | falls back to the leg name; it is reported, not rewritten into the body |
 | `legs[].headers` | no | extra request headers, for example `x-opencode-session` |
 | `legs[].role` | no | `primary` or `fallback`, default `primary` |
 | `legs[].weight` | no | must be `1`; any other value is refused at startup |
+| `legs[].oauth` | no | makes the leg refresh its own access token; see below |
+| `legs[].oauth.token_url` | yes, with `oauth` | the endpoint kori POSTs to; must be `http` or `https` |
+| `legs[].oauth.client_id` | yes, with `oauth` | sent with the refresh grant |
+| `legs[].oauth.refresh_token` | yes, with `oauth` | the seed; a rotation in the answer replaces it |
+| `legs[].oauth.client_secret` | no | sent only when the endpoint needs it |
+| `legs[].oauth.access_token` | no | a seed token, used until the first refresh |
+| `legs[].oauth.expires_at` | no | epoch seconds; without it kori refreshes only after a `401` |
+| `legs[].oauth.refresh_skew_seconds` | no | refresh this long before expiry, default `60` |
 | `balance` | no | default `false`, which keeps strict leg order |
 | `listen`, `log` | no | overridden by `--address`, `--port`, `--log` |
+
+The two owner-side facts in the example, `token_url` and `client_id`, are labelled
+placeholders on purpose: they are not guessed here and no vendor URL is assumed.
+
 
 The caller's body is forwarded byte for byte, with one exception: for a streaming request
 kori sets `stream_options.include_usage` if the caller did not, so the leg reports token
@@ -128,6 +144,9 @@ The default `false` keeps strict config order.
 | `429` carrying a quota body | `quota_429` | 900 s |
 | any other status | not a failure; returned to the caller | — |
 
+`credential_refresh_failed` and `refresh_timeout` are the two log-only values: they name a
+request that stopped where it was instead of failing over (see below).
+
 A response that dies after its first byte is aborted and logged as `mid_stream_abort`; it
 is not rerouted. When every leg is dead the caller gets one `502` carrying the last
 failure reason.
@@ -142,6 +161,35 @@ Deadlines enforced by the binary, independent of any proxy in front of it:
 | response headers, non-streaming | 90 s |
 | idle between chunks | 120 s |
 | whole non-streaming request | 300 s |
+
+## Credential refresh
+
+A leg with an `oauth` block holds an access token that expires. kori refreshes it itself;
+a leg without the block keeps its static `api_key` and never calls a token endpoint.
+
+Before dialling, when the clock has reached `expires_at` minus `refresh_skew_seconds`,
+kori POSTs a form-encoded `grant_type=refresh_token` with `refresh_token`, `client_id` and
+`client_secret` when one is set. It reads `access_token`, a rotated `refresh_token` and
+`expires_in` from the JSON answer. A `401` from the leg itself buys one forced refresh and
+one retry, then the leg is classified exactly as any other `401`.
+
+A refresh that fails stops the request. The caller gets `502` with
+`{"error":{"type":"credential_refresh_failed"}}`, or `refresh_timeout` when the deadline
+fired; no fallback leg is dialled, no stale bearer is sent, and one line goes to stderr.
+The token call has its own 5 s budget after connect and TLS, so a hung token endpoint
+cannot pass for a slow provider.
+
+Only one token call per leg is in flight at a time: requests that need the same refresh
+wait on it instead of repeating it. The new credential is written back into the same config
+file atomically, at mode `0600`, leaving every other byte alone. When the file cannot be
+written, as inside the container where the config is mounted read-only, kori warns and
+serves the refreshed credential from memory.
+
+`/admin/config` reports the refresh state, never the credential:
+
+```json
+"oauth": { "state": "set", "expires_at": 1794812128 }
+```
 
 ## Request log
 
@@ -232,7 +280,7 @@ input is missing.
 The acceptance harness proves the router end to end against a real binary:
 
 ```sh
-KORI_BIN=./apps/api/src/kori sh acceptance/run-all.sh   # the ten cases, A1–A10
+KORI_BIN=./apps/api/src/kori sh acceptance/run-all.sh   # the eleven cases, A1–A11
 KORI_BIN=./apps/api/src/kori sh acceptance/selftest.sh  # proves the harness itself
 ```
 
@@ -248,6 +296,7 @@ KORI_BIN=./apps/api/src/kori sh acceptance/selftest.sh  # proves the harness its
 | a8 | a fresh start knows nothing about any leg |
 | a9 | all legs dead is one `502` and the log keeps both ends of the chain |
 | a10 | the dashboard is a read-only surface over three GETs |
+| a11 | an expired credential is refreshed, and a refresh forced to fail stops the request |
 
 Cases use logical port numbers; `acceptance/lib.sh` resolves each to a free port per run,
 so a run leaves nothing behind and can be repeated immediately.
@@ -265,7 +314,7 @@ single required status and the only door to publishing the image.
 apps/api/       Nim gateway source, Dockerfile
 apps/api/src/generated/static_files.nim   dashboard compiled into the binary
 apps/web/       dashboard source (vite, TypeScript) and the committed dist
-acceptance/     A1–A10 harness, lib.sh, stub.py, self-test
+acceptance/     A1–A11 harness, lib.sh, stub.py, self-test
 ops/            deploy, rollback and smoke scripts, Caddy, env, systemd, webhook templates
 tests/          unit tests and the dry runs ./task ops calls
 tools/          gen-static.sh

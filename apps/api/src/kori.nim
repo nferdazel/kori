@@ -10,8 +10,12 @@
 # Slice 4: the four dashboard pages and their assets, served from the table that
 # tools/gen-static.sh embeds at compile time. Nothing is read from disk at runtime.
 #
-# Deliberately absent, and not to be reported as done: balancing beyond weight 1
-# and the credential refresh (§4). See REPORT.md for the open list.
+# Slice 5: the OAuth credential refresh of SPEC §4 for a leg that carries an
+# `oauth` block. A refresh that fails stops the request; it never fails over and
+# never sends a stale bearer.
+#
+# Deliberately absent, and not to be reported as done: balancing beyond weight 1.
+# See REPORT.md for the open list.
 
 import std/[algorithm, asyncdispatch, asyncnet, exitprocs,
             httpcore, json, net, options, os, posix, strutils, tables, times, uri]
@@ -43,6 +47,11 @@ const
   ChunkIdleMs* = 120_000
   TotalNonStreamMs* = 300_000
 
+  # SPEC §4: the token call gets its own budget on top of connect and TLS, so a
+  # hung token endpoint is a refresh timeout and never a slow provider.
+  RefreshDeadlineMs* = 5_000
+  DefaultRefreshSkewS = 60
+
   # SPEC §3.1 and §3.2.
   AvailabilityCooldownS* = 60.0
   CapacityCooldownS* = 900.0
@@ -68,6 +77,12 @@ const
   TokenQuota429* = "quota_429"
   TokenMidStreamAbort* = "mid_stream_abort"
 
+  # Log-only values, not failure classes: a request that cannot refresh its
+  # credential stops where it is, so nothing is failed over and nothing is cooled
+  # (§4). They appear in `failover_reason` and nowhere else.
+  TokenRefreshFailed* = "credential_refresh_failed"
+  TokenRefreshTimeout* = "refresh_timeout"
+
 type
   CliError* = object of CatchableError
   ConfigError* = object of CatchableError
@@ -75,6 +90,17 @@ type
   LegRole* = enum
     lrPrimary = "primary"
     lrFallback = "fallback"
+
+  Oauth* = object
+    ## SPEC §4. The endpoint and the client identity are data: nothing here is a
+    ## vendor URL this binary assumes. A leg without this block keeps api_key.
+    tokenUrl*: string
+    clientId*: string
+    clientSecret*: string
+    refreshToken*: string
+    accessToken*: string
+    expiresAt*: float           ## epoch seconds, 0 when the config does not say
+    refreshSkewSeconds*: int
 
   Leg* = object
     name*: string
@@ -84,6 +110,8 @@ type
     headers*: seq[(string, string)]
     role*: LegRole
     weight*: int
+    oauth*: Oauth
+    hasOauth*: bool
 
   Config* = object
     listenHost*: string
@@ -122,6 +150,19 @@ type
     toRoute*: string
     reason*: string
 
+  RefreshOutcome* = object
+    ok*: bool
+    timedOut*: bool
+    detail*: string             ## for stderr only; never carries a credential
+
+  OauthState* = object
+    ## The live credential. `inFlight` is the single-flight latch: one token call
+    ## per leg at a time, and every other request waits on that same future.
+    accessToken*: string
+    refreshToken*: string
+    expiresAt*: float
+    inFlight*: Future[RefreshOutcome]
+
   Gateway* = ref object
     cfg: Config
     log: RequestLog
@@ -133,6 +174,7 @@ type
     cursor: int
     ssl*: SslContext
     legs*: seq[LegRuntime]
+    oauth*: seq[OauthState]
     events*: seq[FailoverEvent]
     configPath*: string
     configModifiedAt*: string
@@ -365,6 +407,45 @@ proc loadConfig*(path: string): Config =
       # no defined split (TAKEOVER-plan-team-c §5).
       if leg.weight != 1:
         failConfig(ctx & ".weight must be 1 in v1; the weighted split is not built")
+    # SPEC §4. A leg with no `oauth` block behaves exactly as it did before: one
+    # static bearer from api_key.
+    let oauth = item{"oauth"}
+    if oauth != nil and oauth.kind != JNull:
+      let octx = ctx & ".oauth"
+      if oauth.kind != JObject:
+        failConfig(octx & " must be an object")
+      leg.hasOauth = true
+      leg.oauth.tokenUrl = optionalString(oauth, "token_url", octx)
+      if leg.oauth.tokenUrl.len == 0:
+        failConfig(octx & ".token_url is required")
+      let tokenUri = parseUri(leg.oauth.tokenUrl)
+      if tokenUri.scheme notin ["http", "https"] or tokenUri.hostname.len == 0:
+        failConfig(octx & ".token_url must be an http or https URL")
+      leg.oauth.clientId = optionalString(oauth, "client_id", octx)
+      if leg.oauth.clientId.len == 0:
+        failConfig(octx & ".client_id is required")
+      leg.oauth.clientSecret = optionalString(oauth, "client_secret", octx)
+      leg.oauth.refreshToken = optionalString(oauth, "refresh_token", octx)
+      if leg.oauth.refreshToken.len == 0:
+        failConfig(octx & ".refresh_token is required")
+      leg.oauth.accessToken = optionalString(oauth, "access_token", octx)
+      leg.oauth.refreshSkewSeconds = DefaultRefreshSkewS
+      let expiresAt = oauth{"expires_at"}
+      if expiresAt != nil and expiresAt.kind != JNull:
+        case expiresAt.kind
+        of JInt: leg.oauth.expiresAt = expiresAt.getInt().float
+        of JFloat: leg.oauth.expiresAt = expiresAt.getFloat()
+        else:
+          failConfig(octx & ".expires_at must be epoch seconds")
+        if leg.oauth.expiresAt < 0:
+          failConfig(octx & ".expires_at must not be negative")
+      let skew = oauth{"refresh_skew_seconds"}
+      if skew != nil and skew.kind != JNull:
+        if skew.kind != JInt:
+          failConfig(octx & ".refresh_skew_seconds must be an integer")
+        leg.oauth.refreshSkewSeconds = skew.getInt()
+        if leg.oauth.refreshSkewSeconds < 0:
+          failConfig(octx & ".refresh_skew_seconds must not be negative")
     result.legs.add(leg)
   if result.legs.len == 0:
     failConfig("config needs at least one leg")
@@ -469,10 +550,19 @@ proc newUpstreamSslContext*(): SslContext =
 
 proc newGateway*(cfg: Config, log: RequestLog,
                 listenAddr: string): Gateway =
-  Gateway(cfg: cfg, log: log, startedAt: nowStamp(), listenAddr: listenAddr,
-          cursor: -1, ssl: newUpstreamSslContext(),
-          legs: newSeq[LegRuntime](cfg.legs.len),
-          staticFiles: staticFileTable())
+  result = Gateway(cfg: cfg, log: log, startedAt: nowStamp(),
+                   listenAddr: listenAddr, cursor: -1,
+                   ssl: newUpstreamSslContext(),
+                   legs: newSeq[LegRuntime](cfg.legs.len),
+                   oauth: newSeq[OauthState](cfg.legs.len),
+                   staticFiles: staticFileTable())
+  # The seeded credential is the starting point, not the truth: a refresh replaces
+  # it in memory and, when the file is writable, on disk.
+  for index, leg in cfg.legs:
+    if leg.hasOauth:
+      result.oauth[index].accessToken = leg.oauth.accessToken
+      result.oauth[index].refreshToken = leg.oauth.refreshToken
+      result.oauth[index].expiresAt = leg.oauth.expiresAt
 
 proc legAvailable*(gateway: Gateway, index: int, now: float): bool =
   ## A cooling leg is skipped without a dial. Once the cooldown expires the leg
@@ -875,6 +965,12 @@ proc allLegsFailedBody(message: string): string =
   "{\"error\":{\"type\":\"all_legs_failed\",\"message\":" &
     jsonEscape(message) & "}}"
 
+proc credentialRefreshBody(reason, detail: string): string =
+  ## §4: the type is the reason token, so a caller can tell a credential problem
+  ## from a provider problem without reading prose.
+  "{\"error\":{\"type\":" & jsonEscape(reason) & ",\"message\":" &
+    jsonEscape(detail) & "}}"
+
 # ------------------------------------------------------------------ attempts ---
 
 proc closeQuietly(socket: AsyncSocket) =
@@ -908,7 +1004,340 @@ proc dial(uri: Uri): Future[tuple[ok: bool, timedOut: bool,
     closeQuietly(socket)
     (false, false, nil)
 
-proc attemptLeg(gateway: Gateway, request: Request, leg: Leg, body: string,
+# ------------------------------------------------------- credential refresh ---
+
+proc writeFileAtomic(path, content: string): bool =
+  ## A temp file beside the target, opened 0600 before a byte is written, then
+  ## renamed over it: a reader sees the old file or the new one, never half of one.
+  let tmp = path & ".tmp"
+  let fd = posix.open(tmp.cstring, O_WRONLY or O_CREAT or O_TRUNC, Mode(0o600))
+  if fd < 0:
+    return false
+  var offset = 0
+  var failed = false
+  while offset < content.len:
+    let written = posix.write(fd, unsafeAddr content[offset], content.len - offset)
+    if written <= 0:
+      failed = true
+      break
+    offset += written
+  if not failed:
+    discard posix.fsync(fd)
+  discard posix.close(fd)
+  if failed:
+    discard posix.unlink(tmp.cstring)
+    return false
+  try:
+    moveFile(tmp, path)
+    true
+  except CatchableError:
+    discard posix.unlink(tmp.cstring)
+    false
+
+proc stringLiteralEnd(raw: string, quoteAt: int): int =
+  ## Index of the closing quote of the string opening at `quoteAt`, or -1.
+  var index = quoteAt + 1
+  while index < raw.len:
+    case raw[index]
+    of '\\': index += 2
+    of '"': return index
+    else: inc index
+  -1
+
+proc enclosingObject(raw: string, pos: int): tuple[found: bool, open, close: int] =
+  ## The innermost JSON object containing byte `pos`, found by a string-aware
+  ## brace walk so a brace inside a token or a URL cannot fool it.
+  var stack: seq[int]
+  var inString = false
+  var escaped = false
+  var index = 0
+  while index < raw.len:
+    let ch = raw[index]
+    if inString:
+      if escaped: escaped = false
+      elif ch == '\\': escaped = true
+      elif ch == '"': inString = false
+    else:
+      case ch
+      of '"': inString = true
+      of '{': stack.add index
+      of '}':
+        if stack.len > 0: discard stack.pop()
+      else: discard
+    if index == pos:
+      if stack.len == 0:
+        return (false, 0, 0)
+      let open = stack[^1]
+      var depth = 0
+      var innerString = false
+      var innerEscaped = false
+      var cursor = open
+      while cursor < raw.len:
+        let current = raw[cursor]
+        if innerString:
+          if innerEscaped: innerEscaped = false
+          elif current == '\\': innerEscaped = true
+          elif current == '"': innerString = false
+        else:
+          case current
+          of '"': innerString = true
+          of '{': inc depth
+          of '}':
+            dec depth
+            if depth == 0:
+              return (true, open, cursor)
+          else: discard
+        inc cursor
+      return (false, 0, 0)
+    inc index
+  (false, 0, 0)
+
+proc oauthBlockSpan(raw: string,
+                    tokenUrl: string): tuple[found: bool, open, close: int] =
+  ## The byte span of the `oauth` object whose `token_url` is this leg's. Located
+  ## by that value rather than by a line number, so reformatting the file is safe.
+  ## Two legs sharing one token endpoint are ambiguous and are not guessed at.
+  const needle = "\"token_url\""
+  let expected = jsonEscape(tokenUrl)
+  var hits: seq[int]
+  var searchAt = 0
+  while true:
+    let at = raw.find(needle, searchAt)
+    if at < 0:
+      break
+    searchAt = at + needle.len
+    var cursor = searchAt
+    while cursor < raw.len and raw[cursor] in {' ', '\t', '\r', '\n'}: inc cursor
+    if cursor >= raw.len or raw[cursor] != ':':
+      continue
+    inc cursor
+    while cursor < raw.len and raw[cursor] in {' ', '\t', '\r', '\n'}: inc cursor
+    if cursor >= raw.len or raw[cursor] != '"':
+      continue
+    let stop = stringLiteralEnd(raw, cursor)
+    if stop < 0:
+      continue
+    if raw[cursor .. stop] == expected:
+      hits.add at
+  if hits.len != 1:
+    return (false, 0, 0)
+  enclosingObject(raw, hits[0])
+
+proc lineIndent(raw: string, pos: int): string =
+  ## The leading whitespace of the line `pos` sits on, so a spliced block keeps
+  ## the file's own indentation instead of collapsing it onto one line.
+  var start = pos
+  while start > 0 and raw[start - 1] != '\n': dec start
+  var stop = start
+  while stop < raw.len and raw[stop] in {' ', '\t'}: inc stop
+  raw[start ..< stop]
+
+proc oauthBlockText(leg: Leg, state: OauthState, indent: string): string =
+  ## The oauth object as it is written back: same keys, same order, live values,
+  ## one key per line at the file's own indentation. Everything outside this one
+  ## object keeps its bytes.
+  var keys: seq[(string, string)]
+  keys.add(("\"token_url\"", jsonEscape(leg.oauth.tokenUrl)))
+  keys.add(("\"client_id\"", jsonEscape(leg.oauth.clientId)))
+  if leg.oauth.clientSecret.len > 0:
+    keys.add(("\"client_secret\"", jsonEscape(leg.oauth.clientSecret)))
+  keys.add(("\"refresh_token\"", jsonEscape(state.refreshToken)))
+  if state.accessToken.len > 0:
+    keys.add(("\"access_token\"", jsonEscape(state.accessToken)))
+  if state.expiresAt > 0:
+    keys.add(("\"expires_at\"", $int64(state.expiresAt)))
+  if leg.oauth.refreshSkewSeconds != DefaultRefreshSkewS:
+    keys.add(("\"refresh_skew_seconds\"", $leg.oauth.refreshSkewSeconds))
+  result = "{\n"
+  for index, (name, value) in keys:
+    result.add indent & "  " & name & ": " & value
+    if index + 1 < keys.len:
+      result.add ","
+    result.add "\n"
+  result.add indent & "}"
+
+proc persistOauth(gateway: Gateway, index: int): bool =
+  ## SPEC §4 point 7. The rotated credential goes back into the same config file,
+  ## atomically, with every other byte untouched. A read-only config (the container
+  ## mounts it `:ro`) is not an error: the process serves the refreshed credential
+  ## from memory and says so once on stderr.
+  if gateway.configPath.len == 0:
+    return false
+  let leg = gateway.cfg.legs[index]
+  var raw: string
+  try:
+    raw = readFile(gateway.configPath)
+  except CatchableError as error:
+    stderr.writeLine("kori: cannot read config back for leg '" & leg.name & "': " &
+                     error.msg & " (serving the refreshed credential from memory)")
+    return false
+  let span = oauthBlockSpan(raw, leg.oauth.tokenUrl)
+  if not span.found:
+    stderr.writeLine("kori: cannot locate the oauth block for leg '" & leg.name &
+                     "' in " & gateway.configPath &
+                     " (serving the refreshed credential from memory)")
+    return false
+  let patched = raw[0 ..< span.open] &
+                oauthBlockText(leg, gateway.oauth[index],
+                               lineIndent(raw, span.open)) &
+                raw[span.close + 1 .. ^1]
+  if not writeFileAtomic(gateway.configPath, patched):
+    stderr.writeLine("kori: cannot write " & gateway.configPath & " for leg '" &
+                     leg.name &
+                     "' (read-only?); serving the refreshed credential from memory")
+    return false
+  true
+
+proc refreshLeg(gateway: Gateway, index: int): Future[RefreshOutcome] {.async.} =
+  ## One form-encoded POST to the configured token endpoint, inside
+  ## RefreshDeadlineMs once the connection is up. No token, refresh token or
+  ## client secret is ever written to stderr, the log or an admin response.
+  let leg = gateway.cfg.legs[index]
+  let uri = parseUri(leg.oauth.tokenUrl)
+  let isTls = uri.scheme == "https"
+  var form = "grant_type=refresh_token"
+  form.add "&refresh_token=" & encodeUrl(gateway.oauth[index].refreshToken, true)
+  form.add "&client_id=" & encodeUrl(leg.oauth.clientId, true)
+  if leg.oauth.clientSecret.len > 0:
+    form.add "&client_secret=" & encodeUrl(leg.oauth.clientSecret, true)
+
+  var connected: bool
+  var dialTimedOut: bool
+  var socket: AsyncSocket
+  (connected, dialTimedOut, socket) = await dial(uri)
+  if not connected:
+    return RefreshOutcome(ok: false, timedOut: dialTimedOut,
+      detail: (if dialTimedOut: "token endpoint dial timed out"
+               else: "token endpoint connection refused"))
+  try:
+    var client = socket
+    if isTls:
+      gateway.ssl.wrapConnectedSocket(client, handshakeAsClient, uri.hostname)
+    var head = "POST " & (if uri.path.len > 0: uri.path else: "/") & " HTTP/1.1\r\n"
+    head.add "Host: " & uri.hostname
+    if uri.port.len > 0:
+      head.add ":" & uri.port
+    head.add "\r\n"
+    head.add "Content-Type: application/x-www-form-urlencoded\r\n"
+    head.add "Accept: application/json\r\n"
+    head.add "Content-Length: " & $form.len & "\r\n"
+    head.add "Connection: close\r\n\r\n"
+
+    # The budget starts once the connection is up, so connect and TLS keep their
+    # own deadlines and a hung endpoint cannot pass for a slow provider (§4).
+    let refreshDeadline = deadlineIn(RefreshDeadlineMs)
+    let sendDeadline = if isTls: deadlineIn(TlsDeadlineMs) else: refreshDeadline
+    if not await client.awaitSend(head, sendDeadline):
+      return RefreshOutcome(ok: false, timedOut: isTls,
+        detail: "token endpoint did not accept the request")
+    if not await client.awaitSend(form, refreshDeadline):
+      return RefreshOutcome(ok: false, timedOut: true,
+        detail: "token endpoint timed out reading the request")
+
+    var raw = ""
+    var headDone = false
+    while not headDone:
+      if raw.len > MaxHeaderBytes:
+        return RefreshOutcome(ok: false,
+          detail: "token endpoint sent oversized headers")
+      if raw.find("\r\n\r\n") >= 0:
+        headDone = true
+        break
+      let got = await awaitRecv(client, 8192, refreshDeadline)
+      case got.kind
+      of rkData: raw.add got.data
+      of rkTimeout:
+        return RefreshOutcome(ok: false, timedOut: true,
+          detail: "token endpoint timed out before headers")
+      of rkEof, rkTruncated, rkError:
+        return RefreshOutcome(ok: false,
+          detail: "token endpoint closed before headers")
+
+    let split = raw.find("\r\n\r\n")
+    let (status, _) = parseHead(raw[0 ..< split])
+    var payload = raw[split + 4 .. ^1]
+    # Connection: close, so the body ends at EOF; the size is the only bound.
+    while payload.len <= 1_048_576:
+      let got = await awaitRecv(client, 16_384, refreshDeadline)
+      if got.kind == rkData:
+        payload.add got.data
+      elif got.kind == rkTimeout:
+        return RefreshOutcome(ok: false, timedOut: true,
+          detail: "token endpoint timed out reading the body")
+      else:
+        break
+    if status < 200 or status >= 300:
+      return RefreshOutcome(ok: false, detail: "token endpoint answered " & $status)
+    var node: JsonNode
+    try:
+      node = parseJson(payload)
+    except CatchableError:
+      return RefreshOutcome(ok: false,
+        detail: "token endpoint answered with non-JSON")
+    if node.kind != JObject:
+      return RefreshOutcome(ok: false,
+        detail: "token endpoint answered with non-object JSON")
+    let access = node{"access_token"}
+    if access == nil or access.kind != JString or access.getStr().len == 0:
+      return RefreshOutcome(ok: false,
+        detail: "token answer carried no access_token")
+
+    gateway.oauth[index].accessToken = access.getStr()
+    let rotated = node{"refresh_token"}
+    if rotated != nil and rotated.kind == JString and rotated.getStr().len > 0:
+      gateway.oauth[index].refreshToken = rotated.getStr()
+    let expiresIn = node{"expires_in"}
+    if expiresIn != nil and expiresIn.kind == JInt and expiresIn.getInt() > 0:
+      gateway.oauth[index].expiresAt = epochTime() + expiresIn.getInt().float
+    else:
+      gateway.oauth[index].expiresAt = 0
+    discard gateway.persistOauth(index)
+    RefreshOutcome(ok: true)
+  except CatchableError as error:
+    RefreshOutcome(ok: false, detail: "token endpoint unusable: " & error.msg)
+  finally:
+    closeQuietly(socket)
+
+proc refreshIfNeeded(gateway: Gateway, index: int,
+                     force: bool): Future[RefreshOutcome] {.async.} =
+  ## Single flight: the first request that needs a refresh makes the call and
+  ## every other one waits on the same future, so eight concurrent requests cost
+  ## one token call, not eight.
+  let leg = gateway.cfg.legs[index]
+  if not leg.hasOauth:
+    return RefreshOutcome(ok: true)
+  if not force:
+    let expiresAt = gateway.oauth[index].expiresAt
+    if expiresAt <= 0:
+      # No expiry in the config: nothing says the token is stale, so only a 401
+      # is allowed to force a refresh.
+      return RefreshOutcome(ok: true)
+    if epochTime() < expiresAt - leg.oauth.refreshSkewSeconds.float:
+      return RefreshOutcome(ok: true)
+  if gateway.oauth[index].inFlight != nil:
+    return await gateway.oauth[index].inFlight
+  let pending = gateway.refreshLeg(index)
+  gateway.oauth[index].inFlight = pending
+  var outcome: RefreshOutcome
+  try:
+    outcome = await pending
+  finally:
+    gateway.oauth[index].inFlight = nil
+  outcome
+
+proc refreshReason(outcome: RefreshOutcome): string =
+  if outcome.timedOut: TokenRefreshTimeout else: TokenRefreshFailed
+
+proc bearerFor(gateway: Gateway, index: int): string =
+  ## An oauth leg sends its live access token; a leg without the block keeps the
+  ## static api_key it always had.
+  let leg = gateway.cfg.legs[index]
+  if leg.hasOauth: gateway.oauth[index].accessToken
+  elif leg.apiKey.len > 0: leg.apiKey
+  else: ""
+
+proc attemptLeg(gateway: Gateway, request: Request, leg: Leg, bearer: string,
+                body: string,
                 stream: bool, totalDeadline: float): Future[AttemptOutcome] {.async.} =
   ## One leg, one attempt, and the caller's response written from here when the
   ## attempt produced one. The failover window ends when response headers arrive
@@ -945,8 +1374,8 @@ proc attemptLeg(gateway: Gateway, request: Request, leg: Leg, body: string,
       if name.toLowerAscii() == "authorization":
         hasAuthorization = true
       head.add name & ": " & value & "\r\n"
-    if leg.apiKey.len > 0 and not hasAuthorization:
-      head.add "Authorization: Bearer " & leg.apiKey & "\r\n"
+    if bearer.len > 0 and not hasAuthorization:
+      head.add "Authorization: Bearer " & bearer & "\r\n"
     head.add "\r\n"
 
     # The head send drives the TLS handshake, so its deadline is the TLS one.
@@ -1153,6 +1582,8 @@ proc handleChat(gateway: Gateway, request: Request): Future[void] {.async.} =
   var tokensIn: Option[int]
   var tokensOut: Option[int]
   var answered = false
+  var hardStop = ""
+  var hardStopDetail = ""
 
   let order = gateway.pickOrder()
   if order.len == 0:
@@ -1164,13 +1595,37 @@ proc handleChat(gateway: Gateway, request: Request): Future[void] {.async.} =
   if not answered:
     for position, index in order:
       let leg = gateway.cfg.legs[index]
+      # §4: a credential that cannot be refreshed stops the request here. Nothing
+      # is dialled, nothing is failed over, no stale bearer leaves the process.
+      if leg.hasOauth:
+        let ready = await gateway.refreshIfNeeded(index, force = false)
+        if not ready.ok:
+          hardStop = refreshReason(ready)
+          hardStopDetail = ready.detail
+          route = leg.name
+          break
       let probing = gateway.legs[index].coolingUntil > 0
       if probing:
         gateway.legs[index].probeInFlight = true
       gateway.markAttempted(index)
       route = leg.name
-      let outcome = await gateway.attemptLeg(request, leg, forwardBody, stream,
-                                             totalDeadline)
+      var outcome = await gateway.attemptLeg(request, leg,
+                                             gateway.bearerFor(index), forwardBody,
+                                             stream, totalDeadline)
+      # A 401 from an oauth leg buys one forced refresh and one retry, then it is
+      # classified exactly as before. Never a loop.
+      if outcome.kind == akFailed and outcome.reason == TokenAuth401 and
+         leg.hasOauth:
+        let retried = await gateway.refreshIfNeeded(index, force = true)
+        if not retried.ok:
+          if probing:
+            gateway.legs[index].probeInFlight = false
+          hardStop = refreshReason(retried)
+          hardStopDetail = retried.detail
+          break
+        outcome = await gateway.attemptLeg(request, leg,
+                                           gateway.bearerFor(index), forwardBody,
+                                           stream, totalDeadline)
       if probing:
         gateway.legs[index].probeInFlight = false
 
@@ -1198,6 +1653,17 @@ proc handleChat(gateway: Gateway, request: Request): Future[void] {.async.} =
         answered = true
         break
 
+  if hardStop.len > 0:
+    # §4: loud on stderr, one 502 to the caller, and no answer from an expired
+    # credential. The detail never carries a token.
+    stderr.writeLine("kori: credential refresh failed for route '" & route & "': " &
+                     hardStopDetail)
+    await request.sendErrorBody(502, credentialRefreshBody(hardStop, hardStopDetail))
+    status = 502
+    tokensIn = none(int)
+    tokensOut = none(int)
+    answered = true
+
   if not answered:
     # §5.5: one 502 whatever the legs returned, carrying the terminal reason.
     let message = if chain.lastReason.len > 0: chain.lastReason else: "all_legs_failed"
@@ -1215,9 +1681,11 @@ proc handleChat(gateway: Gateway, request: Request): Future[void] {.async.} =
   # §5.1: `failover_reason` is the first reason the request met, with
   # `mid_stream_abort` as the one outcome that overrides it because it is what
   # the caller actually saw (D9.2, D10.1). A request that never failed over keeps
-  # the empty string, which is the binding answer for this field.
+  # the empty string, which is the binding answer for this field. A hard stop is
+  # not a failover: nothing was abandoned, so `failover_from` stays empty.
   let logReason =
-    if terminalAbort: TokenMidStreamAbort
+    if hardStop.len > 0: hardStop
+    elif terminalAbort: TokenMidStreamAbort
     else: chain.firstReason
 
   let latencyMs = int((epochTime() - started) * 1000.0)
@@ -1228,7 +1696,7 @@ proc handleChat(gateway: Gateway, request: Request): Future[void] {.async.} =
       latencyMs = latencyMs,
       tokensIn = tokensIn,
       tokensOut = tokensOut,
-      failoverFrom = chain.firstFrom,
+      failoverFrom = (if hardStop.len > 0: "" else: chain.firstFrom),
       failoverReason = logReason,
       stream = stream)):
     inc gateway.logLines
@@ -1606,15 +2074,29 @@ proc configJson*(gateway: Gateway): string =
       headers.add(%headerName)
     node["headers"] = headers
     var credential = newJObject()
-    credential["name"] = %(leg.name & " API key")
-    credential["state"] = %(if leg.apiKey.len > 0: "set" else: "missing")
+    let hasLiveToken = leg.hasOauth and gateway.oauth[index].accessToken.len > 0
+    credential["name"] = %(if leg.hasOauth: leg.name & " OAuth token"
+                           else: leg.name & " API key")
+    credential["state"] = %(if hasLiveToken or (not leg.hasOauth and
+                                                leg.apiKey.len > 0): "set"
+                            else: "missing")
     credential["source"] = %"file"
     var credentialRef = gateway.configPath
-    if index < gateway.credentialRefs.len and
+    if not leg.hasOauth and index < gateway.credentialRefs.len and
        gateway.credentialRefs[index].len > 0:
       credentialRef = gateway.credentialRefs[index]
     credential["ref"] = %credentialRef
     node["credential"] = credential
+    # §4: the state of the refresh, never the credential. An epoch expiry is not a
+    # secret; a token is.
+    if leg.hasOauth:
+      var oauth = newJObject()
+      oauth["state"] = %(if hasLiveToken: "set" else: "missing")
+      if gateway.oauth[index].expiresAt > 0:
+        oauth["expires_at"] = %int64(gateway.oauth[index].expiresAt)
+      else:
+        oauth["expires_at"] = newJNull()
+      node["oauth"] = oauth
     legs.add(node)
   root["legs"] = legs
 

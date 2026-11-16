@@ -10,6 +10,12 @@ templates under `ops/` describe the intended host shape and have not been run ag
 
 ## [Unreleased]
 
+### Added
+
+- OAuth credential refresh per leg: an expired token is refreshed before the dial, a `401`
+  buys one refresh and one retry, the rotated credential is written back to the config, and
+  a refresh that fails stops the request with `502` instead of failing over.
+
 ## [0.3.0] - 2026-11-16
 
 ### Added

@@ -16,7 +16,7 @@ if [ ! -x "$KORI_BIN" ]; then
   exit 1
 fi
 
-CASES="a1-failover a2-dead-socket a3-deadlines a4-capacity a5-client-error a6-stream a7-toolcall a8-fresh a9-all-dead a10-admin"
+CASES="a1-failover a2-dead-socket a3-deadlines a4-capacity a5-client-error a6-stream a7-toolcall a8-fresh a9-all-dead a10-admin a11-refresh"
 
 red=
 green=0

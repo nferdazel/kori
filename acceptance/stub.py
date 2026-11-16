@@ -119,12 +119,21 @@ def log_conn(path, note):
 
 
 def capture(path, raw):
+    """Last request wins. The temp name is unique per thread: eight concurrent
+    requests sharing one temp file made a capture lose the race and the handler
+    die before answering (A11d)."""
     if not path:
         return
-    tmp = path + ".tmp"
-    with open(tmp, "wb") as fh:
-        fh.write(raw)
-    os.replace(tmp, path)
+    tmp = "%s.tmp.%d.%d" % (path, os.getpid(), threading.get_ident())
+    try:
+        with open(tmp, "wb") as fh:
+            fh.write(raw)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
 
 
 def read_head(conn):
@@ -186,6 +195,36 @@ def handle(conn, addr, opts):
         body = read_body(conn, headers, rest)
         capture(opts.capture_file, head + body)
         mode = opts.mode
+
+        # A provider that only accepts one bearer: anything else is a 401, so a
+        # case can prove which credential the gateway actually sent (A11).
+        if opts.expect_bearer:
+            if headers.get("authorization", "") != "Bearer " + opts.expect_bearer:
+                send(conn, 401, "application/json",
+                     dumps({"error": {"message": "Unauthorized"}}))
+                try:
+                    conn.shutdown(socket.SHUT_WR)
+                except OSError:
+                    pass
+                return
+
+        # The token endpoint. One JSON answer per call; the count file is the
+        # number of token calls this run made, so single flight is countable.
+        if mode == "token":
+            if opts.status != 200:
+                send(conn, opts.status, "application/json",
+                     dumps({"error": {"message": "token endpoint refused"}}))
+            else:
+                payload = {"access_token": opts.token, "token_type": "Bearer",
+                           "expires_in": opts.token_ttl}
+                if opts.rotate:
+                    payload["refresh_token"] = opts.rotate
+                send(conn, 200, "application/json", json.dumps(payload).encode())
+            try:
+                conn.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+            return
 
         if mode == "never":
             deadline = time.time() + opts.ttl
@@ -334,6 +373,11 @@ def main():
     ap.add_argument("--gap", type=float, default=119.0)
     ap.add_argument("--model", default="")
     ap.add_argument("--after", type=int, default=0)
+    # A11: the token endpoint's answer, and the one bearer a provider accepts.
+    ap.add_argument("--token", default="STUB-ACCESS-TOKEN")
+    ap.add_argument("--token-ttl", type=int, default=3600)
+    ap.add_argument("--rotate", default="")
+    ap.add_argument("--expect-bearer", default="")
     ap.add_argument("--host", default="127.0.0.1")
     opts = ap.parse_args()
 
