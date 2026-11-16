@@ -4,9 +4,14 @@
 # Called by the host webhook (adnanh/webhook, hook `kori`) with:
 #   $1 = repository.name   $2 = ref
 #
-# Order: fail-closed ref guard -> flock -> git fetch/reset -> rev -> tag :local to :prev
-#        -> build :local -> install unit + render edge block -> restart -> health gate
-#        -> auto-rollback to :prev -> .deployed_rev -> self-update.
+# Order: fail-closed ref guard -> flock -> git fetch/reset -> rev -> pull the signed image for
+#        that commit, verify its revision label and signature -> tag :local to :prev -> install
+#        unit + render edge block -> restart -> health gate -> auto-rollback to :prev
+#        -> .deployed_rev -> self-update.
+#
+# The host never builds. The image is built and signed in GitHub Actions (ci.yml, job
+# image-api); this script only pulls ghcr.io/nferdazel/kori-api:sha-<7>. A host build here would
+# be a second, unreviewed path to production and a second thing to keep working.
 #
 # No secret lives in this repo. Everything host-specific comes from the env file
 # (/srv/qouver/apps/kori/env/kori-prod.env, mode 600).
@@ -20,6 +25,7 @@ REF="${2:-}"
 APP_DIR="${KORI_APP_DIR:-/srv/qouver/apps/kori}"
 ENV_FILE="$APP_DIR/env/kori-prod.env"
 IMAGE="${KORI_IMAGE:-localhost/kori}"
+IMAGE_REPO="${KORI_IMAGE_REPO:-ghcr.io/nferdazel/kori-api}"
 SERVICE="${KORI_SERVICE:-kori-api}"
 UNIT_DIR="${KORI_UNIT_DIR:-$HOME/.config/containers/systemd}"
 STATE_FILE="$APP_DIR/.deployed_rev"
@@ -64,7 +70,8 @@ MONO_DIR="$APP_DIR/src"
 log "==> sync $REPO main"
 git -C "$MONO_DIR" fetch --quiet origin main
 git -C "$MONO_DIR" reset --hard --quiet origin/main
-REV="$(git -C "$MONO_DIR" rev-parse --short=8 HEAD)"
+REV="$(git -C "$MONO_DIR" rev-parse HEAD)"
+SHORT="${REV:0:7}"
 log "==> rev $REV"
 
 wait_healthy() {
@@ -83,18 +90,51 @@ restart_service() {
   systemctl --user restart "$SERVICE"
 }
 
-# ── 4. Retention: :local becomes :prev, then build :local ────────────────────
-# Only two tags exist at any moment. No commit-SHA tags: they are never pruned and the
-# podman store fills up silently.
-if podman image exists "${IMAGE}:local"; then
-  podman tag "${IMAGE}:local" "${IMAGE}:prev"
-  log "==> tagged previous :local as :prev"
-fi
+# ── 4. Pull the image this commit built; the host never builds ───────────────
+# sha-<7> is a filename until the image proves which commit it is. Two independent proofs run
+# before any tag moves: the revision label must equal the commit just checked out, and the
+# signature must come from this repository's workflow. Both failures leave the running
+# container untouched.
+#
+# Retention: :local becomes :prev, the pulled sha tag becomes :local, and the sha tag is removed
+# right after. No commit-SHA tag is left in the store to fill the disk silently.
+IMAGE_REF="${IMAGE_REPO}:sha-${SHORT}"
+IMAGE_PULLED=0
+PULL_OUT="$(mktemp)"
 
-log "==> build ${IMAGE}:local (dashboard built in-image, before the Nim step)"
-if ! podman build -t "${IMAGE}:local" -f "$MONO_DIR/Containerfile" "$MONO_DIR" >>"$LOG" 2>&1; then
-  log "ERROR: build failed; :local still points at the running image, nothing restarted"
-  exit 1
+if podman pull "$IMAGE_REF" >"$PULL_OUT" 2>&1; then
+  IMAGE_REV="$(podman inspect -f '{{ index .Labels "org.opencontainers.image.revision" }}' "$IMAGE_REF" 2>/dev/null || true)"
+  if [ "$IMAGE_REV" != "$REV" ]; then
+    rm -f "$PULL_OUT"
+    die "Image $IMAGE_REF says revision '${IMAGE_REV}', payload says $REV — running container untouched"
+  fi
+  cosign verify "$IMAGE_REF" \
+    --certificate-identity-regexp "^https://github.com/nferdazel/kori/" \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com >/dev/null 2>&1 \
+    || { rm -f "$PULL_OUT"; die "cosign verify failed for $IMAGE_REF — running container untouched"; }
+
+  if podman image exists "${IMAGE}:local"; then
+    podman tag "${IMAGE}:local" "${IMAGE}:prev"
+    log "==> tagged previous :local as :prev"
+  fi
+  podman tag "$IMAGE_REF" "${IMAGE}:local"
+  podman rmi "$IMAGE_REF" >/dev/null 2>&1 || true   # :local and :prev stay the only local tags
+  IMAGE_PULLED=1
+  log "==> image pulled, verified and tagged :local (revision $IMAGE_REV)"
+elif grep -qiE 'manifest unknown|manifest for .* not found|no such manifest' "$PULL_OUT"; then
+  # Legitimate: this commit did not change the image side, so CI pushed nothing for it.
+  log "==> no image for ${SHORT} (this commit built none); keeping the running container"
+else
+  # A dead registry, an expired token or a 502 is NOT "not built". Fail closed.
+  TAIL_OUT="$(tail -3 "$PULL_OUT" 2>/dev/null || true)"
+  rm -f "$PULL_OUT"
+  die "registry pull failed and this is NOT 'not built': $TAIL_OUT"
+fi
+rm -f "$PULL_OUT"
+
+if [ "$IMAGE_PULLED" != "1" ]; then
+  log "==> nothing to deploy for ${SHORT}; container left running, no restart"
+  exit 0
 fi
 
 # ── 5. Unit + edge block from the repo (host is not the source of truth) ─────
