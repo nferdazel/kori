@@ -187,3 +187,9 @@ jobs:
 
       - name: "Smoke dry run (edge matrix, bearer gate)"
         run: bash tests/dryrun-smoke.sh
+
+      # The first deploy is gated on host facts nobody can see from a laptop: port, build slot,
+      # disk, lingering, the Quadlet generator, the Caddy module set. Every FAIL branch is driven
+      # by the harness, so the check cannot rot into "always green".
+      - name: "Preflight dry run (host gate branches)"
+        run: bash tests/dryrun-preflight.sh
