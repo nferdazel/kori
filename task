@@ -1,0 +1,59 @@
+#!/bin/sh
+# task — one entry point for the checks CI runs, so a local run and a red check mean the same thing.
+#
+# A target whose input does not exist yet (apps/web, apps/api, the acceptance harness) exits 1 with
+# what is missing. It never reports success for work that did not happen.
+set -eu
+cd "$(dirname "$0")"
+
+usage() {
+  cat <<'EOF'
+task — one entry point for the checks CI runs.
+
+  ./task check   everything below, in CI order
+  ./task ops     shellcheck + deploy/smoke dry runs (no podman, no network)
+  ./task web     vite build in apps/web, then fail if the committed dist is stale
+  ./task nim     nim check, nimble test, acceptance harness against a real binary
+  ./task help    this text
+EOF
+}
+
+need() { command -v "$1" >/dev/null 2>&1 || { echo "missing: $1 — $2" >&2; exit 1; }; }
+missing() { echo "not in the repo yet: $1 ($2)" >&2; exit 1; }
+
+task_ops() {
+  need shellcheck "brew install shellcheck, or apt-get install shellcheck"
+  shellcheck -S warning -x ops/scripts/*.sh tools/gen-static.sh tests/dryrun-*.sh task
+  bash tests/dryrun-deploy.sh
+  bash tests/dryrun-smoke.sh
+}
+
+task_web() {
+  [ -f apps/web/package.json ] || missing apps/web "the Svelte source"
+  need npm "install Node 22"
+  ( cd apps/web && npm ci --no-audit --no-fund && npm run build )
+  # The committed dist is what `nim c` embeds; a stale one ships an old dashboard silently.
+  git diff --quiet -- apps/web/dist \
+    || { echo "apps/web/dist is stale — commit the fresh build" >&2; exit 1; }
+}
+
+task_nim() {
+  [ -f apps/api/src/kori.nim ] || missing apps/api "the gateway source"
+  [ -d apps/web/dist ] || missing apps/web/dist "run ./task web first"
+  [ -f acceptance/selftest.sh ] || missing acceptance "the A1-A11 harness"
+  need nim "install Nim 2.4.2"
+  sh tools/gen-static.sh apps/web/dist src/generated/static_files.nim
+  nim check --hints:off apps/api/src/kori.nim
+  nimble test -y
+  nim c -d:release --mm:orc --threads:on --hints:off -o:apps/api/src/kori apps/api/src/kori.nim
+  KORI_BIN=./apps/api/src/kori sh acceptance/selftest.sh
+}
+
+case "${1:-check}" in
+  check) task_ops; task_web; task_nim ;;
+  ops) task_ops ;;
+  web) task_web ;;
+  nim) task_nim ;;
+  help | -h | --help) usage ;;
+  *) echo "unknown target: $1 (try ./task help)" >&2; exit 2 ;;
+esac
