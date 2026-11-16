@@ -111,7 +111,7 @@ the repository, in an image or in a log.
 | `legs[].name` | yes | the name that appears in the log and on the dashboard |
 | `legs[].base_url` | yes | kori appends `/chat/completions` to its path |
 | `legs[].api_key` | no | sent as `Authorization: Bearer …` unless `headers` already sets one, or the leg has an `oauth` block |
-| `legs[].model` | no | falls back to the leg name; it is reported, not rewritten into the body |
+| `legs[].model` | no | the model id that leg is sent, replacing the caller's `model` on that leg only; falls back to the leg name, which is reported and never sent (DEC-10) |
 | `legs[].headers` | no | extra request headers, for example `x-opencode-session` |
 | `legs[].role` | no | `primary` or `fallback`, default `primary` |
 | `legs[].weight` | no | must be `1`; any other value is refused at startup |

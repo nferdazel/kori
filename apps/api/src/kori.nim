@@ -107,6 +107,7 @@ type
     baseUrl*: string
     apiKey*: string
     model*: string
+    hasModel*: bool          ## `model` came from the config, so it is sent upstream
     headers*: seq[(string, string)]
     role*: LegRole
     weight*: int
@@ -379,8 +380,13 @@ proc loadConfig*(path: string): Config =
       failConfig(ctx & ".base_url is required")
     leg.apiKey = optionalString(item, "api_key", ctx)
     # CONTRACT §1: model is optional; the leg name stands in, never a refusal.
+    # A model the config names is also what kori sends upstream (DEC-10): the
+    # three providers do not share model ids, so the leg's id replaces the
+    # caller's on that leg alone. Without it the caller's model passes through.
     leg.model = optionalString(item, "model", ctx)
-    if leg.model.len == 0:
+    if leg.model.len > 0:
+      leg.hasModel = true
+    else:
       leg.model = leg.name
     let headers = item{"headers"}
     if headers != nil and headers.kind != JNull:
@@ -876,6 +882,115 @@ proc injectIncludeUsage*(body: string): string =
     body[0 .. brace] & addition & body[after .. ^1]
   else:
     body[0 .. brace] & addition & "," & body[after .. ^1]
+
+proc isModelKey(rawKey: string): bool =
+  if rawKey == "model":
+    return true
+  if rawKey.contains('\\'):
+    try:
+      let parsed = parseJson("\"" & rawKey & "\"")
+      if parsed.kind == JString and parsed.getStr() == "model":
+        return true
+    except CatchableError:
+      discard
+  false
+
+proc rewriteModel*(body, model: string): string =
+  ## DEC-10: the leg's own model id replaces the caller's, at the top level and
+  ## nowhere else. Textual on purpose: every other byte the caller sent still
+  ## reaches the leg, the same promise `injectIncludeUsage` keeps. A body with no
+  ## top-level `model` string is returned untouched, never refused.
+  if model.len == 0 or body.len == 0:
+    return body
+
+  var stack: seq[char] = @[]
+  var expectingKey = false
+  var replacements: seq[tuple[valStart, valStop: int]] = @[]
+
+  var i = 0
+  while i < body.len:
+    let c = body[i]
+    case c
+    of '{':
+      stack.add '{'
+      if stack.len == 1:
+        expectingKey = true
+      inc i
+    of '}':
+      if stack.len > 0 and stack[^1] == '{':
+        discard stack.pop()
+      if stack.len == 1 and stack[0] == '{':
+        expectingKey = false
+      inc i
+    of '[':
+      stack.add '['
+      inc i
+    of ']':
+      if stack.len > 0 and stack[^1] == '[':
+        discard stack.pop()
+      inc i
+    of ',':
+      if stack.len == 1 and stack[0] == '{':
+        expectingKey = true
+      inc i
+    of '"':
+      let isTopKey = (stack.len == 1 and stack[0] == '{' and expectingKey)
+      let strStart = i
+      inc i
+      while i < body.len and body[i] != '"':
+        if body[i] == '\\' and i + 1 < body.len:
+          inc i, 2
+        else:
+          inc i
+      if i >= body.len:
+        return body
+      let strStop = i
+      inc i
+
+      if isTopKey:
+        let rawKey = body[strStart + 1 ..< strStop]
+        expectingKey = false
+        var cursor = i
+        while cursor < body.len and body[cursor] in {' ', '\t', '\r', '\n'}:
+          inc cursor
+        if cursor < body.len and body[cursor] == ':':
+          inc cursor
+          while cursor < body.len and body[cursor] in {' ', '\t', '\r', '\n'}:
+            inc cursor
+          if isModelKey(rawKey):
+            if cursor < body.len and body[cursor] == '"':
+              let vStart = cursor
+              var vCursor = cursor + 1
+              while vCursor < body.len and body[vCursor] != '"':
+                if body[vCursor] == '\\' and vCursor + 1 < body.len:
+                  inc vCursor, 2
+                else:
+                  inc vCursor
+              if vCursor >= body.len:
+                return body
+              let vStop = vCursor + 1
+              replacements.add((vStart, vStop))
+              i = vStop
+            else:
+              i = cursor
+          else:
+            i = cursor
+    else:
+      inc i
+
+  if replacements.len == 0:
+    return body
+
+  let replacement = $(%model)
+  var res = ""
+  var lastIdx = 0
+  for r in replacements:
+    res.add body[lastIdx ..< r.valStart]
+    res.add replacement
+    lastIdx = r.valStop
+  if lastIdx < body.len:
+    res.add body[lastIdx .. ^1]
+  res
 
 proc wantsStream*(body: string): bool =
   try:
@@ -1609,8 +1724,11 @@ proc handleChat(gateway: Gateway, request: Request): Future[void] {.async.} =
         gateway.legs[index].probeInFlight = true
       gateway.markAttempted(index)
       route = leg.name
+      # DEC-10: a leg that names a model gets that id, and only that leg does.
+      let legBody = if leg.hasModel: rewriteModel(forwardBody, leg.model)
+                    else: forwardBody
       var outcome = await gateway.attemptLeg(request, leg,
-                                             gateway.bearerFor(index), forwardBody,
+                                             gateway.bearerFor(index), legBody,
                                              stream, totalDeadline)
       # A 401 from an oauth leg buys one forced refresh and one retry, then it is
       # classified exactly as before. Never a loop.
@@ -1624,7 +1742,7 @@ proc handleChat(gateway: Gateway, request: Request): Future[void] {.async.} =
           hardStopDetail = retried.detail
           break
         outcome = await gateway.attemptLeg(request, leg,
-                                           gateway.bearerFor(index), forwardBody,
+                                           gateway.bearerFor(index), legBody,
                                            stream, totalDeadline)
       if probing:
         gateway.legs[index].probeInFlight = false

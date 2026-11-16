@@ -169,3 +169,29 @@ forced refresh, one retry, then the usual classification.
 absorbed by the failover chain. The cost is that a broken credential takes the route down
 even when another leg could have answered, which is the point: it is an operator problem,
 not a provider problem.
+
+## DEC-10 — A leg's `model` is the id that leg is sent
+
+**Status:** accepted. Supersedes the README line that said `model` is reported and never
+rewritten, and fills a gap the failover spec leaves open.
+
+**Context.** The spec fixes one primary route plus ordered fallback across opencode-go,
+commandcode and sinarcloud, and it says nothing about the `model` field. The three providers
+do not accept the same ids: a caller that sends one name cannot be served by all three if
+kori forwards it verbatim, so the three-leg chain could never answer from more than one leg.
+Measured on 2026-11-16: opencode-go answers `429 GoUsageLimitError` and commandcode
+`400 insufficient credits`, so only sinarcloud has ever served a request, and the mismatch
+had not shown up yet.
+
+**Decision.** When a leg's config names `model`, kori replaces the caller's top-level
+`model` with that id before dialling that leg, and only that leg. A leg without `model`
+forwards the caller's body byte for byte, which is what every existing config does. The
+rewrite is textual and touches one string value: everything else the caller sent reaches the
+leg unchanged, the same promise `injectIncludeUsage` keeps. A body with no top-level `model`
+string is not refused and not given one.
+
+**Consequences.** One gateway can front three providers with different ids, and the caller
+keeps asking for one model name. The cost is that a leg with `model` set cannot serve a
+per-request model choice: the route decides the model, not the caller. That is consistent
+with a fixed chain and it is visible in the config, but a future need for caller-side model
+selection is a new decision, not a config flag.

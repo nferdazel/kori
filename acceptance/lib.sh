@@ -244,7 +244,7 @@ kill_stubs() {
   fi
 }
 
-write_config() { # write_config "name|base_url|api_key|header:value[|role[|weight]]" ...
+write_config() { # write_config "name|base_url|api_key|header:value[|role[|weight[|model]]]" ...
   # D12: `balance` (top level) and per-leg `role` and `weight` are written only when
   # a case asks for them, so A1 to A10 keep the fixture shape they were proved on and
   # A11 is the one block that carries the new keys. GW_BALANCE=true turns balancing on.
@@ -283,6 +283,8 @@ for spec in legs:
         leg["role"] = parts[4]
     if len(parts) > 5 and parts[5]:
         leg["weight"] = int(parts[5])
+    if len(parts) > 6 and parts[6]:
+        leg["model"] = parts[6]
     cfg["legs"].append(leg)
 json.dump(cfg, open(path, "w"), indent=2)
 PY

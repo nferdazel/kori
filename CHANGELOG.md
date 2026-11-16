@@ -15,6 +15,9 @@ templates under `ops/` describe the intended host shape and have not been run ag
 - OAuth credential refresh per leg: an expired token is refreshed before the dial, a `401`
   buys one refresh and one retry, the rotated credential is written back to the config, and
   a refresh that fails stops the request with `502` instead of failing over.
+- A leg's `model` is the id that leg is sent (DEC-10): the caller's top-level `model` is
+  replaced with it on that leg alone, so one gateway can chain providers that do not share
+  model ids. A leg without `model` still forwards the caller's body byte for byte.
 
 ## [0.3.0] - 2026-11-16
 

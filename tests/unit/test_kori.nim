@@ -219,6 +219,41 @@ block:
   check "R10 keeps an empty object valid", injectIncludeUsage("{}") ==
     """{"stream_options":{"include_usage":true}}"""
 
+block:
+  # DEC-10: the leg's model id replaces the caller's, and the rest of the bytes
+  # stay as the caller wrote them.
+  let rewritten = rewriteModel(StreamRequest, "deepseek/deepseek-v4-1-flash")
+  check "3c the leg model replaces the caller's",
+    parseJson(rewritten){"model"}.getStr() == "deepseek/deepseek-v4-1-flash"
+  check "3c every other byte survives the rewrite",
+    rewritten.replace("\"deepseek/deepseek-v4-1-flash\"", "\"flash\"") == StreamRequest
+  check "3c a nested model key is not the one replaced",
+    rewriteModel("""{"messages":[{"model":"inner"}],"model":"outer"}""", "leg-model") ==
+      """{"messages":[{"model":"inner"}],"model":"leg-model"}"""
+  check "3c a body with no model key is untouched",
+    rewriteModel("""{"messages":[]}""", "leg-model") == """{"messages":[]}"""
+  check "3c a non-string model is left alone",
+    rewriteModel("""{"model":7}""", "leg-model") == """{"model":7}"""
+  check "3c an empty leg model is a no-op",
+    rewriteModel(StreamRequest, "") == StreamRequest
+  check "3c the rewrite is valid JSON with a quote in the id",
+    parseJson(rewriteModel("""{"model":"x"}""", "a\"b")){"model"}.getStr() == "a\"b"
+  check "3c a string value named model before the key is ignored",
+    rewriteModel("""{"foo":"model","model":"caller-id"}""", "leg-model") ==
+      """{"foo":"model","model":"leg-model"}"""
+  check "3c an array element named model before the key is ignored",
+    rewriteModel("""{"stop":["model"],"model":"caller-id"}""", "leg-model") ==
+      """{"stop":["model"],"model":"leg-model"}"""
+  check "3c an escaped model key is rewritten",
+    rewriteModel("""{"\u006dodel":"caller-id"}""", "leg-model") ==
+      """{"\u006dodel":"leg-model"}"""
+  check "3c duplicate top-level model keys are both rewritten",
+    rewriteModel("""{"model":"c1","model":"c2"}""", "leg-model") ==
+      """{"model":"leg-model","model":"leg-model"}"""
+  check "3c top-level array is not treated as top-level object",
+    rewriteModel("""[{"model":"caller-id"}]""", "leg-model") ==
+      """[{"model":"caller-id"}]"""
+
 # ---------------------------------------------------------------- the router ---
 
 proc makeGateway(legs: seq[Leg], balance: bool): Gateway =
