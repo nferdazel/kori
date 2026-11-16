@@ -10,6 +10,9 @@ nimcache/
 # Real env files live on qouver1 only (/srv/qouver/apps/kori/env/, mode 600).
 ops/env/*.env
 !ops/env/*.env.example
+# The real provider config belongs on the host (mode 600), never in the repo; the committed
+# template next to this line is the shape and carries placeholders only.
+ops/etc/config.json
 
 # Deploy state written on the host
 .deployed_rev

@@ -11,7 +11,7 @@ usage() {
 task — one entry point for the checks CI runs.
 
   ./task check   everything below, in CI order
-  ./task ops     shellcheck + deploy/smoke dry runs (no podman, no network)
+  ./task ops     shellcheck + deploy/smoke/preflight/config dry runs (no podman, no network)
   ./task web     vite build in apps/web, then fail if the committed dist is stale
   ./task nim     nim check, nimble test, acceptance harness against a real binary
   ./task version print VERSION, the single source for the binary and the nimble package
@@ -34,6 +34,7 @@ task_ops() {
   bash tests/dryrun-deploy.sh
   bash tests/dryrun-smoke.sh
   bash tests/dryrun-preflight.sh
+  bash tests/dryrun-config.sh
 }
 
 task_web() {
