@@ -206,17 +206,26 @@ jobs:
     name: "Security: secrets scan"
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    env:
+      GITLEAKS_VERSION: 8.30.1
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
       # Every repository here is public. A leaked token is public the moment it is pushed, so the
-      # scan runs on the full history and not just the diff.
-      - name: gitleaks
-        uses: gitleaks/gitleaks-action@v3
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # scan walks the whole history and not just the diff. The wrapper action derives a
+      # `before..after` range from the push event, and a rewritten main leaves that range
+      # unresolvable, so the binary is called directly instead.
+      - name: Install gitleaks
+        run: |
+          set -eu
+          curl -fsSL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            | sudo tar -xz -C /usr/local/bin gitleaks
+          gitleaks version
+
+      - name: Scan the full history
+        run: gitleaks git --redact --no-banner --verbose --exit-code 1 .
 
   ops:
     name: "Ops: shellcheck + deploy/smoke dry runs"
