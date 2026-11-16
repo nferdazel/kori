@@ -1,0 +1,282 @@
+# kori
+
+kori is an in-house LLM provider gateway: one Nim binary that exposes a single
+`/v1/chat/completions` door and routes each request across an ordered list of provider
+legs, failing over when a leg is dead. It exists to replace a LiteLLM deployment that
+carried a Python service and a Postgres database for a workload of one person. kori has
+no Python, no database and no migrations. Its only durable output is an append-only
+request log.
+
+What it does:
+
+- **One door, ordered legs.** A primary leg plus ordered fallbacks. The caller sees one
+  endpoint and never learns which leg answered.
+- **Dead-route classification.** A leg that answers `401`, `400 MissingSessionID`,
+  connection refused, a dial or TLS timeout, a quota `429` or a `5xx` is marked dead and
+  the next leg is tried. A client error that belongs to the caller (`400`, `403`, `404`,
+  a plain `429`) is returned unchanged and nothing fails over.
+- **Cooldown.** A dead leg is skipped without a dial until its cooldown expires.
+- **One log line per request.** Append-only JSONL carrying route, status, latency, token
+  counts and the failover reason.
+- **A read-only dashboard** compiled into the binary, served from memory.
+
+## Requirements
+
+| Tool | Version | Needed for |
+|---|---|---|
+| Nim | 2.4.2 | the binary, the unit tests, the acceptance harness |
+| Node.js and npm | 22 | rebuilding the dashboard under `apps/web` only |
+| shellcheck | any recent | `./task ops` |
+| jq, curl, python3 | stock | the acceptance harness under `acceptance/` |
+
+Nim 2.4.2 is the version CI pins. The binary needs OpenSSL headers at build time, because
+every leg is `https`.
+
+## Build
+
+```sh
+nim c -d:release --mm:orc --threads:on --hints:off -o:apps/api/src/kori apps/api/src/kori.nim
+```
+
+`apps/api/src/config.nims` is picked up automatically and adds `-d:ssl` plus the revision
+string `/healthz` reports, so no extra flags are needed.
+
+`./task nim` runs the same build after `nim check`, `nimble test` and the static-embed
+drift check, then runs the acceptance self-test against the binary.
+
+## Run
+
+```sh
+./apps/api/src/kori --config ~/.config/kori/kori.json --port 4021 --log /tmp/kori.jsonl
+```
+
+`--config` is required. There is no default path and no search path. A missing file,
+unreadable file or invalid JSON exits `2` before the listener opens.
+
+| Flag | Meaning | Default |
+|---|---|---|
+| `--config` | path to the JSON config | required |
+| `--address` | IPv4 literal to bind | `listen.host`, then `127.0.0.1` |
+| `--port` | port, 1–65535 | `listen.port`, then `8787` |
+| `--log` | request log path | `log.path`; exit `2` if neither is set |
+| `--help` | usage on stdout | — |
+
+Both `--flag value` and `--flag=value` are accepted. Precedence is CLI over config over
+built-in default. An unknown flag, a non-numeric port or a non-literal address exits `2`
+with one usage line on stderr. Exit codes: `0` clean, `2` bad config or CLI, `1` anything
+else.
+
+## Configuration
+
+The config is a JSON object. It holds every provider credential, so it never belongs in
+the repository, in an image or in a log.
+
+```json
+{
+  "listen": { "host": "127.0.0.1", "port": 8787 },
+  "log":    { "path": "/var/log/kori/requests.jsonl" },
+  "balance": false,
+  "legs": [
+    {
+      "name": "opencode-go",
+      "base_url": "https://opencode.ai/inference/go/openai/v1",
+      "api_key": "…",
+      "model": "deepseek-v4.1-flash",
+      "headers": { "x-opencode-session": "…" },
+      "role": "primary"
+    },
+    { "name": "commandcode", "base_url": "…", "api_key": "…", "role": "fallback" },
+    { "name": "sinarcloud",  "base_url": "…", "api_key": "…", "role": "fallback" }
+  ]
+}
+```
+
+| Key | Required | Notes |
+|---|---|---|
+| `legs` | yes | at least one; order in the array is the failover order |
+| `legs[].name` | yes | the name that appears in the log and on the dashboard |
+| `legs[].base_url` | yes | kori appends `/chat/completions` to its path |
+| `legs[].api_key` | no | sent as `Authorization: Bearer …` unless `headers` already sets one |
+| `legs[].model` | no | falls back to the leg name; it is reported, not rewritten into the body |
+| `legs[].headers` | no | extra request headers, for example `x-opencode-session` |
+| `legs[].role` | no | `primary` or `fallback`, default `primary` |
+| `legs[].weight` | no | must be `1`; any other value is refused at startup |
+| `balance` | no | default `false`, which keeps strict leg order |
+| `listen`, `log` | no | overridden by `--address`, `--port`, `--log` |
+
+The caller's body is forwarded byte for byte, with one exception: for a streaming request
+kori sets `stream_options.include_usage` if the caller did not, so the leg reports token
+counts.
+
+## Routing and failure handling
+
+Legs are tried in config order. A leg that fails is put on cooldown and the next leg is
+tried. A request that reaches a response is never rerouted afterwards.
+
+With `"balance": true`, the starting leg rotates round-robin across the available
+`primary` legs; the walk then covers the other primaries and finally the `fallback` legs.
+The default `false` keeps strict config order.
+
+| Condition from a leg | Class | Cooldown |
+|---|---|---|
+| `401` | `auth_401` | 60 s |
+| `400` with `MissingSessionID` | `missing_session_id` | 60 s |
+| connection refused | `conn_refused` | 60 s |
+| dial timeout | `dial_timeout` | 60 s |
+| header timeout | `header_timeout` | 60 s |
+| `5xx` | `upstream_5xx` | 60 s |
+| `429` carrying a quota body | `quota_429` | 900 s |
+| any other status | not a failure; returned to the caller | — |
+
+A response that dies after its first byte is aborted and logged as `mid_stream_abort`; it
+is not rerouted. When every leg is dead the caller gets one `502` carrying the last
+failure reason.
+
+Deadlines enforced by the binary, independent of any proxy in front of it:
+
+| Phase | Limit |
+|---|---|
+| connect | 2 s |
+| TLS handshake | 3 s |
+| response headers, streaming | 15 s |
+| response headers, non-streaming | 90 s |
+| idle between chunks | 120 s |
+| whole non-streaming request | 300 s |
+
+## Request log
+
+One line per request, appended with a single write, never rewritten and never rotated.
+Nine keys, in this order:
+
+```json
+{"ts":"2026-11-16T13:20:04+07:00","route":"commandcode","status":200,"latency_ms":812,"tokens_in":128,"tokens_out":64,"failover_from":"opencode-go","failover_reason":"auth_401","stream":false}
+```
+
+| Key | Meaning |
+|---|---|
+| `ts` | RFC 3339 timestamp with offset |
+| `route` | the leg that answered, or the last leg tried when none did |
+| `status` | status returned to the caller |
+| `latency_ms` | wall clock for the whole request |
+| `tokens_in`, `tokens_out` | read from the provider's response, `null` when absent |
+| `failover_from` | the first leg that failed, empty when none did |
+| `failover_reason` | the first failure reason, empty when none did |
+| `stream` | whether the caller asked for a stream |
+
+No header, body or credential is ever written to the log.
+
+## HTTP surface
+
+| Path | Method | Purpose |
+|---|---|---|
+| `/v1/chat/completions` | POST | the gateway door |
+| `/healthz` | GET, HEAD | `{"status":"ok","version":…,"revision":…}`; revision is the git sha the binary was built from, or `dev` |
+| `/admin/state` | GET, HEAD | routes, window counters, failover events, recent log rows |
+| `/admin/log` | GET, HEAD | a page of the request log, newest first |
+| `/admin/config` | GET, HEAD | the loaded config with every credential redacted |
+| `/`, `/requests.html`, `/routes.html`, `/config.html`, `/assets/*`, `/fonts/*` | GET, HEAD | the dashboard, served from the compiled static table |
+| anything else | any | `404` |
+
+Any method other than GET or HEAD under `/admin/` is a `405` that names `GET`. Nothing is
+read from disk at runtime: the dashboard files are compiled into the binary.
+
+`/admin/log` takes `limit` (1–200, default 50), `offset`, `route`, `status_class`
+(`2xx`, `4xx`, `5xx`), `reason` (the token, or `none` for requests that did not fail
+over), `stream` (`true`, `false`) and `since` (RFC 3339). A malformed value is a `400`
+that names the parameter, and no file read happens.
+
+Router state is memory only. After a restart every leg reads `unknown` with no cooldown
+and zero counters; the log is the durable record, not a source of router state.
+
+## Dashboard
+
+Four read-only pages, wired to the three admin GETs:
+
+| Page | Shows |
+|---|---|
+| `/` Overview | route health, the window counters, recent requests |
+| `/requests.html` | the request log with filters |
+| `/routes.html` | per-route state, cooldowns and latency |
+| `/config.html` | the loaded config with credentials redacted |
+
+The pages are built in `apps/web` and committed as `apps/web/dist`. `tools/gen-static.sh`
+turns that directory into `apps/api/src/generated/static_files.nim`, which is also
+committed. Both are checked for drift in CI, so a stale embed fails the build instead of
+shipping an old page.
+
+To rebuild the dashboard:
+
+```sh
+cd apps/web && npm ci && npm run build
+```
+
+Then regenerate the embedded module from the repo root:
+
+```sh
+sh tools/gen-static.sh apps/web/dist apps/api/src/generated/static_files.nim
+```
+
+## Checks
+
+`./task` is the single entry point; every target exits nonzero with a reason when its
+input is missing.
+
+```sh
+./task help    # the target list
+./task ops     # shellcheck + deploy/smoke/preflight dry runs, no podman, no network
+./task web     # vite build in apps/web, then fail if the committed dist is stale
+./task nim     # nim check, nimble test, embed drift, release build, acceptance self-test
+./task check   # all of the above, in CI order
+```
+
+The acceptance harness proves the router end to end against a real binary:
+
+```sh
+KORI_BIN=./apps/api/src/kori sh acceptance/run-all.sh   # the ten cases, A1–A10
+KORI_BIN=./apps/api/src/kori sh acceptance/selftest.sh  # proves the harness itself
+```
+
+| Case | What it proves |
+|---|---|
+| a1 | an availability failure falls over and the log names the dead leg |
+| a2 | a dead socket costs one dial, not two |
+| a3 | the three deadlines fire at their own numbers |
+| a4 | a quota `429` is a different failure with a 900 s cooldown |
+| a5 | a client error reaches the caller unchanged and nothing fails over |
+| a6 | a stream that dies after the first byte is aborted, never rerouted |
+| a7 | tool calls survive the proxy byte for byte |
+| a8 | a fresh start knows nothing about any leg |
+| a9 | all legs dead is one `502` and the log keeps both ends of the chain |
+| a10 | the dashboard is a read-only surface over three GETs |
+
+Cases use logical port numbers; `acceptance/lib.sh` resolves each to a free port per run,
+so a run leaves nothing behind and can be repeated immediately.
+
+## CI
+
+`.github/workflows/ci.yml` runs seven jobs: `Contract`, `Security`, `Ops`, `Nim`, `Gate`,
+`Image: api`, `Web`. Every job has `timeout-minutes: 15`, caches its toolchain, and passes
+event data through `env:` rather than interpolating it into a shell script. `Gate` is the
+single required status and the only door to publishing the image.
+
+## Repository layout
+
+```
+apps/api/       Nim gateway source, Dockerfile
+apps/api/src/generated/static_files.nim   dashboard compiled into the binary
+apps/web/       dashboard source (vite, TypeScript) and the committed dist
+acceptance/     A1–A10 harness, lib.sh, stub.py, self-test
+ops/            deploy, rollback and smoke scripts, Caddy, env, systemd, webhook templates
+tests/          unit tests and the dry runs ./task ops calls
+tools/          gen-static.sh
+task            the one entry point for the checks
+docs/           architecture and decisions
+```
+
+`ops/` holds templates for a rootless podman deploy behind a Caddy edge. kori is not
+deployed anywhere yet: the templates describe the intended shape, and no deploy script has
+been run against a host.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
