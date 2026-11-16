@@ -79,6 +79,8 @@ KORI_OPENCODE_SESSION=$SENTINEL_SES
 KORI_COMMANDCODE_API_KEY=$SENTINEL_CC
 KORI_SINARCLOUD_API_KEY=$SENTINEL_SC
 EOF
+# A real values file is 0600; the fill script refuses anything wider, so every fixture matches.
+chmod 600 "$VALUES"
 
 # ── scenario 1: a filled config, 0600, no placeholder left ─────────────────
 OUT="$ROOT/etc/config.json"
@@ -111,6 +113,7 @@ cmp -s "$OUT" "$ROOT/first-copy.json" && pass "the existing config was left byte
 
 # ── scenario 3: --force replaces it ────────────────────────────────────────
 sed -e "s/$SENTINEL_CC/cc-SENTINEL-second-run/" "$VALUES" >"$ROOT/values2.env"
+chmod 600 "$ROOT/values2.env"
 bash "$FILL" --values "$ROOT/values2.env" --out "$OUT" --force 2>"$ROOT/stderr"
 rc=$?
 [ "$rc" = "0" ] && pass "--force replaces the config" || fail "--force failed: $(cat "$ROOT/stderr")"
@@ -119,6 +122,7 @@ grep -qF 'cc-SENTINEL-second-run' "$OUT" && pass "--force wrote the new value" \
 
 # ── scenario 4: a missing key fails and writes nothing ─────────────────────
 grep -v 'KORI_COMMANDCODE_API_KEY' "$VALUES" >"$ROOT/values-missing.env"
+chmod 600 "$ROOT/values-missing.env"
 OUT2="$ROOT/etc2/config.json"
 mkdir -p "$ROOT/etc2"
 bash "$FILL" --values "$ROOT/values-missing.env" --out "$OUT2" 2>"$ROOT/stderr"
@@ -131,6 +135,7 @@ grep -q 'KORI_COMMANDCODE_API_KEY' "$ROOT/stderr" && pass "the error names the m
 
 # ── scenario 5: an empty value is refused ──────────────────────────────────
 sed -e "s/^KORI_SINARCLOUD_API_KEY=.*/KORI_SINARCLOUD_API_KEY=/" "$VALUES" >"$ROOT/values-empty.env"
+chmod 600 "$ROOT/values-empty.env"
 bash "$FILL" --values "$ROOT/values-empty.env" --out "$OUT2" 2>"$ROOT/stderr"
 rc=$?
 [ "$rc" != "0" ] && pass "an empty value exits non-zero ($rc)" || fail "an empty value was accepted"
@@ -140,6 +145,7 @@ grep -q 'KORI_SINARCLOUD_API_KEY is empty' "$ROOT/stderr" && pass "the error say
 # ── scenario 6: a pasted placeholder is refused ────────────────────────────
 sed -e "s/^KORI_OPENCODE_SESSION=.*/KORI_OPENCODE_SESSION=__KORI_OPENCODE_SESSION__/" "$VALUES" \
   >"$ROOT/values-placeholder.env"
+chmod 600 "$ROOT/values-placeholder.env"
 bash "$FILL" --values "$ROOT/values-placeholder.env" --out "$OUT2" 2>"$ROOT/stderr"
 rc=$?
 [ "$rc" != "0" ] && pass "an unfilled placeholder exits non-zero ($rc)" \
@@ -150,6 +156,7 @@ grep -q 'placeholder' "$ROOT/stderr" && pass "the error names the placeholder" \
 # ── scenario 7: a malformed line is refused without echoing it ─────────────
 printf 'KORI_OPENCODE_REFRESH_TOKEN=%s\nthis-is-not-a-key-value-line\n' "$SENTINEL_RT" \
   >"$ROOT/values-bad-line.env"
+chmod 600 "$ROOT/values-bad-line.env"
 bash "$FILL" --values "$ROOT/values-bad-line.env" --out "$OUT2" 2>"$ROOT/stderr"
 rc=$?
 [ "$rc" != "0" ] && pass "a malformed values line exits non-zero ($rc)" \
@@ -264,6 +271,51 @@ if [ -n "$REAL_BIN" ] && [ -x "$REAL_BIN" ]; then
     || fail "the parser's message did not reach the caller: $(cat "$ROOT/stderr")"
 else
   printf 'SKIP  no built binary (KORI_BIN or apps/api/src/kori); the real-parser block did not run\n'
+fi
+
+# ── scenario 14: a group- or world-readable values file is refused ─────────
+# The config this script writes is 0600; reading the four live credentials from a 0644 source
+# leaves them readable by every local user, so the run stops before it writes anything.
+chmod 644 "$ROOT/values-placeholder.env"
+OUT6="$ROOT/etc6/config.json"
+mkdir -p "$ROOT/etc6"
+bash "$FILL" --values "$ROOT/values-placeholder.env" --out "$OUT6" 2>"$ROOT/stderr"
+rc=$?
+[ "$rc" != "0" ] && pass "a 0644 values file exits non-zero ($rc)" \
+  || fail "a 0644 values file was accepted"
+grep -q 'chmod 600' "$ROOT/stderr" && pass "the refusal says how to narrow the file" \
+  || fail "the refusal does not say how to narrow the file"
+[ -e "$OUT6" ] && fail "a config was written from a world-readable values file" \
+  || pass "no config written from a world-readable values file"
+
+# Group-readable alone is refused too: 0640 leaves the four secrets open to the file's group.
+# The fixture is otherwise valid, so the only reason this run can fail is the mode check; the
+# message assertion pins that down instead of accepting any non-zero exit.
+cp "$VALUES" "$ROOT/values-group.env"
+chmod 640 "$ROOT/values-group.env"
+bash "$FILL" --values "$ROOT/values-group.env" --out "$OUT6" 2>"$ROOT/stderr"
+rc=$?
+[ "$rc" != "0" ] && pass "a 0640 values file exits non-zero ($rc)" \
+  || fail "a 0640 values file was accepted"
+grep -q 'chmod 600' "$ROOT/stderr" && pass "the 0640 refusal names the mode and the fix" \
+  || fail "the 0640 run stopped for another reason: $(cat "$ROOT/stderr")"
+[ -e "$OUT6" ] && fail "a config was written from a group-readable values file" \
+  || pass "no config written from a group-readable values file"
+
+# ── scenario 15: a temp left beside the real path is ignored by git ────────
+# A run killed between create and rename leaves config.json.tmp.<pid>, which holds the same
+# secrets. The ignore rule has to cover it without un-tracking the committed template.
+# --no-index makes check-ignore judge the pattern itself: without it, git skips paths that are
+# already tracked, so the template assertion would pass no matter what the rules said.
+if git -C "$KIT" rev-parse --git-dir >/dev/null 2>&1; then
+  git -C "$KIT" check-ignore --no-index -q ops/etc/config.json.tmp.4242 \
+    && pass "config.json.tmp.<pid> is ignored by git" \
+    || fail "config.json.tmp.<pid> is not ignored by git"
+  git -C "$KIT" check-ignore --no-index -q ops/etc/config.json.example \
+    && fail "the committed template is ignored by git" \
+    || pass "the committed template is still tracked"
+else
+  printf 'SKIP  not a git checkout; the ignore rules were not checked\n'
 fi
 
 printf '\n%s\n' "artifacts: $ROOT"

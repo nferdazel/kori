@@ -7,7 +7,7 @@
 #
 # Contract:
 #   - values come from --values FILE or stdin, never from argv, so no value reaches another
-#     process's command line;
+#     process's command line; a values file readable by group or other is refused;
 #   - the file is written under umask 077, 0600, temp in the same directory, renamed into place,
 #     so a reader never sees half a config;
 #   - an existing config.json is not replaced without --force;
@@ -42,6 +42,13 @@ FORCE=0
 
 die() { printf 'kori-config: %s\n' "$*" >&2; exit 1; }
 
+file_mode() { # file_mode <path> -> permission bits as octal, on BSD and GNU
+  case "$(uname -s)" in
+    Darwin) stat -f '%Lp' "$1" ;;
+    *) stat -c '%a' "$1" ;;
+  esac
+}
+
 usage() {
   printf 'usage: kori-config.sh [--values FILE] [--out PATH] [--template PATH] [--force]\n'
   printf '       values are read from --values or stdin, never from argv\n'
@@ -64,6 +71,14 @@ done
 [ -r "$TEMPLATE" ] || die "template not readable: $TEMPLATE"
 if [ -n "$VALUES_FILE" ]; then
   [ -r "$VALUES_FILE" ] || die "values file not readable: $VALUES_FILE"
+  # The values file holds four live credentials. Writing a 0600 config from a wider source leaves
+  # the same secrets reachable by other local accounts, so refuse instead of warning: only a mode
+  # whose group and other digits are both zero gets through.
+  values_mode="$(file_mode "$VALUES_FILE")"
+  case "$values_mode" in
+    *00) ;;
+    *) die "values file is $values_mode, group or other can reach it: chmod 600 $VALUES_FILE" ;;
+  esac
 elif [ -t 0 ]; then
   die "no values: pass --values FILE or pipe the four keys on stdin"
 fi

@@ -11,8 +11,10 @@ nimcache/
 ops/env/*.env
 !ops/env/*.env.example
 # The real provider config belongs on the host (mode 600), never in the repo; the committed
-# template next to this line is the shape and carries placeholders only.
-ops/etc/config.json
+# template next to this line is the shape and carries placeholders only. The wildcard also covers
+# config.json.tmp.<pid>, the copy a killed run leaves in the same directory.
+ops/etc/config.json*
+!ops/etc/config.json.example
 
 # Deploy state written on the host
 .deployed_rev
