@@ -45,6 +45,17 @@ case "$1" in
     case "${FAKE_PULL:-ok}" in
       ok) printf 'stub pull ok\n'; exit 0 ;;
       notbuilt) printf 'Error: manifest unknown\n' >&2; exit 125 ;;
+      late)
+        # The tag shows up on pull number FAKE_PULL_LATE+1: the gate and the image job finish
+        # after the webhook already reached the host. Missing tag, then success.
+        limit="${FAKE_PULL_LATE:-2}"
+        n="$(cat "$S/pull_count" 2>/dev/null || printf 0)"
+        n=$((n + 1))
+        printf '%s\n' "$n" >"$S/pull_count"
+        if [ "$n" -le "$limit" ]; then printf 'Error: manifest unknown\n' >&2; exit 125; fi
+        printf 'stub pull ok\n'
+        exit 0
+        ;;
       *) printf 'Error: received unexpected HTTP status: 502 Bad Gateway\n' >&2; exit 125 ;;
     esac
     ;;
@@ -158,7 +169,7 @@ export KORI_HEALTH_GATE_SECONDS=4
 reset_state() {
   : >"$STATE/tags"
   : >"$STATE/calls.log"
-  rm -f "$STATE/rolled_back"
+  rm -f "$STATE/rolled_back" "$STATE/pull_count"
   rm -f "$APP_DIR/.deployed_rev" "$APP_DIR/logs/deploy.log"
 }
 
@@ -310,6 +321,42 @@ grep -q 'no image for' "$APP_DIR/logs/deploy.log" && pass "not-built says so" \
   || pass "not-built did not move .deployed_rev"
 [ "$(sort -u "$STATE/tags" | tr '\n' ' ')" = "local " ] && pass "not-built left the tags alone" \
   || fail "tags moved: $(sort -u "$STATE/tags" | tr '\n' ' ')"
+
+# ── scenario 9b: image appears after the gate finishes -> deploy, not a no-op ─
+# The webhook reaches the host before CI has pushed the tag. Reading the first "manifest
+# unknown" as "this commit built nothing" is exactly the race that left sds one revision behind.
+reset_state
+printf 'local\n' >"$STATE/tags"
+happy_image
+export FAKE_PULL=late FAKE_PULL_LATE=2 FAKE_CURL=ok
+export KORI_IMAGE_WAIT_ATTEMPTS=5
+rc="$(run refs/heads/main)"
+[ "$rc" = "0" ] && pass "late image exits 0" || fail "late image exited $rc: $(tail -3 "$ROOT/out.txt")"
+grep -q 'not in the registry yet' "$APP_DIR/logs/deploy.log" \
+  && pass "waited for the tag instead of reading it as not built" \
+  || fail "no wait line in the log: $(tail -3 "$APP_DIR/logs/deploy.log")"
+pulls="$(grep -c "^podman pull $(sha_ref)" "$STATE/calls.log" || true)"
+[ "$pulls" = "3" ] && pass "three pulls: two misses, then the tag" \
+  || fail "expected 3 pull attempts, saw $pulls"
+[ "$(cat "$APP_DIR/.deployed_rev" 2>/dev/null)" = "$(head_sha)" ] \
+  && pass "late image was deployed, not skipped" || fail "late image never moved .deployed_rev"
+
+# ── scenario 9c: the tag never appears -> keep the container, name the window ─
+reset_state
+printf 'local\n' >"$STATE/tags"
+happy_image
+export FAKE_PULL=late FAKE_PULL_LATE=99 FAKE_CURL=ok
+export KORI_IMAGE_WAIT_ATTEMPTS=2
+rc="$(run refs/heads/main)"
+[ "$rc" = "0" ] && pass "exhausted wait exits 0" || fail "exhausted wait exited $rc"
+grep -q 'no image for .* after 2 attempts' "$APP_DIR/logs/deploy.log" \
+  && pass "not-built message names the attempt count" \
+  || fail "attempt count missing: $(tail -3 "$APP_DIR/logs/deploy.log")"
+[ "$(restarts)" = "0" ] && pass "exhausted wait left the container running" \
+  || fail "exhausted wait restarted the service"
+[ -f "$APP_DIR/.deployed_rev" ] && fail ".deployed_rev written when no image ever came" \
+  || pass "exhausted wait did not move .deployed_rev"
+unset KORI_IMAGE_WAIT_ATTEMPTS
 
 # ── scenario 10: health gate red -> rollback to :prev, deploy rejected ─────
 reset_state
