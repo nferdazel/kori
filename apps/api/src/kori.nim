@@ -18,9 +18,11 @@ import std/[algorithm, asyncdispatch, asyncnet, exitprocs,
 import std/asynchttpserver
 
 import generated/static_files
+# KoriVersion comes from VERSION through tools/gen-version.sh, so /healthz, /admin/state and the
+# startup line cannot report a number the repository does not declare.
+import generated/version
 
 const
-  KoriVersion* = "0.2.0"
   ## Stamped by config.nims from `git rev-parse --short HEAD`; "dev" when git is
   ## not available, so /healthz never claims a revision it does not have.
   KoriRevision* {.strdefine.} = "dev"

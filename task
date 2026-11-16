@@ -14,6 +14,13 @@ task — one entry point for the checks CI runs.
   ./task ops     shellcheck + deploy/smoke dry runs (no podman, no network)
   ./task web     vite build in apps/web, then fail if the committed dist is stale
   ./task nim     nim check, nimble test, acceptance harness against a real binary
+  ./task version print VERSION, the single source for the binary and the nimble package
+  ./task version-check
+                 fail when VERSION, kori.nimble, the generated module or CHANGELOG disagree
+  ./task release [major|minor|patch] [--skip-check]
+                 bump VERSION, sync the module and kori.nimble, move the CHANGELOG
+                 Unreleased section, run the gate, then one local commit and a local
+                 annotated tag. It never pushes; it prints the push command instead.
   ./task help    this text
 EOF
 }
@@ -23,7 +30,7 @@ missing() { echo "not in the repo yet: $1 ($2)" >&2; exit 1; }
 
 task_ops() {
   need shellcheck "brew install shellcheck, or apt-get install shellcheck"
-  shellcheck -S warning -x ops/scripts/*.sh tools/gen-static.sh tests/dryrun-*.sh task
+  shellcheck -S warning -x ops/scripts/*.sh tools/gen-version.sh tools/gen-static.sh tests/dryrun-*.sh task
   bash tests/dryrun-deploy.sh
   bash tests/dryrun-smoke.sh
   bash tests/dryrun-preflight.sh
@@ -42,6 +49,7 @@ task_nim() {
   [ -f apps/api/src/kori.nim ] || missing apps/api "the gateway source"
   [ -d apps/web/dist ] || missing apps/web/dist "run ./task web first"
   [ -f acceptance/selftest.sh ] || missing acceptance "the A1-A11 harness"
+  task_version_check
   need nim "install Nim 2.4.2"
   # The module lives beside kori.nim, not at the repo root: `import generated/static_files`
   # resolves against apps/api/src, and the committed file is what a bare `nim c` embeds.
@@ -54,11 +62,154 @@ task_nim() {
   KORI_BIN=./apps/api/src/kori sh acceptance/selftest.sh
 }
 
+# VERSION is the single source: the binary reads it through the generated module, the nimble
+# package carries a copy, and the CHANGELOG's newest released heading names it. Everything else
+# reads VERSION from here.
+task_version() {
+  [ -f VERSION ] || { echo "VERSION is missing at the repo root" >&2; exit 1; }
+  printf '%s\n' "$(tr -d ' \n\r' <VERSION)"
+}
+
+# Fails when the four copies disagree, and names the file that is behind. A hand-edited VERSION
+# without a regen lands on the generated module; a release that forgot kori.nimble lands on the
+# package; a CHANGELOG heading that was not moved lands on the changelog.
+task_version_check() {
+  v=$(task_version)
+  case "$v" in
+    '' | .* | *. | *..*) echo "VERSION must be X.Y.Z (got '$v')" >&2; exit 1 ;;
+  esac
+  case "$v" in
+    *[!0-9.]*) echo "VERSION must be plain semver, digits and dots only (got '$v')" >&2; exit 1 ;;
+  esac
+  case "$v" in
+    *.*.*) ;;
+    *) echo "VERSION must be X.Y.Z (got '$v')" >&2; exit 1 ;;
+  esac
+
+  nimble_v=$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' kori.nimble | head -1)
+  [ "$nimble_v" = "$v" ] \
+    || { echo "kori.nimble ($nimble_v) != VERSION ($v) — run ./task release" >&2; exit 1; }
+
+  gen_v=$(sed -n 's/^const KoriVersion\* = "\(.*\)"/\1/p' apps/api/src/generated/version.nim | head -1)
+  [ "$gen_v" = "$v" ] \
+    || { echo "apps/api/src/generated/version.nim is stale ($gen_v) — run sh tools/gen-version.sh" >&2; exit 1; }
+
+  # The newest released heading, ignoring [Unreleased]. Before the first release there is none,
+  # and the check has nothing to compare against.
+  top=$(sed -n 's/^## \[\([0-9][^]]*\)\].*/\1/p' CHANGELOG.md | head -1)
+  if [ -n "$top" ] && [ "$top" != "$v" ]; then
+    echo "CHANGELOG.md newest released heading is $top, not $v" >&2
+    exit 1
+  fi
+
+  echo "version: v$v (VERSION, kori.nimble, generated module, CHANGELOG agree)"
+}
+
+# Rilis = satu commit + satu tag anotasi, lokal. Tag adalah penanda, bukan pemicu deploy: tidak
+# ada satu pun git push di jalur ini. Perintah push dicetak di akhir untuk dijalankan dengan
+# sadar, karena push ke main memicu CI dan percobaan deploy.
+task_release() {
+  bump=""
+  skip_check=0
+  for arg in "$@"; do
+    case "$arg" in
+      major | minor | patch) bump="$arg" ;;
+      --skip-check) skip_check=1 ;;
+      *)
+        echo "release: unknown argument '$arg' (usage: ./task release [major|minor|patch] [--skip-check])" >&2
+        exit 1
+        ;;
+    esac
+  done
+  [ -n "$bump" ] || { echo "release: name the bump (major, minor or patch)" >&2; exit 1; }
+
+  cur=$(task_version)
+  case "$cur" in
+    *.*.*) ;;
+    *) echo "release: VERSION '$cur' is not X.Y.Z" >&2; exit 1 ;;
+  esac
+  case "$cur" in
+    *[!0-9.]* | .* | *. | *..*) echo "release: VERSION '$cur' is not plain semver" >&2; exit 1 ;;
+  esac
+
+  major=$(printf '%s' "$cur" | cut -d. -f1)
+  minor=$(printf '%s' "$cur" | cut -d. -f2)
+  patch=$(printf '%s' "$cur" | cut -d. -f3)
+  case "$bump" in
+    major) major=$((major + 1)); minor=0; patch=0 ;;
+    minor) minor=$((minor + 1)); patch=0 ;;
+    patch) patch=$((patch + 1)) ;;
+  esac
+  new="$major.$minor.$patch"
+
+  grep -q '^## \[Unreleased\]' CHANGELOG.md \
+    || { echo "release: CHANGELOG.md has no ## [Unreleased] section to move" >&2; exit 1; }
+  # An empty Unreleased would become a released heading with nothing under it, which is worse than
+  # no release: it claims a version shipped and says nothing about what changed.
+  if ! awk '
+    /^## \[Unreleased\]/ { inside = 1; next }
+    inside && /^## \[/ { exit }
+    inside && NF { found = 1 }
+    END { exit(found ? 0 : 1) }
+  ' CHANGELOG.md; then
+    echo "release: CHANGELOG.md ## [Unreleased] is empty — write the entries first" >&2
+    exit 1
+  fi
+
+  echo "release: v$cur -> v$new ($bump)"
+
+  printf '%s\n' "$new" >VERSION
+  sed -i.bak -e "s/^version *= *\"[^\"]*\"/version     = \"$new\"/" kori.nimble
+  rm -f kori.nimble.bak
+  sh tools/gen-version.sh
+
+  # The Unreleased content becomes the released section, and a fresh empty Unreleased stays on
+  # top for the next slice. The heading carries the local date, which is the date the changelog's
+  # readers use.
+  today=$(date +%Y-%m-%d)
+  tmp=$(mktemp)
+  awk -v ver="$new" -v day="$today" '
+    !moved && $0 == "## [Unreleased]" {
+      print "## [Unreleased]"
+      print ""
+      print "## [" ver "] - " day
+      moved = 1
+      next
+    }
+    { print }
+  ' CHANGELOG.md >"$tmp"
+  mv "$tmp" CHANGELOG.md
+
+  if [ "$skip_check" -eq 0 ]; then
+    task_ops
+    task_web
+    task_nim
+  else
+    echo "release: gate skipped (--skip-check), nothing verified this tree"
+  fi
+
+  task_version_check
+
+  git add VERSION kori.nimble CHANGELOG.md apps/api/src/generated/version.nim
+  git commit -q -m "chore(release): v$new"
+  git tag -a "v$new" -m "release v$new"
+
+  echo
+  echo "release: v$new committed and tagged locally. Nothing was pushed."
+  echo "  git push origin $(git rev-parse --abbrev-ref HEAD) --follow-tags"
+}
+
 case "${1:-check}" in
   check) task_ops; task_web; task_nim ;;
   ops) task_ops ;;
   web) task_web ;;
   nim) task_nim ;;
+  version) task_version ;;
+  version-check) task_version_check ;;
+  release)
+    shift
+    task_release "$@"
+    ;;
   help | -h | --help) usage ;;
   *) echo "unknown target: $1 (try ./task help)" >&2; exit 2 ;;
 esac
