@@ -4,10 +4,11 @@
 # Called by the host webhook (adnanh/webhook, hook `kori`) with:
 #   $1 = repository.name   $2 = ref
 #
-# Order: fail-closed ref guard -> flock -> git fetch/reset -> rev -> pull the signed image for
-#        that commit, verify its revision label and signature -> tag :local to :prev -> install
-#        unit + render edge block -> restart -> health gate -> auto-rollback to :prev
-#        -> .deployed_rev -> self-update.
+# Order: fail-closed ref guard -> flock -> git fetch/reset -> rev -> script self-update ->
+#        ops-only commit? install the unit, health gate, stop -> pull the signed image for that
+#        commit, verify its revision label and signature -> tag :local to :prev -> install unit
+#        + render edge block -> restart -> health gate -> smoke -> auto-rollback to :prev
+#        -> .deployed_rev -> prune.
 #
 # The host never builds. The image is built and signed in GitHub Actions (ci.yml, job
 # image-api); this script only pulls ghcr.io/nferdazel/kori-api:sha-<7>. A host build here would
@@ -16,10 +17,11 @@
 # No secret lives in this repo. Everything host-specific comes from the env file
 # (/srv/qouver/apps/kori/env/kori-prod.env, mode 600).
 #
-# NOT YET RUN ON qouver1. First run is Dimas's slot, with him watching.
+# NOT YET RUN ON qouver1. kori is in development (owner, 2026-11-16): the skeleton below is the
+# whole host contract, and the first run is a separate slot with Dimas watching.
 #
-# The script copies itself mid-run (self-update) and keeps executing the old inode,
-# so a fix merged to it takes effect one deploy later.
+# The script copies itself mid-run (self-update) and re-execs into the new file, so a fix merged
+# to it takes effect on that same deploy. The lock fd survives exec.
 set -euo pipefail
 
 REPO="${1:-kori}"
@@ -63,8 +65,13 @@ if ! flock -n 9; then
 fi
 
 [ -f "$ENV_FILE" ] || die "env file missing: $ENV_FILE (mode 600, holds the edge token and nothing else)"
+# `set -a` so the values reach the child processes this script starts. A sourced file otherwise
+# leaves plain shell variables, and smoke.sh would then run with KORI_EDGE_URL set but no token —
+# the one combination it treats as a failed edge rather than a skipped one.
+set -a
 # shellcheck disable=SC1090
 . "$ENV_FILE"
+set +a
 
 MONO_DIR="$APP_DIR/src"
 [ -d "$MONO_DIR/.git" ] || die "checkout missing: $MONO_DIR (clone $REPO there once, by hand)"
@@ -76,6 +83,46 @@ git -C "$MONO_DIR" reset --hard --quiet origin/main
 REV="$(git -C "$MONO_DIR" rev-parse HEAD)"
 SHORT="${REV:0:7}"
 log "==> rev $REV"
+
+# ── 3b. Payload that is not an image ────────────────────────────────────────
+# An ops-only commit (docs/, .github/, ops/, root *.md) builds no image. It must still land:
+# on qouver this branch used to exit before the unit was installed, so a quadlet fix sat in the
+# repo until the next image-bearing deploy (BACKLOG CM-05, 2026-11-16). The payload is handled
+# below, after the helpers are in place.
+OPS_ONLY=0
+PREV_MAIN="$(git -C "$MONO_DIR" rev-parse "${REV}^" 2>/dev/null || true)"
+if [ -n "$PREV_MAIN" ] && [ "$PREV_MAIN" != "$REV" ]; then
+  CHANGED="$(git -C "$MONO_DIR" diff --name-only "$PREV_MAIN" "$REV" || true)"
+  if [ -n "$CHANGED" ] && ! printf '%s\n' "$CHANGED" | grep -qvE '^(docs/|\.github/|ops/|[^/]*\.md$)'; then
+    OPS_ONLY=1
+    log "==> only docs/workflow/ops paths changed in $REV; no image to wait for"
+  fi
+fi
+
+# Scripts first, so the copy that gates this deploy is the copy in the repo. A file replaced
+# mid-run keeps running the old inode; the re-exec is what makes a fix here take effect now
+# rather than one deploy later.
+mkdir -p "$APP_DIR/scripts"
+REPO_SCRIPT="$MONO_DIR/ops/scripts/deploy-vps.sh"
+SELF_SCRIPT="$APP_DIR/scripts/deploy-vps.sh"
+SCRIPT_SWAPPED=0
+if [ -f "$REPO_SCRIPT" ] && ! cmp -s "$REPO_SCRIPT" "$SELF_SCRIPT"; then
+  cp -f "$REPO_SCRIPT" "$SELF_SCRIPT.new.$$" && chmod 0755 "$SELF_SCRIPT.new.$$" \
+    && mv -f "$SELF_SCRIPT.new.$$" "$SELF_SCRIPT" \
+    && SCRIPT_SWAPPED=1 && log "==> scripts/deploy-vps.sh updated from repo"
+fi
+for helper in smoke.sh rollback.sh; do
+  SRC="$MONO_DIR/ops/scripts/$helper"
+  DST="$APP_DIR/scripts/$helper"
+  if [ -f "$SRC" ] && ! cmp -s "$SRC" "$DST"; then
+    install -m 0755 "$SRC" "$DST.new.$$" && mv -f "$DST.new.$$" "$DST" \
+      && log "==> scripts/$helper updated from repo"
+  fi
+done
+if [ "$SCRIPT_SWAPPED" = "1" ]; then
+  log "==> re-executing the updated deploy-vps.sh"
+  exec "$SELF_SCRIPT" "$@"
+fi
 
 wait_healthy() {
   local deadline=$((SECONDS + HEALTH_GATE_SECONDS))
@@ -96,6 +143,75 @@ restart_service() {
   systemctl --user restart "$SERVICE" \
     || log "WARN: restart of $SERVICE returned non-zero; health gate decides"
 }
+
+# smoke.sh is part of the release gate, not a suggestion: a container that answers /admin/state
+# while its request log is unparseable, or that listens on a non-loopback address, is not a
+# deploy. Its output goes to its own log so a failed run is readable afterwards.
+SMOKE_LOG="$APP_DIR/logs/smoke.log"
+run_smoke() {
+  if [ ! -f "$APP_DIR/scripts/smoke.sh" ]; then
+    log "==> WARN: scripts/smoke.sh missing; smoke gate skipped on this run"
+    return 0
+  fi
+  if bash "$APP_DIR/scripts/smoke.sh" >"$SMOKE_LOG" 2>&1; then
+    log "==> smoke passed ($SMOKE_LOG)"
+    return 0
+  fi
+  log "ERROR: smoke failed; last lines of $SMOKE_LOG:"
+  tail -n 6 "$SMOKE_LOG" | while IFS= read -r line; do log "    $line"; done
+  return 1
+}
+
+# ── 4. Quadlet hardening gate (fail-closed) ─────────────────────────────────
+# The unit is the security boundary around the process, so a weaker copy from the repo never
+# replaces it. Aborts before anything is pulled, tagged or restarted.
+UNIT_SRC="$MONO_DIR/ops/systemd/${SERVICE}.container"
+[ -f "$UNIT_SRC" ] || die "quadlet unit missing: $UNIT_SRC — deploy aborted, unit on the host untouched"
+for key in NoNewPrivileges=true DropCapability=ALL ReadOnly=true; do
+  k="${key%%=*}"; v="${key#*=}"
+  grep -qEi "^[[:space:]]*${k}[[:space:]]*=[[:space:]]*${v}[[:space:]]*$" "$UNIT_SRC" \
+    || die "quadlet hardening gate failed: $UNIT_SRC lacks ${key} — deploy aborted, unit on the host untouched"
+done
+log "==> quadlet hardening gate passed (NoNewPrivileges, DropCapability=ALL, ReadOnly)"
+
+# ── 4b. Ops-only commit: the unit is the whole payload ─────────────────────
+# No image is pulled here, so .deployed_rev keeps the running image's revision. Install the unit
+# only when it differs, restart only then, prove the service answers, and restore the previous
+# file if it does not — the guarantee step 7 gives an image.
+if [ "$OPS_ONLY" = "1" ]; then
+  mkdir -p "$UNIT_DIR"
+  UNIT_LIVE="$UNIT_DIR/${SERVICE}.container"
+  if cmp -s "$UNIT_SRC" "$UNIT_LIVE"; then
+    log "==> ops-only commit $REV: live unit already matches, nothing to deploy or restart"
+    exit 0
+  fi
+  UNIT_BAK=""
+  if [ -f "$UNIT_LIVE" ]; then
+    UNIT_BAK="$UNIT_LIVE.bak-$(date '+%Y%m%d-%H%M%S')"
+    cp -p "$UNIT_LIVE" "$UNIT_BAK" || die "could not back up $UNIT_LIVE — unit untouched"
+  fi
+  install -m 0600 "$UNIT_SRC" "$UNIT_LIVE.new.$$" && mv -f "$UNIT_LIVE.new.$$" "$UNIT_LIVE" \
+    || die "could not install $UNIT_SRC"
+  log "==> ops-only commit $REV: quadlet unit updated (backup ${UNIT_BAK:-none}), restarting $SERVICE"
+  restart_service || true
+  if wait_healthy; then
+    log "==> health gate passed after the unit-only restart ($HEALTH_URL); image unchanged at $(cat "$STATE_FILE" 2>/dev/null || echo unknown)"
+    exit 0
+  fi
+  log "ERROR: $SERVICE did not answer $HEALTH_URL after the unit-only restart — restoring the previous unit"
+  if [ -n "$UNIT_BAK" ] && [ -f "$UNIT_BAK" ]; then
+    install -m 0600 "$UNIT_BAK" "$UNIT_LIVE"
+    restart_service || true
+    if wait_healthy; then
+      log "==> unit rollback verified: previous unit restored from $(basename "$UNIT_BAK") and the service answers"
+    else
+      log "WARNING: service still not answering $HEALTH_URL after restoring $(basename "$UNIT_BAK") — needs a human"
+    fi
+  else
+    log "WARNING: no previous unit to restore — the installed unit stays, needs a human"
+  fi
+  exit 1
+fi
 
 # CI publishes this tag only after the gate job is green, and the webhook reaches this host
 # before that. A tag that is not in the registry yet is therefore waited for, not read as "this
@@ -184,7 +300,7 @@ verify_signature() {
   done
 }
 
-# ── 4. Pull the image this commit built; the host never builds ───────────────
+# ── 5. Pull the image this commit built; the host never builds ───────────────
 # sha-<7> is a filename until the image proves which commit it is. Two independent proofs run
 # before any tag moves: the revision label must equal the commit just checked out, and the
 # signature must come from this repository's workflow. Both failures leave the running
@@ -237,8 +353,11 @@ if [ "$IMAGE_PULLED" != "1" ]; then
   exit 0
 fi
 
-# ── 5. Unit + edge block from the repo (host is not the source of truth) ─────
-install -m 0644 "$MONO_DIR/ops/systemd/${SERVICE}.container" "$UNIT_DIR/${SERVICE}.container"
+# ── 6. Unit + edge block from the repo (host is not the source of truth) ─────
+mkdir -p "$UNIT_DIR"
+install -m 0600 "$UNIT_SRC" "$UNIT_DIR/${SERVICE}.container.new.$$" \
+  && mv -f "$UNIT_DIR/${SERVICE}.container.new.$$" "$UNIT_DIR/${SERVICE}.container" \
+  || die "could not install $UNIT_SRC"
 
 if [ -n "${KORI_EDGE_TOKEN:-}" ]; then
   RENDERED="$APP_DIR/caddy/site.caddy"
@@ -254,12 +373,18 @@ if [ -n "${KORI_EDGE_TOKEN:-}" ]; then
   sudo systemctl restart caddy || log "WARN: caddy restart returned non-zero; check is-active"
 fi
 
-# ── 6. Restart + health gate with automatic rollback ────────────────────────
+# ── 7. Restart + health gate + smoke, with automatic rollback ───────────────
 restart_service
-if wait_healthy; then
-  log "==> healthy after restart"
-else
-  log "ERROR: health gate failed within ${HEALTH_GATE_SECONDS}s; rolling back to :prev"
+GATE_OK=1
+if ! wait_healthy; then
+  log "ERROR: health gate failed within ${HEALTH_GATE_SECONDS}s"
+  GATE_OK=0
+elif ! run_smoke; then
+  log "ERROR: health gate passed but smoke failed"
+  GATE_OK=0
+fi
+if [ "$GATE_OK" != "1" ]; then
+  log "ERROR: rolling back to :prev"
   if podman image exists "${IMAGE}:prev"; then
     podman tag "${IMAGE}:prev" "${IMAGE}:local"
     restart_service
@@ -274,16 +399,9 @@ else
   exit 1
 fi
 
-# ── 7. Record what is actually serving ──────────────────────────────────────
+# ── 8. Record what is actually serving ──────────────────────────────────────
 printf '%s\n' "$REV" >"$STATE_FILE"
 log "==> deployed $REV, image tags: $(podman images --format '{{.Tag}}' "${IMAGE}" | sort | tr '\n' ' ')"
+# The image that lost both tags is what fills the store; :local and :prev keep theirs.
+podman image prune -f >/dev/null 2>&1 || true
 
-# Self-update: this script and the smoke script follow the repo, so a fix here is not a manual scp.
-for f in deploy-vps.sh smoke.sh rollback.sh; do
-  SRC="$MONO_DIR/ops/scripts/$f"
-  DST="$APP_DIR/scripts/$f"
-  if [ -f "$SRC" ] && ! cmp -s "$SRC" "$DST"; then
-    install -m 0755 "$SRC" "$DST.tmp" && mv "$DST.tmp" "$DST"
-    log "==> self-updated $f"
-  fi
-done
