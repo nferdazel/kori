@@ -54,6 +54,9 @@ command -v flock >/dev/null 2>&1 || {
 }
 
 mkdir -p "$APP_DIR/logs"
+# The config mount is a directory, so the OAuth refresh can write its temp file next to the
+# config and rename it into place. 0700 here, the file inside stays 0600.
+install -d -m 0700 "$APP_DIR/etc"
 log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" | tee -a "$LOG"; }
 die() { log "ERROR: $*"; exit 1; }
 
@@ -172,7 +175,16 @@ for key in NoNewPrivileges=true DropCapability=ALL ReadOnly=true; do
   grep -qEi "^[[:space:]]*${k}[[:space:]]*=[[:space:]]*${v}[[:space:]]*$" "$UNIT_SRC" \
     || die "quadlet hardening gate failed: $UNIT_SRC lacks ${key} — deploy aborted, unit on the host untouched"
 done
-log "==> quadlet hardening gate passed (NoNewPrivileges, DropCapability=ALL, ReadOnly)"
+# The config mount must be the writable DIRECTORY, not a single file at :ro. persistOauth writes a
+# temp in the same directory and renames it over the config; a file bind cannot take that rename
+# even at :rw, and at :ro every refresh is lost at the next container restart. A unit that goes
+# back to the old shape silently disables token rotation, so it never reaches the host.
+grep -qE "^[[:space:]]*Volume=[^:]+:/etc/kori:rw(,z)?[[:space:]]*$" "$UNIT_SRC" \
+  || die "quadlet config mount is not a writable directory at /etc/kori — deploy aborted, unit on the host untouched"
+if grep -qE "^[[:space:]]*Volume=.*config\.json:/etc/kori/config\.json" "$UNIT_SRC"; then
+  die "quadlet mounts config.json as a single file; OAuth rotation cannot persist — deploy aborted, unit on the host untouched"
+fi
+log "==> quadlet hardening gate passed (NoNewPrivileges, DropCapability=ALL, ReadOnly, config dir rw)"
 
 # ── 4b. Ops-only commit: the unit is the whole payload ─────────────────────
 # No image is pulled here, so .deployed_rev keeps the running image's revision. Install the unit
@@ -362,15 +374,56 @@ install -m 0600 "$UNIT_SRC" "$UNIT_DIR/${SERVICE}.container.new.$$" \
 if [ -n "${KORI_EDGE_TOKEN:-}" ]; then
   RENDERED="$APP_DIR/caddy/site.caddy"
   mkdir -p "$APP_DIR/caddy"
-  sed "s|__KORI_EDGE_TOKEN__|${KORI_EDGE_TOKEN}|g" \
-    "$MONO_DIR/ops/caddy/Caddyfile.kori.example" >"$RENDERED.tmp"
-  install -m 0640 "$RENDERED.tmp" "$RENDERED"
-  rm -f "$RENDERED.tmp"
+  # The token is substituted by the shell, never by sed/awk: an external process would carry it in
+  # argv, where every user on the host can read it from `ps` while the process lives. The temp file
+  # is created by the shell at 0600 (umask 077), raised to 0640 only once its content is complete,
+  # then renamed into place — no world-readable copy exists at any point.
+  CADDY_BAK=""
+  if [ -f "$RENDERED" ]; then
+    CADDY_BAK="$RENDERED.prev.$$"
+    cp -p "$RENDERED" "$CADDY_BAK" || die "could not back up $RENDERED — edge block untouched"
+  fi
+  OLD_UMASK="$(umask)"
+  umask 077
+  EDGE_TEMPLATE="$MONO_DIR/ops/caddy/Caddyfile.kori.example"
+  [ -f "$EDGE_TEMPLATE" ] || die "edge template missing: $EDGE_TEMPLATE"
+  : >"$RENDERED.tmp.$$"
+  while IFS= read -r line || [ -n "$line" ]; do
+    out="${line//__KORI_EDGE_TOKEN__/$KORI_EDGE_TOKEN}"
+    printf '%s\n' "$out" >>"$RENDERED.tmp.$$"
+  done <"$EDGE_TEMPLATE"
+  chmod 0640 "$RENDERED.tmp.$$"
+  mv -f "$RENDERED.tmp.$$" "$RENDERED"
+  umask "$OLD_UMASK"
   # SELinux: Caddy runs as httpd_t and must be able to read this file (team note, 2026-11-15).
   restorecon "$RENDERED" 2>/dev/null || true
   log "==> rendered edge block $RENDERED"
   # `admin off` on qouver1 makes `caddy reload` fail every time; restart is the switch.
-  sudo systemctl restart caddy || log "WARN: caddy restart returned non-zero; check is-active"
+  # A Caddy that cannot load the new block takes every site on this host down with it, so a failed
+  # restart is not a warning: put back the block that was serving, restart once more, and fail the
+  # deploy either way. The journal lines copied below carry no token.
+  if sudo systemctl restart caddy; then
+    if [ -n "$CADDY_BAK" ]; then rm -f "$CADDY_BAK"; fi
+  else
+    log "ERROR: caddy rejected the rendered block; restoring the previous one"
+    if [ -n "$CADDY_BAK" ]; then
+      mv -f "$CADDY_BAK" "$RENDERED"
+    else
+      # No previous block existed, so the last state Caddy loaded is "no file at this path".
+      rm -f "$RENDERED"
+    fi
+    if sudo systemctl restart caddy; then
+      log "ERROR: caddy answers again with the previous block; deploy of ${SHORT} REJECTED at the edge"
+    else
+      log "ERROR: caddy did not restart even with the previous block restored — the public edge is down, human needed"
+    fi
+    if command -v journalctl >/dev/null 2>&1; then
+      journalctl -u caddy -n 20 --no-pager 2>&1 | while IFS= read -r jline; do log "    caddy: $jline"; done
+    else
+      log "    (journalctl not available here; read the caddy unit journal by hand)"
+    fi
+    exit 1
+  fi
 fi
 
 # ── 7. Restart + health gate + smoke, with automatic rollback ───────────────

@@ -11,8 +11,12 @@
 #   - `ReadOnly=true` + `Tmpfs=/tmp`: the gateway writes exactly two things, the append-only
 #     request log and stdout. The log is a bind mount; a write to the rootfs is a bug and should
 #     fail the container, not fill a layer.
-#   - Config file is mounted read-only from the host, mode 0600, outside every repo. It holds
-#     every provider credential, so it is never baked into an image.
+#   - The config DIRECTORY is mounted writable, and the file inside it stays 0600, outside every
+#     repo. It holds every provider credential, so it is never baked into an image. It cannot be
+#     a single-file bind: the OAuth refresh rewrites the token atomically (temp in the same dir,
+#     then rename), and a rename into a bind-mounted file fails even at :rw. Mounting the file
+#     read-only made every refresh succeed in memory and persist nowhere, so a container restart
+#     went back to the seed token.
 #   - No HealthCmd: the runtime image has no curl or wget, and podman healthchecks run inside the
 #     container. Health is `Restart=always` plus the deploy gate on /admin/state.
 #   - `OnFailure=alert@%N.service`: the host's Telegram alert with a 15-minute per-unit cooldown,
@@ -34,7 +38,7 @@ PublishPort=127.0.0.1:8787:8787
 Pull=never
 AutoUpdate=local
 EnvironmentFile=/srv/qouver/apps/kori/env/kori-prod.env
-Volume=/srv/qouver/apps/kori/etc/config.json:/etc/kori/config.json:ro,z
+Volume=/srv/qouver/apps/kori/etc:/etc/kori:rw,z
 Volume=/srv/qouver/apps/kori/logs:/var/log/kori:z
 Exec=--config=/etc/kori/config.json --port=8787 --address=0.0.0.0 --log=/var/log/kori/requests.jsonl
 NoNewPrivileges=true

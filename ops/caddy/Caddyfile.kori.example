@@ -1,8 +1,8 @@
 # Caddyfile.kori.example — the ai.qouver.com block for kori.
 #
 # This file is a TEMPLATE. deploy-vps.sh renders it to
-#   /srv/qouver/apps/kori/caddy/site.caddy   (mode 0640, root:caddy, httpd_sys_content_t)
-# with __KORI_EDGE_TOKEN__ replaced by the real bearer. /etc/caddy/Caddyfile then only carries
+#   /srv/qouver/apps/kori/caddy/site.caddy   (mode 0640, sachiel:caddy, httpd_sys_content_t)
+# with the token placeholder replaced by the real bearer. /etc/caddy/Caddyfile then only carries
 # one line, added once by Dimas:
 #   import /srv/qouver/apps/kori/caddy/site.caddy
 # The token never enters this repository.
@@ -65,6 +65,9 @@ ai.qouver.com {
 	# Rate limit per real client IP. Needs the caddy-ratelimit module, which is NOT in a stock
 	# Caddy build; Dimas owns that binary. Until it is there, the same limit is a Cloudflare rule
 	# on ai.qouver.com (per-IP, 60 requests/minute) — recorded in OPS-SHIP §4.4 as the interim.
+	# That rule is a precondition for opening the endpoint, not a follow-up: while this block is
+	# commented out the door has no per-IP limit at all, so the Cloudflare rule has to exist before
+	# the site block goes live.
 	# rate_limit {
 	# 	zone kori_ip {
 	# 		key {client_ip}

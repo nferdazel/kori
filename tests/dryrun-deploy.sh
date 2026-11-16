@@ -173,7 +173,20 @@ STUB
 
 cat >"$BIN/systemctl" <<'STUB'
 #!/usr/bin/env bash
-printf 'systemctl %s\n' "$*" >>"${PODMAN_STATE:?}/calls.log"
+S="${PODMAN_STATE:?}"
+printf 'systemctl %s\n' "$*" >>"$S/calls.log"
+# FAKE_SYSTEMCTL_CADDY: only caddy refuses to restart, so the edge path is what is under test
+# while every kori-api restart stays green.
+#   once : the first caddy restart fails, the retry after the restore succeeds
+#   fail : every caddy restart fails
+if [ "${FAKE_SYSTEMCTL_CADDY:-ok}" != "ok" ] && [ "${1:-}" = "restart" ] && [ "${2:-}" = "caddy" ]; then
+  n=$(( $(cat "$S/caddy_restarts" 2>/dev/null || printf 0) + 1 ))
+  printf '%s\n' "$n" >"$S/caddy_restarts"
+  case "${FAKE_SYSTEMCTL_CADDY}" in
+    fail) exit 1 ;;
+    once) [ "$n" -eq 1 ] && exit 1 || exit 0 ;;
+  esac
+fi
 exit 0
 STUB
 
@@ -271,7 +284,7 @@ export KORI_HEALTH_GATE_SECONDS=4
 reset_state() {
   : >"$STATE/tags"
   : >"$STATE/calls.log"
-  rm -f "$STATE/rolled_back" "$STATE/pull_count"
+  rm -f "$STATE/rolled_back" "$STATE/pull_count" "$STATE/caddy_restarts"
   rm -f "$APP_DIR/.deployed_rev" "$APP_DIR/logs/deploy.log" "$APP_DIR/logs/smoke.log"
   # smoke.sh requires an append-only request log with a JSON last line. The gateway writes it in
   # production; here the harness owns it, so every scenario starts from the same one line.
@@ -408,6 +421,95 @@ grep -qxF "podman tag ghcr.io/nferdazel/kori-api@$DUP_DIGEST localhost/kori:loca
   || fail "docker manifest list did not tag the index: $(grep '^podman tag' "$STATE/calls.log")"
 [ "$(cat "$APP_DIR/.deployed_rev" 2>/dev/null)" = "$(head_sha)" ] \
   && pass "docker manifest list moved .deployed_rev" || fail "docker manifest list never completed"
+
+# ── scenario 3f: the config mount is a writable directory, created 0700 ────
+# A single-file :ro bind is what made every OAuth rotation vanish at the next container restart:
+# the refresh writes a temp in the same directory and renames it over the config, which a file
+# bind cannot take. The unit must mount the directory rw and the deploy must create it.
+reset_state
+rm -rf "${APP_DIR:?}/etc"
+happy_image
+export FAKE_CURL=ok
+rc="$(run refs/heads/main)"
+[ "$rc" = "0" ] && pass "config-dir deploy exits 0" \
+  || fail "config-dir deploy exited $rc: $(tail -3 "$ROOT/out.txt")"
+UNIT_LIVE="$UNIT_DIR/kori-api.container"
+grep -qxF 'Volume=/srv/qouver/apps/kori/etc:/etc/kori:rw,z' "$UNIT_LIVE" \
+  && pass "unit mounts the config directory rw" \
+  || fail "unit mount line: $(grep '^Volume=' "$UNIT_LIVE" | tr '\n' ' ')"
+grep -q 'config.json:/etc/kori/config.json' "$UNIT_LIVE" \
+  && fail "unit still single-file mounts config.json" || pass "no single-file config bind"
+[ -d "$APP_DIR/etc" ] && pass "deploy created the config directory" || fail "config directory missing"
+[ -n "$(find "$APP_DIR/etc" -maxdepth 0 -perm 0700 2>/dev/null)" ] \
+  && pass "config directory is 0700" || fail "config directory mode is not 0700"
+# The gate is what stops a later unit edit from undoing the mount, so it must name the old shape.
+grep -qF 'config\.json:/etc/kori/config\.json' "$DEPLOY" \
+  && pass "the hardening gate refuses a single-file config bind" \
+  || fail "the gate no longer names the single-file bind"
+
+# ── scenario 3g: the edge token never reaches argv or a world-readable file ─
+# The token used to go through `sed`, so it sat in an argv any user on the host could read with
+# `ps`, and the redirect created the temp at the shell umask (0644). Both are assertions now.
+reset_state
+rm -rf "${APP_DIR:?}/caddy"
+happy_image
+export FAKE_CURL=ok
+rc="$(run refs/heads/main)"
+[ "$rc" = "0" ] && pass "edge render exits 0" || fail "edge render exited $rc"
+RENDERED="$APP_DIR/caddy/site.caddy"
+[ -n "$(find "$RENDERED" -maxdepth 0 -perm 0640 2>/dev/null)" ] \
+  && pass "rendered edge block is 0640" || fail "rendered edge block mode is not 0640"
+leftovers="$(find "$APP_DIR/caddy" -mindepth 1 -maxdepth 1 ! -name site.caddy -print 2>/dev/null)"
+[ -z "$leftovers" ] && pass "no temp file left in caddy/" || fail "leftovers in caddy/: $leftovers"
+grep -q 'Bearer dryrun-token' "$RENDERED" && pass "bearer line carries the rendered token" \
+  || fail "bearer line not rendered: $(grep -n 'no_bearer' "$RENDERED" | head -2)"
+# An external process carrying the token in argv is the bug; a shell builtin substitution is not.
+TOKEN_ARGV="$(grep -nE '^[^#]*\b(sed|awk|printf)\b[^#]*\$\{?KORI_EDGE_TOKEN' "$DEPLOY" || true)"
+[ -z "$TOKEN_ARGV" ] && pass "no sed/awk/printf line carries the edge token" \
+  || fail "an external command carries the token: $TOKEN_ARGV"
+grep -qE '^[[:space:]]*umask 077' "$DEPLOY" && pass "the render runs under umask 077" \
+  || fail "no umask 077 before the render"
+
+# ── scenario 3h: a caddy that rejects the block fails the deploy, old block back ─
+# Caddy cannot load the new block: every site on the host goes down if this is only a WARN. The
+# deploy must restore the block that was serving, restart once more, and exit non-zero before the
+# app is touched.
+reset_state
+mkdir -p "$APP_DIR/caddy"
+printf '# previous block that was serving\n' >"$APP_DIR/caddy/site.caddy"
+chmod 0640 "$APP_DIR/caddy/site.caddy"
+PREV_SUM="$(cksum <"$APP_DIR/caddy/site.caddy")"
+happy_image
+export FAKE_CURL=ok FAKE_SYSTEMCTL_CADDY=once
+rc="$(run refs/heads/main)"
+[ "$rc" != "0" ] && pass "caddy rejection exits non-zero ($rc)" || fail "caddy rejection exited 0"
+grep -q 'caddy rejected the rendered block' "$APP_DIR/logs/deploy.log" \
+  && pass "caddy rejection is named in the deploy log" \
+  || fail "caddy rejection not logged: $(tail -3 "$APP_DIR/logs/deploy.log")"
+[ "$(cksum <"$APP_DIR/caddy/site.caddy")" = "$PREV_SUM" ] \
+  && pass "previous edge block restored byte-identical" \
+  || fail "previous edge block not restored: $(cat "$APP_DIR/caddy/site.caddy")"
+grep -q 'REJECTED at the edge' "$APP_DIR/logs/deploy.log" \
+  && pass "restore retry is reported" \
+  || fail "restore retry not reported: $(tail -3 "$APP_DIR/logs/deploy.log")"
+[ "$(restarts)" = "0" ] && pass "caddy rejection restarted no kori-api" \
+  || fail "caddy rejection still restarted kori-api"
+
+# ── scenario 3i: caddy down and no previous block -> remove the file, exit non-zero ─
+# The first deploy on a host has nothing to restore. The last state Caddy loaded is "no file at
+# this path", so the unloadable block is removed and the deploy fails loudly.
+reset_state
+rm -rf "${APP_DIR:?}/caddy"
+happy_image
+export FAKE_CURL=ok FAKE_SYSTEMCTL_CADDY=fail
+rc="$(run refs/heads/main)"
+[ "$rc" != "0" ] && pass "dead caddy exits non-zero ($rc)" || fail "dead caddy exited 0"
+grep -q 'public edge is down, human needed' "$APP_DIR/logs/deploy.log" \
+  && pass "dead caddy is reported as an edge outage" \
+  || fail "edge outage not reported: $(tail -3 "$APP_DIR/logs/deploy.log")"
+[ -f "$APP_DIR/caddy/site.caddy" ] && fail "dead caddy left the unloadable block in place" \
+  || pass "dead caddy removed the unloadable block"
+unset FAKE_SYSTEMCTL_CADDY
 
 # ── scenario 4: a redeploy rotates :local to :prev ──────────────────────────
 reset_state
