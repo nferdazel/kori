@@ -2,9 +2,10 @@
 # grades byte-wise, CLI flag forms and precedence, and config defaults. No socket
 # is opened here; the harness starts the real binary.
 
-import std/[json, options, os, sequtils, strutils, times]
+import std/[json, options, os, sequtils, strutils, tables, times]
 
 import "../../apps/api/src/kori"
+import "../../apps/api/src/generated/static_files"
 
 var failures = 0
 
@@ -379,6 +380,46 @@ block:
                             LogFilter(stream: -1))
   check "a missing log is reported, not raised",
     not missing.exists and missing.rows.len == 0
+
+# ------------------------------------------------------------- static surface ---
+
+check "the root serves index.html", resolveStaticPath("/") == "/index.html"
+check "an empty path serves index.html", resolveStaticPath("") == "/index.html"
+check "a page path is looked up unchanged",
+  resolveStaticPath("/requests.html") == "/requests.html"
+check "a missing page is not an index fallback",
+  resolveStaticPath("/nope.html") == "/nope.html"
+check "a traversal attempt is only a key that is not present",
+  resolveStaticPath("/../kori.nim") == "/../kori.nim"
+check "an encoded traversal is not normalised into a real path",
+  resolveStaticPath("/%2e%2e/kori.nim") == "/%2e%2e/kori.nim"
+
+check "a hashed asset is immutable",
+  cacheControlFor("/assets/main-BYeE7fmQ.css") == StaticAssetCache
+check "a font keeps its name, so it is not immutable",
+  cacheControlFor("/fonts/inter-latin-var.woff2") == StaticFontCache
+check "a page is never cached across a deploy",
+  cacheControlFor("/index.html") == StaticNoStore
+check "the root path is no-store too, because it is a page",
+  cacheControlFor(resolveStaticPath("/")) == StaticNoStore
+
+# The committed module must be the one the binary serves, so a page the dist has
+# cannot be missing from the table and a page the table has cannot be missing from
+# the dist. This is the drift check in test form, for the four pages and the two
+# assets that are named in the shell.
+block:
+  let table = staticFileTable()
+  for path in ["/index.html", "/requests.html", "/routes.html", "/config.html",
+               "/assets/main-BYeE7fmQ.css", "/assets/main-DD-mDHpI.js",
+               "/fonts/inter-latin-var.woff2", "/fonts/jetbrains-mono-latin-var.woff2"]:
+    check "the embedded table carries " & path, table.hasKey(path)
+  check "every embedded page is html",
+    table["/index.html"].contentType.startsWith("text/html")
+  check "the two fonts are woff2",
+    table["/fonts/inter-latin-var.woff2"].contentType == "font/woff2"
+  check "an embedded body is not empty", table["/index.html"].body.len > 0
+  check "no path in the table is a directory or a traversal",
+    table.keys().toSeq().allIt(it.startsWith("/") and not it.contains(".."))
 
 # --------------------------------------------------------------------- report ---
 

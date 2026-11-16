@@ -43,7 +43,11 @@ task_nim() {
   [ -d apps/web/dist ] || missing apps/web/dist "run ./task web first"
   [ -f acceptance/selftest.sh ] || missing acceptance "the A1-A11 harness"
   need nim "install Nim 2.4.2"
-  sh tools/gen-static.sh apps/web/dist src/generated/static_files.nim
+  # The module lives beside kori.nim, not at the repo root: `import generated/static_files`
+  # resolves against apps/api/src, and the committed file is what a bare `nim c` embeds.
+  sh tools/gen-static.sh apps/web/dist apps/api/src/generated/static_files.nim
+  git diff --quiet -- apps/api/src/generated/static_files.nim \
+    || { echo "static_files.nim is stale — regenerate it from the committed dist" >&2; exit 1; }
   nim check --hints:off apps/api/src/kori.nim
   nimble test -y
   nim c -d:release --mm:orc --threads:on --hints:off -o:apps/api/src/kori apps/api/src/kori.nim

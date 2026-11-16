@@ -7,13 +7,17 @@
 # Slice 3: GET /admin/log over a bounded tail scan, GET /admin/config with every
 # credential redacted, `recent[]` on /admin/state, and the D11 envelope.
 #
-# Deliberately absent, and not to be reported as done: balancing beyond weight 1,
-# the dashboard pages and the credential refresh (§4). See REPORT.md for the open
-# list.
+# Slice 4: the four dashboard pages and their assets, served from the table that
+# tools/gen-static.sh embeds at compile time. Nothing is read from disk at runtime.
+#
+# Deliberately absent, and not to be reported as done: balancing beyond weight 1
+# and the credential refresh (§4). See REPORT.md for the open list.
 
 import std/[algorithm, asyncdispatch, asyncnet, exitprocs,
-            httpcore, json, net, options, os, posix, strutils, times, uri]
+            httpcore, json, net, options, os, posix, strutils, tables, times, uri]
 import std/asynchttpserver
+
+import generated/static_files
 
 const
   KoriVersion* = "0.2.0"
@@ -44,6 +48,13 @@ const
   LatencyRingSize = 50
   RecentLimit = 10
   FailoverEventLimit = 20
+
+  # Slice 4 cache policy. Only /assets/ names are content-hashed, so only those
+  # may be immutable; the fonts keep their names across a font upgrade, and the
+  # four pages must never be served stale after a deploy.
+  StaticAssetCache* = "public, max-age=31536000, immutable"
+  StaticFontCache* = "public, max-age=86400"
+  StaticNoStore* = "no-store"
 
   # The seven failure classes plus the one log-only value (§3.1, §5.1).
   TokenAuth401* = "auth_401"
@@ -125,6 +136,7 @@ type
     configModifiedAt*: string
     credentialRefs*: seq[string]
     logLines*: int
+    staticFiles: Table[string, StaticFile]
 
   RecvKind = enum
     rkData, rkEof, rkTruncated, rkTimeout, rkError
@@ -457,7 +469,8 @@ proc newGateway*(cfg: Config, log: RequestLog,
                 listenAddr: string): Gateway =
   Gateway(cfg: cfg, log: log, startedAt: nowStamp(), listenAddr: listenAddr,
           cursor: -1, ssl: newUpstreamSslContext(),
-          legs: newSeq[LegRuntime](cfg.legs.len))
+          legs: newSeq[LegRuntime](cfg.legs.len),
+          staticFiles: staticFileTable())
 
 proc legAvailable*(gateway: Gateway, index: int, now: float): bool =
   ## A cooling leg is skipped without a dial. Once the cooldown expires the leg
@@ -1746,6 +1759,55 @@ proc handleAdminLog(gateway: Gateway,
 
   await respondJson(request, Http200, $root)
 
+proc cacheControlFor*(path: string): string =
+  if path.startsWith("/assets/"):
+    StaticAssetCache
+  elif path.startsWith("/fonts/"):
+    StaticFontCache
+  else:
+    StaticNoStore
+
+proc resolveStaticPath*(requestPath: string): string =
+  ## "/" is the only alias, and it is a fixed one. Every other path is handed to
+  ## the table unchanged: no prefix rule and no index fallback, so a missing file
+  ## stays missing instead of quietly serving index.html with a 200.
+  if requestPath.len == 0 or requestPath == "/": "/index.html"
+  else: requestPath
+
+proc notFoundBody(): string =
+  "{\"error\":{\"type\":\"not_found\",\"message\":\"no such path\"}}"
+
+proc handleStatic(gateway: Gateway,
+                  request: Request): Future[void] {.async.} =
+  ## The four pages, /assets/* and /fonts/*, from the compiled table only.
+  ##
+  ## Exact path match: "/" is index.html and every other request is a lookup, so
+  ## there is no prefix rule, no index fallback and no way for a path outside the
+  ## table to reach a file. Nothing here touches the filesystem, so a traversal
+  ## attempt is just a key that is not present.
+  if request.reqMethod notin {HttpGet, HttpHead}:
+    var refusal = newHttpHeaders()
+    refusal["Content-Type"] = "application/json"
+    refusal["Allow"] = "GET, HEAD"
+    await request.respond(Http405,
+      "{\"error\":{\"type\":\"method_not_allowed\",\"message\":\"GET, HEAD\"}}",
+      refusal)
+    return
+
+  let path = resolveStaticPath(request.url.path)
+  if not gateway.staticFiles.hasKey(path):
+    await respondJson(request, Http404, notFoundBody())
+    return
+
+  let entry = gateway.staticFiles[path]
+  var headers = @[("Content-Type", entry.contentType),
+                  ("Content-Length", $entry.body.len),
+                  ("Cache-Control", cacheControlFor(path)),
+                  ("X-Content-Type-Options", "nosniff")]
+  # A HEAD gets the same headers and no body; the length is the body's.
+  let payload = if request.reqMethod == HttpHead: "" else: entry.body
+  await request.client.send(buildHead(200, headers) & payload)
+
 proc dispatch(gateway: Gateway, request: Request): Future[void] {.async.} =
   let path = request.url.path
   if path == "/healthz":
@@ -1774,8 +1836,9 @@ proc dispatch(gateway: Gateway, request: Request): Future[void] {.async.} =
     else:
       await gateway.handleChat(request)
   else:
-    await respondJson(request, Http404,
-                      "{\"error\":{\"type\":\"not_found\",\"message\":\"no such path\"}}")
+    # Last in the chain on purpose: /healthz, /admin/* and /v1/* keep their
+    # priority, so the D11 envelope is untouched by the static surface.
+    await gateway.handleStatic(request)
 
 # ---------------------------------------------------------------------- main ---
 
