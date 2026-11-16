@@ -45,7 +45,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: "Contract: check this repo"
         run: ./ops/scripts/contract-check.sh .
@@ -55,10 +55,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Cache Nim toolchain
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.nimble
@@ -163,8 +163,10 @@ jobs:
       packages: write
       id-token: write        # keyless cosign, this job only
     steps:
+      # This job holds packages: write and id-token: write, so its actions are pinned to a commit:
+      # a retagged major would otherwise run whatever the tag points at with those permissions.
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # ${GITHUB_SHA::7} is bash syntax and inside `with:` there is no shell, so buildx receives
       # it literally and the tag is invalid. printf '%.7s' also matches the host's `cut -c1-7`
@@ -177,11 +179,11 @@ jobs:
         run: printf 'sha7=%.7s\n' "$SHA" >>"$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Log in to GHCR
         if: github.event_name == 'push'
-        uses: docker/login-action@v4
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -193,7 +195,7 @@ jobs:
       #   NIM_SHA256   https://nim-lang.org/download/nim-2.4.2-linux_x64.tar.xz.sha256
       - name: Build and push
         id: push
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: apps/api/Dockerfile
@@ -240,9 +242,14 @@ jobs:
       # pnpm 12 pin; v4 predates it.
       - name: Set up pnpm
         uses: pnpm/action-setup@v6
+        with:
+          # packageManager lives in apps/web, not at the repo root: without this the action
+          # looks for a root package.json, finds none and fails with "No pnpm version is
+          # specified" before node or pnpm ever runs.
+          package_json_file: apps/web/package.json
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: "26"
           cache: pnpm
@@ -274,7 +281,7 @@ jobs:
     env:
       GITLEAKS_VERSION: 8.30.1
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -297,13 +304,13 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Nothing else in this pipeline reads ops/scripts. Without this job an edit to the ref guard
       # or the rollback branch lands on main with only `bash -n` behind it, and the next deploy is
       # the first time the change runs.
       - name: Cache shellcheck
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/kori-shellcheck
           key: shellcheck-${{ env.SHELLCHECK_VERSION }}
