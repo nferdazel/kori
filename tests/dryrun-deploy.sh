@@ -181,14 +181,35 @@ cat >"$BIN/curl" <<'STUB'
 #!/usr/bin/env bash
 S="${PODMAN_STATE:?}"
 printf 'curl %s\n' "$*" >>"$S/calls.log"
+# The body matters: smoke.sh parses /admin/state as JSON, so a healthy stub has to answer with
+# something parseable. wait_healthy only reads the exit code, which is why a body-only failure
+# (nonjson) keeps the health gate green and fails smoke — the case scenario 10b needs.
 # ok      : always healthy
 # recover : the new image is sick, the old one (:prev) is fine once it is back in service
+# nonjson : answers 200 with a body that is not JSON -> health green, smoke red
 # fail    : nothing is healthy, not even the rollback
 case "${FAKE_CURL:-ok}" in
-  ok) exit 0 ;;
+  ok) printf '{}\n'; exit 0 ;;
   recover) [ -f "$S/rolled_back" ] && { printf '{}\n'; exit 0; } || exit 7 ;;
+  nonjson) printf 'not json\n'; exit 0 ;;
   *) exit 7 ;;
 esac
+STUB
+
+# smoke.sh reads the publish address with `ss` and the log size with GNU `stat -c`. Neither is
+# macOS-native, and the deploy harness runs on the workstation, so both are stubbed here the same
+# way dryrun-smoke.sh stubs them.
+cat >"$BIN/ss" <<'STUB'
+#!/usr/bin/env bash
+printf 'ss %s\n' "$*" >>"${PODMAN_STATE:?}/calls.log"
+printf 'State  Recv-Q  Send-Q  Local Address:Port\nLISTEN 0 4096 127.0.0.1:8787 0.0.0.0:*\n'
+STUB
+
+cat >"$BIN/stat" <<'STUB'
+#!/usr/bin/env bash
+printf 'stat %s\n' "$*" >>"${PODMAN_STATE:?}/calls.log"
+f="${3:-${2:-}}"
+[ -f "$f" ] && wc -c <"$f" | tr -d ' ' || printf '0\n'
 STUB
 
 cat >"$BIN/sudo" <<'STUB'
@@ -251,7 +272,12 @@ reset_state() {
   : >"$STATE/tags"
   : >"$STATE/calls.log"
   rm -f "$STATE/rolled_back" "$STATE/pull_count"
-  rm -f "$APP_DIR/.deployed_rev" "$APP_DIR/logs/deploy.log"
+  rm -f "$APP_DIR/.deployed_rev" "$APP_DIR/logs/deploy.log" "$APP_DIR/logs/smoke.log"
+  # smoke.sh requires an append-only request log with a JSON last line. The gateway writes it in
+  # production; here the harness owns it, so every scenario starts from the same one line.
+  mkdir -p "$APP_DIR/logs"
+  printf '{"ts":"2026-11-16T07:00:00Z","route":"leg-a","status":200,"latency_ms":42,"stream":false,"tokens_in":11,"tokens_out":7,"failover_from":"","failover_reason":"","model":"flash"}\n' \
+    >"$APP_DIR/logs/requests.jsonl"
   unset FAKE_MANIFEST FAKE_REPO_DIGESTS
 }
 
@@ -524,6 +550,29 @@ grep -q 'rollback to :prev healthy; deploy of' "$APP_DIR/logs/deploy.log" && pas
   || fail "expected 2 restarts, saw $(restarts)"
 [ -f "$APP_DIR/.deployed_rev" ] && fail ".deployed_rev was written for a rejected deploy" \
   || pass "rejected deploy did not move .deployed_rev"
+
+# ── scenario 10b: health green, smoke red -> same rollback as an unhealthy box ─
+# The smoke gate is new in this diff. A container that answers /admin/state with a body the log
+# reader cannot parse is not a deploy, even though wait_healthy is satisfied (it reads the exit
+# code only). Without this scenario the smoke branch could rot into dead code.
+reset_state
+printf 'local\n' >"$STATE/tags"
+happy_image
+export FAKE_CURL=nonjson
+rc="$(run refs/heads/main)"
+[ "$rc" != "0" ] && pass "smoke failure exits non-zero ($rc)" || fail "smoke failure exited 0"
+grep -q 'health gate passed but smoke failed' "$APP_DIR/logs/deploy.log" \
+  && pass "smoke failure is named apart from the health gate" \
+  || fail "smoke failure not named: $(tail -3 "$APP_DIR/logs/deploy.log")"
+grep -q 'body is not JSON' "$APP_DIR/logs/deploy.log" \
+  && pass "smoke's reason is in the deploy log" \
+  || fail "deploy log does not carry smoke's reason: $(tail -4 "$APP_DIR/logs/deploy.log")"
+grep -q 'rollback to :prev healthy; deploy of' "$APP_DIR/logs/deploy.log" \
+  && pass "smoke failure rolled back to :prev" \
+  || fail "no rollback after smoke failure: $(tail -3 "$APP_DIR/logs/deploy.log")"
+[ -f "$APP_DIR/.deployed_rev" ] && fail ".deployed_rev written for a smoke-rejected deploy" \
+  || pass "smoke-rejected deploy did not move .deployed_rev"
+unset FAKE_CURL
 
 # ── scenario 11: both images sick -> no false comfort, exit non-zero ───────
 reset_state
