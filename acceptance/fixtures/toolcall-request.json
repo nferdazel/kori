@@ -1,0 +1,33 @@
+{
+  "model": "flash",
+  "stream": false,
+  "messages": [
+    {
+      "role": "system",
+      "content": "Answer with a tool call when a tool fits."
+    },
+    {
+      "role": "user",
+      "content": "What is the weather in Jakarta right now? Use the tool."
+    }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "Current weather for one city",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "city": { "type": "string" },
+            "unit": { "type": "string", "enum": ["celsius", "fahrenheit"] }
+          },
+          "required": ["city"]
+        }
+      }
+    }
+  ],
+  "tool_choice": "auto",
+  "temperature": 0
+}

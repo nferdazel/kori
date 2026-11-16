@@ -1,0 +1,11 @@
+{
+  "model": "flash",
+  "stream": false,
+  "messages": [
+    {
+      "role": "user",
+      "content": "PROMPT-PLACEHOLDER"
+    }
+  ],
+  "temperature": 0
+}
