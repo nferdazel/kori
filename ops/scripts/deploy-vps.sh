@@ -90,7 +90,11 @@ wait_healthy() {
 
 restart_service() {
   systemctl --user daemon-reload
-  systemctl --user restart "$SERVICE"
+  # A container that dies before READY makes this return non-zero at once; under `set -e` that
+  # used to abort the deploy before the health gate and before rollback could finish. The gate
+  # decides the outcome, never this exit code, so a failure here is a warning, not fatal.
+  systemctl --user restart "$SERVICE" \
+    || log "WARN: restart of $SERVICE returned non-zero; health gate decides"
 }
 
 # CI publishes this tag only after the gate job is green, and the webhook reaches this host
