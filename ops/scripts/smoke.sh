@@ -7,8 +7,9 @@
 #   3. the request log is append-only: the file never shrinks across a request, and its last line
 #      parses as JSON. It does NOT prove one line per proxied request: that needs a real provider
 #      leg, and a smoke run must not spend tokens.
-#   4. edge, only when KORI_EDGE_URL is set: no bearer -> 401, wrong bearer -> 401, right bearer -> 200
-#      and /admin/* stays unreachable from the edge
+#   4. edge, only when KORI_EDGE_URL is set: no bearer -> 401, wrong bearer -> 401, right bearer ->
+#      405 with kori's own JSON body on a GET of the v1 chat path, and /admin/* stays unreachable
+#      from the edge. The body matters: a 405 alone can come from any proxy in front of the origin.
 set -euo pipefail
 
 APP_DIR="${KORI_APP_DIR:-/srv/qouver/apps/kori}"
@@ -79,13 +80,29 @@ elif [ -n "${KORI_EDGE_URL:-}" ]; then
   # readable on the host, so an argument would hand the edge token to any local process for the
   # life of the request. `printf` here is a shell builtin, so no second process sees it either.
   code_auth() { printf 'header = "Authorization: Bearer %s"\n' "$KORI_EDGE_TOKEN" | code -K - "$@"; }
-  c="$(code "$KORI_EDGE_URL/v1/models")"
+  body_auth() { printf 'header = "Authorization: Bearer %s"\n' "$KORI_EDGE_TOKEN" | curl -s --max-time 10 -K - "$@"; }
+  c="$(code "$KORI_EDGE_URL/v1/chat/completions")"
   [ "$c" = "401" ] && ok "edge without bearer -> 401" || bad "edge without bearer -> $c (expected 401)"
   # The literal below is a deliberately wrong bearer: it must be rejected. Not a credential.
-  c="$(code -H "Authorization: Bearer wrong-token" "$KORI_EDGE_URL/v1/models")"  # gitleaks:allow
+  c="$(code -H "Authorization: Bearer wrong-token" "$KORI_EDGE_URL/v1/chat/completions")"  # gitleaks:allow
   [ "$c" = "401" ] && ok "edge with wrong bearer -> 401" || bad "edge with wrong bearer -> $c (expected 401)"
-  c="$(code_auth "$KORI_EDGE_URL/v1/models")"
-  [ "$c" = "200" ] && ok "edge with right bearer -> 200" || bad "edge with right bearer -> $c (expected 200)"
+  # v1 has one route and no /v1/models, so a GET of the chat path answers 405 from the binary. That
+  # proves the edge forwarded into kori without spending a provider token. The old /v1/models -> 200
+  # assertion was a permanent false negative: no such route exists in v1 (SPEC v1.1 R14).
+  c="$(code_auth "$KORI_EDGE_URL/v1/chat/completions")"
+  if [ "$c" != "405" ]; then
+    bad "edge with right bearer -> $c (expected 405)"
+  else
+    # A 405 on its own proves nothing: any proxy or error page in front of the origin can answer
+    # 405, so the status alone let a foreign 405 go green (gate finding, 2026-11-16). kori's own
+    # 405 is a JSON body naming the method, so the body has to match as well.
+    edge_body="$(body_auth "$KORI_EDGE_URL/v1/chat/completions" || true)"
+    if printf '%s' "$edge_body" | grep -q '"error":"method not allowed"'; then
+      ok "edge with right bearer -> 405 kori JSON on GET /v1/chat/completions"
+    else
+      bad "edge with right bearer -> 405 but the body is not kori's: $(printf '%s' "$edge_body" | head -c 120)"
+    fi
+  fi
   c="$(code_auth "$KORI_EDGE_URL/admin/state")"
   [ "$c" = "404" ] && ok "edge refuses /admin/state -> 404" || bad "edge answered /admin/state with $c (expected 404)"
 else

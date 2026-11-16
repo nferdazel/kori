@@ -69,6 +69,13 @@ if [ "${url#*"$FAKE_EDGE_URL"}" != "$url" ]; then
     */admin/state)
       [ "$hdr" = "Authorization: Bearer $FAKE_GOOD_TOKEN" ] && { say 404; exit 0; }
       say 401; exit 0 ;;
+    */v1/chat/completions)
+      if [ "$hdr" = "Authorization: Bearer $FAKE_GOOD_TOKEN" ]; then
+        if [ "$code_only" = "1" ]; then say "${FAKE_V1_CODE:-405}"; exit 0; fi
+        say "${FAKE_V1_BODY-{\"error\":\"method not allowed\"}}"; exit 0
+      fi
+      if [ "${FAKE_EDGE_MODE:-strict}" = "leaky" ] && [ -n "$hdr" ]; then say 200; exit 0; fi
+      say 401; exit 0 ;;
     *)
       if [ "$hdr" = "Authorization: Bearer $FAKE_GOOD_TOKEN" ]; then say 200; exit 0; fi
       if [ "${FAKE_EDGE_MODE:-strict}" = "leaky" ] && [ -n "$hdr" ]; then say 200; exit 0; fi
@@ -210,6 +217,28 @@ unset FAKE_EDGE_MODE
 [ "$rc" != "0" ] && pass "leaky bearer gate exits non-zero" || fail "leaky bearer gate exited 0"
 grep -q 'edge with wrong bearer -> 200' "$ROOT/out.txt" && pass "leaky bearer gate is named" \
   || fail "leaky bearer gate not named"
+
+# ── scenario 12: the v1 chat path answers 200 to a GET -> FAIL ─────────────
+# v1 has no GET route, so a 200 here means the edge is answering something that is not kori.
+reset_state
+export FAKE_V1_CODE=200
+rc="$(run "$FAKE_EDGE_URL" "$FAKE_GOOD_TOKEN")"
+unset FAKE_V1_CODE
+[ "$rc" != "0" ] && pass "GET on the v1 chat path answering 200 exits non-zero" \
+  || fail "a GET on the v1 chat path answered 200 and the smoke still passed"
+grep -q 'edge with right bearer -> 200 (expected 405)' "$ROOT/out.txt" \
+  && pass "the 405 expectation is named" || fail "the 405 expectation is not named"
+
+# ── scenario 13: a 405 that is not kori's -> FAIL ─────────────────────────
+# Any proxy or error page in front of the origin can answer 405. Without the body check this
+# scenario went green against an nginx error page (gate finding, 2026-11-16).
+reset_state
+export FAKE_V1_BODY='<html><head><title>405 Not Allowed</title></head><body><center><h1>405 Not Allowed</h1></center><hr><center>nginx</center></body></html>'
+rc="$(run "$FAKE_EDGE_URL" "$FAKE_GOOD_TOKEN")"
+unset FAKE_V1_BODY
+[ "$rc" != "0" ] && pass "a foreign 405 body exits non-zero" || fail "a foreign 405 body passed the edge matrix"
+grep -q "the body is not kori's" "$ROOT/out.txt" && pass "the foreign 405 body is named" \
+  || fail "foreign 405 body not named"
 
 printf '\n%s\n' "artifacts: $ROOT"
 if [ "$FAILS" -eq 0 ]; then
