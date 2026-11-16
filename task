@@ -39,8 +39,8 @@ task_ops() {
 
 task_web() {
   [ -f apps/web/package.json ] || missing apps/web "the Svelte source"
-  need npm "install Node 22"
-  ( cd apps/web && npm ci --no-audit --no-fund && npm run build )
+  need pnpm "npm install -g pnpm, or brew install pnpm"
+  ( cd apps/web && pnpm install --frozen-lockfile && pnpm run build )
   # The committed dist is what `nim c` embeds; a stale one ships an old dashboard silently.
   git diff --quiet -- apps/web/dist \
     || { echo "apps/web/dist is stale — commit the fresh build" >&2; exit 1; }

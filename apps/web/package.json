@@ -1,6 +1,7 @@
 {
   "name": "kori-web",
   "private": true,
+  "packageManager": "pnpm@12.20.0",
   "version": "0.1.0",
   "type": "module",
   "description": "kori gateway read-only dashboard: four pages, one shell, wired to the live admin GETs.",
@@ -10,7 +11,7 @@
     "preview": "vite preview"
   },
   "devDependencies": {
-    "typescript": "~5.6.3",
-    "vite": "^8.3.8"
+    "typescript": "5.6.3",
+    "vite": "8.3.8"
   }
 }

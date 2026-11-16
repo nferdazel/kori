@@ -42,7 +42,7 @@ This repository is public. A leaked token is public the moment it is pushed.
 Before every commit, push and pull request:
 
 - Run `gitleaks git --redact --no-banner .` over the history, not just the diff.
-- Scan the dependencies you touched: `npm audit --audit-level=high` for `apps/web`, and
+- Scan the dependencies you touched: `pnpm audit --audit-level=high` for `apps/web`, and
   `nimble` dependency review for the binary.
 - Check the diff for `.env` files, connection strings, tokens, keys and credentials. The
   real environment file lives on the host only; `ops/env/*.env.example` is a template.

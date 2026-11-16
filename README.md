@@ -25,7 +25,7 @@ What it does:
 | Tool | Version | Needed for |
 |---|---|---|
 | Nim | 2.4.2 | the binary, the unit tests, the acceptance harness |
-| Node.js and npm | 22 | rebuilding the dashboard under `apps/web` only |
+| Node.js and pnpm | 26 / pnpm 12 | rebuilding the dashboard under `apps/web` only |
 | shellcheck | any recent | `./task ops` |
 | jq, curl, python3 | stock | the acceptance harness under `acceptance/` |
 
@@ -274,7 +274,7 @@ shipping an old page.
 To rebuild the dashboard:
 
 ```sh
-cd apps/web && npm ci && npm run build
+cd apps/web && pnpm install --frozen-lockfile && pnpm run build
 ```
 
 Then regenerate the embedded module from the repo root:
