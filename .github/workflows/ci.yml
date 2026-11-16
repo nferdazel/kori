@@ -35,8 +35,10 @@ env:
 jobs:
 
   # Golden CI/CD contract: the same rules the server repo enforces, run here so drift fails
-  # this repo's own build instead of waiting for a manual audit. The script is a byte-identical
-  # copy of qouver's ops/scripts/contract-check.sh; fix it there and copy it out again.
+  # this repo's own build instead of waiting for a manual audit. The script is qouver's
+  # ops/scripts/contract-check.sh with one data entry added to its repo_exempt table: kori's
+  # dashboard is embedded in the api binary, so the C3 quadlet rule cannot apply. Port any other
+  # fix back to qouver and copy it out again.
   contract:
     name: "Contract: golden CI/CD rules"
     runs-on: ubuntu-24.04
@@ -75,11 +77,21 @@ jobs:
           tar -xJf /tmp/nim.tar.xz -C "$HOME/nim" --strip-components=1
           echo "$HOME/nim/bin" >> "$GITHUB_PATH"
 
-      # No dashboard build here: apps/web does not exist in this tree yet, so the embed step and
-      # its node setup were removed rather than left pointing at a missing lockfile. Restore both
-      # (and the Dockerfile's node stage) when the vite dashboard lands.
+      # No dashboard build here: apps/web/dist is committed, and the binary embeds it. What this
+      # job proves is that the committed embed matches that committed dist, so a stale
+      # static_files.nim cannot ship a dashboard nobody rebuilt. node setup stays out of this job;
+      # image-web is the job that rebuilds dist from source.
       - name: Install dependencies
         run: nimble install -d -y
+
+      # tools/gen-static.sh is deterministic (sorted, no timestamps, no absolute paths), so a
+      # fresh regeneration on a clean tree must produce the committed bytes. A hand edit, a dist
+      # change without a regen, or a regen without the dist all land here as a diff.
+      - name: Static embed drift
+        run: |
+          set -eu
+          sh tools/gen-static.sh apps/web/dist apps/api/src/generated/static_files.nim
+          git diff --exit-code -- apps/api/src/generated/static_files.nim
 
       - name: Check
         run: nim check --hints:off apps/api/src/kori.nim
@@ -87,23 +99,23 @@ jobs:
       - name: Tests
         run: nimble test -y
 
-      # The acceptance harness from the scope folder runs against a real binary. It is the only
-      # thing that proves the router, so it is a gate and not an optional job.
-      # The release-mode binary must compile even when the acceptance harness is absent: -d:release
-      # is where the compiler turns off runtime checks, so this step is worth keeping on its own.
-      - name: Acceptance harness
+      # The acceptance harness is the only thing that proves the router end to end, so it is a
+      # gate and not an optional job. The release-mode binary must compile even when the harness
+      # is absent: -d:release is where the compiler turns off runtime checks, so that step stands
+      # on its own. The suite itself is fail-closed — a harness that cannot run proves nothing.
+      - name: Build release binary
+        run: nim c -d:release --mm:orc --threads:on --hints:off -o:apps/api/src/kori apps/api/src/kori.nim
+
+      - name: Acceptance suite
         env:
           KORI_BIN: ./apps/api/src/kori
         run: |
           set -eu
-          nim c -d:release --mm:orc --threads:on --hints:off -o:"$KORI_BIN" apps/api/src/kori.nim
-          if [ -f acceptance/selftest.sh ]; then
-            sh acceptance/selftest.sh
-          else
-            # The harness lives outside this tree today. Skipping loudly beats a job that is red
-            # for a missing file on every push, and beats one that claims a gate it never ran.
-            echo "::warning::acceptance/selftest.sh is not committed; the acceptance gate did not run"
-          fi
+          [ -f acceptance/run-all.sh ] || {
+            echo "acceptance/run-all.sh is missing from the tree; the acceptance gate cannot run" >&2
+            exit 1
+          }
+          sh acceptance/run-all.sh
 
   # One required status for branch protection, and the only door to publication: the image job
   # below needs this job, so a commit whose quality gates are red can never become a pullable

@@ -132,7 +132,15 @@ repo_exempt() {
   case "$(basename "$1")" in
     majadu)          echo "C3 C5" ;;  # §4: repo is 404 on GitHub, the container is being retired
     badminton-match) echo "C3" ;;     # §13.6: owner excluded its frontend from the container migration
+    kori)            echo "C3-quadlet" ;; # dashboard is compiled into the kori-api binary; no web container exists to publish
   esac
+}
+
+exempt() { # exempt <repo-dir> <rule-id>
+  case " $(repo_exempt "$1") " in
+    *" $2 "*) return 0 ;;
+  esac
+  return 1
 }
 
 badid() {
@@ -213,6 +221,8 @@ check_web_container() {
     -type f \( -name '*.container' -o -name '*.quadlet' \) -print 2>/dev/null)
   if [ -n "$quad" ] && grep -qE '^PublishPort=127\.0\.0\.1:[0-9]+:8080$' $quad 2>/dev/null; then
     ok "frontend: quadlet mem-publish port loopback"
+  elif exempt "$d" C3-quadlet; then
+    note "C3-quadlet exempt for $(basename "$d"): the dashboard is compiled into the api binary, so there is no web container to publish"
   else
     warn "frontend: belum ada quadlet web dengan PublishPort 127.0.0.1:<port>:8080"
   fi
