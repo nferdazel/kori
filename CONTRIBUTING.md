@@ -13,7 +13,14 @@ Run these from the repo root and read the result:
 ./task check   # both of the above plus the dashboard build
 ```
 
-`./task nim` also runs the full acceptance suite separately:
+`./task nim` builds the binary and runs the acceptance self-test, 92 checks:
+
+```sh
+KORI_BIN=./apps/api/src/kori sh acceptance/selftest.sh
+```
+
+The ten-case suite (A1 to A10) is a separate command, and it is what the Nim job in CI
+runs after the release build:
 
 ```sh
 KORI_BIN=./apps/api/src/kori sh acceptance/run-all.sh
