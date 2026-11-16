@@ -202,6 +202,47 @@ jobs:
           DIGEST: ${{ steps.push.outputs.digest }}
         run: cosign sign --yes "ghcr.io/nferdazel/kori-api@${DIGEST}"
 
+  # C3 of the shared contract says a repo with apps/web/ needs its own web job. kori has no
+  # separate web container to publish: the built dashboard is embedded into the single kori-api
+  # binary (tools/gen-static.sh), so the contract's "quadlet on 127.0.0.1:<port>:8080" stays a
+  # warning here by design. This job is that web job, honest about what it proves: the committed
+  # dist is a fresh `vite build`, so what image-api embeds is what the source says, and the
+  # lockfile passes an audit. Nothing is pushed from here.
+  image-web:
+    name: "Web: build and dist drift check"
+    needs: [gate]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+
+      - name: Install dependencies
+        working-directory: apps/web
+        run: npm ci --no-audit --no-fund
+
+      # The dependency CVE gate for the node stack. Every repo here is public; a known-bad
+      # transitive package is as public as a leaked token.
+      - name: Audit the lockfile
+        working-directory: apps/web
+        run: npm audit --audit-level=high
+
+      - name: Build the dashboard
+        working-directory: apps/web
+        run: npm run build
+
+      # dist is committed because `nim c` embeds it and the container never runs node. A stale
+      # dist would ship an old dashboard silently, so a diff here is a red build, not a note.
+      - name: Committed dist must match a fresh build
+        run: git diff --exit-code -- apps/web/dist
+
   security:
     name: "Security: secrets scan"
     runs-on: ubuntu-24.04

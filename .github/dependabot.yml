@@ -17,6 +17,18 @@ updates:
     labels:
       - dependencies
 
-  # No npm ecosystem entry: apps/web does not exist in this tree, so Dependabot found no
-  # manifest and opened a failing "npm_and_yarn in /apps/web" PR on every run. Add it back
-  # together with the dashboard and its lockfile.
+  # The dashboard's own dependencies. apps/web now exists with a lockfile, so Dependabot has a
+  # manifest to read and no longer opens an empty "npm_and_yarn in /apps/web" PR.
+  - package-ecosystem: npm
+    directory: "/apps/web"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      web:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: "chore"
+    labels:
+      - dependencies

@@ -14,5 +14,8 @@ ops/env/*.env
 # Deploy state written on the host
 .deployed_rev
 
+# Node
+node_modules/
+
 # macOS noise
 .DS_Store

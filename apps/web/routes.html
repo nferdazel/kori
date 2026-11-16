@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Routes · kori</title>
+<meta name="description" content="kori gateway read-only dashboard: per-leg state.">
+</head>
+<body data-page="routes.html">
+<a class="skip" href="#main">Skip to content</a>
+
+<div class="shell">
+  <aside class="rail">
+    <div class="brand">kori<span>gateway</span></div>
+    <nav class="rail-nav" aria-label="Pages">
+      <a href="index.html"><span class="n">1</span>Overview</a>
+      <a href="requests.html"><span class="n">2</span>Requests</a>
+      <a href="routes.html"><span class="n">3</span>Routes</a>
+      <a href="config.html"><span class="n">4</span>Config</a>
+    </nav>
+    <div class="rail-foot">read-only<br>loopback only</div>
+  </aside>
+
+  <div class="main">
+    <header class="topbar">
+      <p class="sentence" data-sentence>reading route state</p>
+      <div class="topmeta">
+        <span data-refreshed>refreshed 0s ago</span>
+        <span class="up" data-uptime>up 0m</span>
+        <span class="ring" role="img" aria-label="refreshing every 5 seconds">
+          <svg width="18" height="18" viewBox="0 0 18 18" aria-hidden="true">
+            <circle class="track" cx="9" cy="9" r="8" fill="none" stroke-width="2"></circle>
+            <circle class="arc" data-ring-arc cx="9" cy="9" r="8" fill="none" stroke-width="2"></circle>
+          </svg>
+          <span class="tick" data-ring-num>5s</span>
+        </span>
+      </div>
+      <nav class="seg" aria-label="Pages">
+        <a href="index.html"><span class="n">1</span>Overview</a>
+        <a href="requests.html"><span class="n">2</span>Requests</a>
+        <a href="routes.html"><span class="n">3</span>Routes</a>
+        <a href="config.html"><span class="n">4</span>Config</a>
+      </nav>
+    </header>
+
+    <main class="page" id="main">
+      <div class="pagehead">
+        <div>
+          <h1>Routes</h1>
+          <p class="sub">Per leg: alive, cooling, how fast, how often it let you down.</p>
+        </div>
+      </div>
+
+      <p class="errline" data-log-note hidden></p>
+
+      <section class="panel" aria-labelledby="routes-h">
+        <div class="panel-head">
+          <h2 id="routes-h">Per leg</h2>
+          <span class="hint">GET /admin/state</span>
+        </div>
+        <p class="scrollnote">Table scrolls sideways at this width; every column stays reachable.</p>
+        <div class="tablewrap routes-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th scope="col">Leg</th>
+                <th scope="col">Model</th>
+                <th scope="col">State</th>
+                <th scope="col">Cooling until</th>
+                <th scope="col">Last failure</th>
+                <th scope="col" class="num">Failed in window</th>
+                <th scope="col" class="num">Served</th>
+                <th scope="col">p50 / max</th>
+                <th scope="col">Last seen</th>
+              </tr>
+            </thead>
+            <tbody data-routes></tbody>
+          </table>
+        </div>
+        <p class="table-note" data-routes-note></p>
+      </section>
+
+      <footer class="footer">
+        <span class="path" data-footer-path>log path</span>
+        <span data-footer-count></span>
+        <span>read-only · served on loopback</span>
+      </footer>
+    </main>
+  </div>
+</div>
+
+<script type="module" src="/src/main.ts"></script>
+</body>
+</html>
