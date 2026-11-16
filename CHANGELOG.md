@@ -10,6 +10,8 @@ templates under `ops/` describe the intended host shape and have not been run ag
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-16
+
 ### Added
 
 - Gateway door `POST /v1/chat/completions`, one [OI]-compatible surface in front of an
