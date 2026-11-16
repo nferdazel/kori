@@ -1,0 +1,11 @@
+version     = "0.1.0"
+author      = "Team C"
+description = "kori — in-house LLM provider gateway"
+license     = "MIT"
+srcDir      = "apps/api/src"
+bin         = @["kori"]
+
+requires "nim >= 2.0.0"
+
+task test, "Run the slice-1 unit tests":
+  exec "nim c -r --hints:off --mm:orc --threads:on --out:out/test-kori tests/unit/test_kori.nim"
