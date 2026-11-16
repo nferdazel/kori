@@ -66,6 +66,13 @@ case "$1" in
     exit 0
     ;;
   image)
+    if [ "${2:-}" = "inspect" ]; then
+      # The bytes just pulled claim this digest. The host must verify and tag the digest, not the
+      # mutable sha-<7> tag, so the harness reports one and scenario 3b asserts it is what moved
+      # :local.
+      printf '%s@sha256:%s\n' "${5%%:*}" "${FAKE_DIGEST:-$(printf 'a%.0s' {1..64})}"
+      exit 0
+    fi
     [ "${2:-}" = "exists" ] || exit 0
     grep -qxF "${3##*:}" "$S/tags" 2>/dev/null && exit 0 || exit 1
     ;;
@@ -235,6 +242,14 @@ grep -qF -- '--certificate-identity-regexp ^https://github.com/nferdazel/kori/' 
   || fail "cosign identity not pinned to this repo"
 grep -qxF "podman rmi $(sha_ref)" "$STATE/calls.log" && pass "sha tag removed after retag" \
   || fail "sha tag left behind: $(grep '^podman rmi' "$STATE/calls.log")"
+# The tag is only a filename: verification and the :local tag must use the digest the pulled
+# bytes report, so a tag moved between pull and verify cannot reach the running container.
+DIGEST_REF="ghcr.io/nferdazel/kori-api@sha256:$(printf 'a%.0s' {1..64})"
+grep -qF "cosign verify $DIGEST_REF" "$STATE/calls.log" && pass "signature verified on the digest" \
+  || fail "cosign did not verify the digest: $(grep '^cosign' "$STATE/calls.log")"
+grep -qxF "podman tag $DIGEST_REF localhost/kori:local" "$STATE/calls.log" \
+  && pass ":local tagged from the digest, not from the tag" \
+  || fail ":local not tagged from the digest: $(grep '^podman tag' "$STATE/calls.log")"
 
 # ── scenario 4: a redeploy rotates :local to :prev ──────────────────────────
 reset_state

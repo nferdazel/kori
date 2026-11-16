@@ -112,6 +112,14 @@ pull_when_published() {
   done
 }
 
+# A tag is a filename until the bytes state their own digest. Resolve the digest of what was just
+# pulled, then verify and tag that digest, so a tag moved between pull and verify cannot point
+# the local tag at unverified bytes.
+pulled_digest() {
+  podman image inspect -f '{{range .RepoDigests}}{{println .}}{{end}}' "$1" 2>/dev/null \
+    | grep -F '@sha256:' | head -1
+}
+
 # ── 4. Pull the image this commit built; the host never builds ───────────────
 # sha-<7> is a filename until the image proves which commit it is. Two independent proofs run
 # before any tag moves: the revision label must equal the commit just checked out, and the
@@ -128,24 +136,29 @@ PULL_RC=0
 pull_when_published "$IMAGE_REF" "$PULL_OUT" || PULL_RC=$?
 
 if [ "$PULL_RC" = "0" ]; then
-  IMAGE_REV="$(podman inspect -f '{{ index .Labels "org.opencontainers.image.revision" }}' "$IMAGE_REF" 2>/dev/null || true)"
+  IMAGE_DIGEST="$(pulled_digest "$IMAGE_REF")"
+  if [ -z "$IMAGE_DIGEST" ]; then
+    rm -f "$PULL_OUT"
+    die "Pulled $IMAGE_REF but it reports no digest — running container untouched"
+  fi
+  IMAGE_REV="$(podman inspect -f '{{ index .Labels "org.opencontainers.image.revision" }}' "$IMAGE_DIGEST" 2>/dev/null || true)"
   if [ "$IMAGE_REV" != "$REV" ]; then
     rm -f "$PULL_OUT"
     die "Image $IMAGE_REF says revision '${IMAGE_REV}', payload says $REV — running container untouched"
   fi
-  cosign verify "$IMAGE_REF" \
+  cosign verify "$IMAGE_DIGEST" \
     --certificate-identity-regexp "^https://github.com/nferdazel/kori/" \
     --certificate-oidc-issuer https://token.actions.githubusercontent.com >/dev/null 2>&1 \
-    || { rm -f "$PULL_OUT"; die "cosign verify failed for $IMAGE_REF — running container untouched"; }
+    || { rm -f "$PULL_OUT"; die "cosign verify failed for $IMAGE_DIGEST — running container untouched"; }
 
   if podman image exists "${IMAGE}:local"; then
     podman tag "${IMAGE}:local" "${IMAGE}:prev"
     log "==> tagged previous :local as :prev"
   fi
-  podman tag "$IMAGE_REF" "${IMAGE}:local"
+  podman tag "$IMAGE_DIGEST" "${IMAGE}:local"
   podman rmi "$IMAGE_REF" >/dev/null 2>&1 || true   # :local and :prev stay the only local tags
   IMAGE_PULLED=1
-  log "==> image pulled, verified and tagged :local (revision $IMAGE_REV)"
+  log "==> image pulled, digest ${IMAGE_DIGEST##*@} verified and tagged :local (revision $IMAGE_REV)"
 elif [ "$PULL_RC" = "1" ]; then
   # Legitimate: this commit did not change the image side, so CI pushed nothing for it.
   log "==> no image for ${SHORT} after ${IMAGE_WAIT_ATTEMPTS} attempts (this commit built none); keeping the running container"
