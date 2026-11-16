@@ -17,21 +17,6 @@ updates:
     labels:
       - dependencies
 
-  # apps/web carries the only lockfile in this repo. Patch and minor land together;
-  # a major stays its own PR so a breaking bump is never mixed into a safe batch.
-  - package-ecosystem: npm
-    directory: "/apps/web"
-    schedule:
-      interval: weekly
-    open-pull-requests-limit: 5
-    groups:
-      npm-patch-minor:
-        patterns:
-          - "*"
-        update-types:
-          - patch
-          - minor
-    commit-message:
-      prefix: "chore"
-    labels:
-      - dependencies
+  # No npm ecosystem entry: apps/web does not exist in this tree, so Dependabot found no
+  # manifest and opened a failing "npm_and_yarn in /apps/web" PR on every run. Add it back
+  # together with the dashboard and its lockfile.
