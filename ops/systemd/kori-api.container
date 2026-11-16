@@ -15,8 +15,14 @@
 #     every provider credential, so it is never baked into an image.
 #   - No HealthCmd: the runtime image has no curl or wget, and podman healthchecks run inside the
 #     container. Health is `Restart=always` plus the deploy gate on /admin/state.
+#   - `OnFailure=alert@%N.service`: the host's Telegram alert with a 15-minute per-unit cooldown,
+#     the same wiring the other units carry. A unit that dies repeatedly and silently is the
+#     failure this host already paid for once.
+#   - No `Network=qouver`: kori talks to upstream providers and has no database, so it does not
+#     need to see the app network.
 
 [Unit]
+OnFailure=alert@%N.service
 Description=kori — in-house LLM gateway (Nim)
 After=network-online.target
 Wants=network-online.target
