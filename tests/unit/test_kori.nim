@@ -2,7 +2,7 @@
 # grades byte-wise, CLI flag forms and precedence, and config defaults. No socket
 # is opened here; the harness starts the real binary.
 
-import std/[json, options, os, sequtils, strutils]
+import std/[json, options, os, sequtils, strutils, times]
 
 import "../../apps/api/src/kori"
 
@@ -165,6 +165,220 @@ check "absent usage is null, never zero",
 
 check "stream is read from the caller body", wantsStream("""{"stream":true}""")
 check "a non-JSON body is not a stream", not wantsStream("not json")
+
+# ------------------------------------------------------------ classification ---
+
+check "401 is the availability class", failureToken(401, "") == "auth_401"
+check "400 with MissingSessionID is its own class",
+  failureToken(400, """{"error":{"message":"MissingSessionID"}}""") == "missing_session_id"
+check "a 400 that is not MissingSessionID is a client error",
+  failureToken(400, """{"error":{"message":"model flash does not exist"}}""") == ""
+check "403 is a client error and never fails over", failureToken(403, "") == ""
+check "404 is a client error and never fails over", failureToken(404, "") == ""
+check "429 with a quota body is the capacity class",
+  failureToken(429, """{"error":{"type":"GoUsageLimitError"}}""") == "quota_429"
+check "429 without a quota body is a client error (D9.3)",
+  failureToken(429, """{"error":{"message":"Rate limit reached for requests per minute (RPM).","type":"requests"}}""") == ""
+check "503 is upstream_5xx", failureToken(503, "") == "upstream_5xx"
+check "502 with an HTML body is upstream_5xx",
+  failureToken(502, "<html>bad gateway</html>") == "upstream_5xx"
+check "a 200 is not a failure", failureToken(200, "") == ""
+
+check "the quota body is recognised in its other spellings",
+  isQuotaBody("insufficient_quota") and isQuotaBody("you are over your usage limit")
+check "a plain rate limit is not a quota body",
+  not isQuotaBody("Rate limit reached for requests per minute")
+
+# ---------------------------------------------------------------- R10 inject ---
+
+const StreamRequest = """{
+  "model": "flash",
+  "stream": true,
+  "messages": [
+    {
+      "role": "user",
+      "content": "PROMPT-PLACEHOLDER"
+    }
+  ],
+  "temperature": 0
+}"""
+
+block:
+  let injected = injectIncludeUsage(StreamRequest)
+  let parsed = parseJson(injected)
+  check "R10 injects include_usage on a stream",
+    parsed{"stream_options"}{"include_usage"}.getBool()
+  var stripped = parsed
+  stripped.delete("stream_options")
+  check "R10 changes nothing else in the request",
+    $stripped == $parseJson(StreamRequest)
+  check "R10 does not inject twice",
+    injectIncludeUsage(injected) == injected
+  check "R10 leaves a non-object body alone", injectIncludeUsage("[]") == "[]"
+  check "R10 keeps an empty object valid", injectIncludeUsage("{}") ==
+    """{"stream_options":{"include_usage":true}}"""
+
+# ---------------------------------------------------------------- the router ---
+
+proc makeGateway(legs: seq[Leg], balance: bool): Gateway =
+  var cfg = Config(listenHost: "127.0.0.1", listenPort: 4011,
+                   logPath: "/tmp/unused.jsonl", balance: balance)
+  cfg.legs = legs
+  newGateway(cfg, RequestLog(fd: -1), "127.0.0.1:4011")
+
+proc legSpec(name: string, role: LegRole): Leg =
+  Leg(name: name, baseUrl: "http://127.0.0.1:1/v1", model: name, role: role,
+      weight: 1)
+
+block:
+  let gateway = makeGateway(@[legSpec("a", lrPrimary), legSpec("b", lrPrimary),
+                              legSpec("c", lrFallback)], balance = false)
+  check "strict order: the walk is the config order",
+    gateway.pickOrder() == @[0, 1, 2]
+  gateway.startCooldown(0, "conn_refused")
+  check "a cooling leg is skipped and consumes no turn",
+    gateway.pickOrder() == @[1, 2]
+
+block:
+  let gateway = makeGateway(@[legSpec("a", lrPrimary), legSpec("b", lrPrimary),
+                              legSpec("c", lrFallback)], balance = true)
+  var picks: seq[int]
+  for _ in 1 .. 6:
+    picks.add gateway.pickOrder()[0]
+  check "balancing alternates the two primaries", picks == @[0, 1, 0, 1, 0, 1]
+  check "the fallback is never picked while a primary is ok",
+    gateway.pickOrder() == @[0, 1, 2]
+
+block:
+  let gateway = makeGateway(@[legSpec("a", lrPrimary), legSpec("b", lrPrimary),
+                              legSpec("c", lrFallback)], balance = true)
+  discard gateway.pickOrder()
+  gateway.startCooldown(0, "auth_401")
+  let walk = gateway.pickOrder()
+  check "a dead primary hands the request to the other primary first",
+    walk == @[1, 2]
+  gateway.startCooldown(1, "auth_401")
+  check "both primaries cooling leaves only the fallback",
+    gateway.pickOrder() == @[2]
+  gateway.startCooldown(2, "auth_401")
+  check "every leg cooling means no dial at all", gateway.pickOrder().len == 0
+
+block:
+  let gateway = makeGateway(@[legSpec("a", lrPrimary), legSpec("b", lrPrimary)],
+                            balance = true)
+  gateway.startCooldown(0, "quota_429")
+  check "a quota cooldown is 900 s, not 60",
+    gateway.legs[0].coolingUntil - epochTime() > 890.0
+  gateway.legs[0].coolingUntil = epochTime() - 1.0   # the cooldown expired
+  check "an expired cooldown is eligible again", gateway.legAvailable(0, epochTime())
+  gateway.legs[0].probeInFlight = true
+  check "only one half-open probe is in flight at a time",
+    not gateway.legAvailable(0, epochTime())
+  gateway.legs[0].probeInFlight = false
+  gateway.startCooldown(0, "quota_429")
+  check "a second quota failure re-cools the leg for another 900 s",
+    gateway.legs[0].coolingUntil - epochTime() > 890.0
+
+block:
+  let gateway = makeGateway(@[legSpec("a", lrPrimary)], balance = true)
+  check "a fresh leg is unknown", legStateName(gateway.legs[0], epochTime()) == "unknown"
+  gateway.startCooldown(0, "upstream_5xx")
+  check "a failed leg is cooling, never dead",
+    legStateName(gateway.legs[0], epochTime()) == "cooling"
+  check "last_failure_class is the §3 token",
+    gateway.legs[0].lastFailureClass == "upstream_5xx"
+  check "the failure counter moved once", gateway.legs[0].failedInWindow == 1
+  gateway.legs[0].coolingUntil = epochTime() - 1.0
+  check "an expired cooldown reads as ok, not cooling",
+    legStateName(gateway.legs[0], epochTime()) == "ok"
+  gateway.markServed(0, 12)
+  check "a served request clears the cooldown", gateway.legs[0].coolingUntil == 0.0
+  check "a served request moves the served counter", gateway.legs[0].servedInWindow == 1
+  check "a served request fills the latency ring", gateway.legs[0].latencies == @[12]
+
+block:
+  let gateway = makeGateway(@[legSpec("a", lrPrimary)], balance = true)
+  gateway.legs[0].attempted = true
+  check "an attempted leg that never failed and never served is ok",
+    legStateName(gateway.legs[0], epochTime()) == "ok"
+
+# ------------------------------------------------------------- admin surface ---
+
+block:
+  check "redactUrl keeps a clean base URL",
+    redactUrl("https://opencode.ai/inference/go/openai/v1") ==
+      "https://opencode.ai/inference/go/openai/v1"
+  check "redactUrl drops a query that carries a key",
+    redactUrl("https://example.test/v1?api_key=abc") == "https://example.test/v1"
+
+block:
+  check "parseRfc3339 reads a +07:00 offset",
+    parseRfc3339("2026-11-16T09:53:20+07:00").isSome
+  check "parseRfc3339 reads the same instant with +00:00",
+    parseRfc3339("2026-11-16T02:53:20+00:00") ==
+      parseRfc3339("2026-11-16T09:53:20+07:00")
+  check "parseRfc3339 tolerates fractional seconds",
+    parseRfc3339("2026-11-16T02:53:20.123456+00:00").isSome
+  check "parseRfc3339 rejects a non-instant", parseRfc3339("not-a-time").isNone
+
+block:
+  let line = """{"ts":"2026-11-16T09:53:20+07:00","route":"a","status":200,""" &
+    """"latency_ms":4,"tokens_in":null,"tokens_out":null,"failover_from":""" &
+    """"","failover_reason":"","stream":false,"extra":"dropped"}"""
+  let row = buildLogRow(parseJson(line))
+  check "a row is exactly the nine keys in order",
+    ($row).startsWith("{\"ts\":\"2026-11-16T09:53:20+07:00\",\"route\":\"a\"," &
+      "\"status\":200,\"latency_ms\":4,\"tokens_in\":null,\"tokens_out\":null," &
+      "\"failover_from\":\"\",\"failover_reason\":\"\",\"stream\":false}")
+  check "an extra key on a line is dropped", row{"extra"} == nil
+
+block:
+  let node = parseJson("""{"ts":"2026-11-16T09:53:20+07:00","route":"a",""" &
+    """"status":404,"tokens_in":1,"tokens_out":2,"failover_from":""" &
+    """"","failover_reason":"auth_401","stream":true}""")
+  var filter = LogFilter(stream: -1)
+  check "no filter matches every row", rowMatches(node, filter)
+  filter = LogFilter(stream: -1, hasRoute: true, route: "b")
+  check "route filter rejects a different leg", not rowMatches(node, filter)
+  filter = LogFilter(stream: -1, statusClass: 4)
+  check "status_class 4xx matches a 404", rowMatches(node, filter)
+  filter = LogFilter(stream: -1, statusClass: 2)
+  check "status_class 2xx rejects a 404", not rowMatches(node, filter)
+  filter = LogFilter(stream: -1, hasReason: true, reason: "auth_401")
+  check "reason filter matches the token", rowMatches(node, filter)
+  filter = LogFilter(stream: 0)
+  check "stream false rejects a streamed row", not rowMatches(node, filter)
+  filter = LogFilter(stream: -1, hasSince: true,
+                     sinceEpoch: parseRfc3339("2026-11-16T09:53:21+07:00").get)
+  check "since excludes an older row", not rowMatches(node, filter)
+
+block:
+  var content = ""
+  for index in 0 ..< 60:
+    content.add("{\"ts\":\"2026-11-16T09:" & align($index, 2, '0') &
+      ":00+07:00\",\"route\":\"b\",\"status\":200,\"latency_ms\":" & $index &
+      ",\"tokens_in\":1,\"tokens_out\":2,\"failover_from\":\"\"," &
+      "\"failover_reason\":\"\",\"stream\":false}\n")
+  let path = writeConfig("requests.jsonl", content)
+  let total = kori.countLines(path)
+  check "countLines counts every line", total == 60
+  let page = readLogTail(path, total, 0, 10, LogFilter(stream: -1))
+  check "a ten-row page has ten rows", page.rows.len == 10
+  check "the page is newest first", page.rows[0]{"latency_ms"}.getInt == 59
+  check "the scan did not cover the file", page.linesScanned <= 15
+  check "there are older lines behind the page", page.moreOlder
+  let second = readLogTail(path, total, 10, 10, LogFilter(stream: -1))
+  check "offset 10 starts at the eleventh line from the end",
+    second.rows[0]{"latency_ms"}.getInt == 49
+  check "the two pages share no row",
+    second.rows[0]{"latency_ms"}.getInt != page.rows[9]{"latency_ms"}.getInt
+  let whole = readLogTail(path, total, 0, 200, LogFilter(stream: -1))
+  check "a limit past the file returns every line and no more_older",
+    whole.rows.len == 60 and not whole.moreOlder
+  let missing = readLogTail(scratch / "absent.jsonl", 0, 0, 10,
+                            LogFilter(stream: -1))
+  check "a missing log is reported, not raised",
+    not missing.exists and missing.rows.len == 0
 
 # --------------------------------------------------------------------- report ---
 
