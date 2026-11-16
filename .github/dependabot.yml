@@ -1,0 +1,37 @@
+version: 2
+updates:
+  # Workflows pin actions by tag or commit SHA; this is what moves the pins.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    # One PR for every action: eleven separate PRs meant eleven images and eleven
+    # deploy hooks for the same supply-chain bump.
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: "chore"
+    labels:
+      - dependencies
+
+  # apps/web carries the only lockfile in this repo. Patch and minor land together;
+  # a major stays its own PR so a breaking bump is never mixed into a safe batch.
+  - package-ecosystem: npm
+    directory: "/apps/web"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      npm-patch-minor:
+        patterns:
+          - "*"
+        update-types:
+          - patch
+          - minor
+    commit-message:
+      prefix: "chore"
+    labels:
+      - dependencies
