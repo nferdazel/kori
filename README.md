@@ -84,8 +84,8 @@ the repository, in an image or in a log.
       "headers": { "x-opencode-session": "…" },
       "role": "primary",
       "oauth": {
-        "token_url": "<token endpoint URL, filled by the owner>",
-        "client_id": "<client id, filled by the owner>",
+        "token_url": "https://opencode.ai/console/auth/oauth/token",
+        "client_id": "https://opencode.ai/oauth/opencode/client.json",
         "refresh_token": "…"
       }
     },
@@ -116,8 +116,14 @@ the repository, in an image or in a log.
 | `balance` | no | default `false`, which keeps strict leg order |
 | `listen`, `log` | no | overridden by `--address`, `--port`, `--log` |
 
-The two owner-side facts in the example, `token_url` and `client_id`, are labelled
-placeholders on purpose: they are not guessed here and no vendor URL is assumed.
+For the `opencode-go` leg, `token_url` and `client_id` are the OpenCode Console's own
+values, published in its OAuth discovery document at
+`https://opencode.ai/console/.well-known/oauth-authorization-server` and in
+`https://opencode.ai/oauth/opencode/client.json`; the client is public and authenticates
+with `token_endpoint_auth_method` `none`, so no client secret is sent. `refresh_token` is
+the only secret in the block: it comes from the OpenCode credential store on the machine
+that owns the account (`opencode auth export`), never from the repository, and the refreshed
+values are written back into the running config file with mode `0600`.
 
 
 The caller's body is forwarded byte for byte, with one exception: for a streaming request
