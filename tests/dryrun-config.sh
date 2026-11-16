@@ -67,6 +67,7 @@ export STUB_ARGV="$ROOT/argv.log"
 export KORI_BIN="$STUB"
 
 SENTINEL_RT="rt-SENTINEL-argv-probe-111"
+SENTINEL_AT="st-SENTINEL-argv-probe-115"
 SENTINEL_SES="ses_SENTINEL-argv-probe-222"
 SENTINEL_CC="cc-SENTINEL-argv-probe-333"
 SENTINEL_SC="sc-SENTINEL-argv-probe-444"
@@ -75,6 +76,7 @@ VALUES="$ROOT/values.env"
 cat >"$VALUES" <<EOF
 # sentinel values: not credentials
 KORI_OPENCODE_REFRESH_TOKEN=$SENTINEL_RT
+KORI_OPENCODE_ACCESS_TOKEN=$SENTINEL_AT
 KORI_OPENCODE_SESSION=$SENTINEL_SES
 KORI_COMMANDCODE_API_KEY=$SENTINEL_CC
 KORI_SINARCLOUD_API_KEY=$SENTINEL_SC
@@ -94,10 +96,31 @@ rc=$?
 [ "$(file_mode "$OUT")" = "600" ] && pass "config.json is 0600" || fail "config.json mode is $(file_mode "$OUT")"
 grep -q '__KORI_' "$OUT" && fail "a placeholder survived into the config" \
   || pass "no template placeholder left in the config"
-for pair in "$SENTINEL_RT" "$SENTINEL_SES" "$SENTINEL_CC" "$SENTINEL_SC"; do
+for pair in "$SENTINEL_RT" "$SENTINEL_AT" "$SENTINEL_SES" "$SENTINEL_CC" "$SENTINEL_SC"; do
   grep -qF "$pair" "$OUT" && pass "value present: ${pair%%-SENTINEL*}" \
     || fail "value missing: ${pair%%-SENTINEL*}"
 done
+# "present somewhere in the file" is not enough: a value wired into the wrong field still passes
+# that check, and the opencode token sitting in sinarcloud's api_key hands it to a third party.
+assert_field() { # assert_field <json field> <value> <label>
+  grep -qF "\"$1\": \"$2\"" "$OUT" && pass "value in its field: $3" \
+    || fail "value not in field \"$1\": $3"
+}
+# Both providers use "api_key", so the field name alone cannot tell the two legs apart; the leg's
+# own name does, and a swap between them must fail here.
+leg_key() { # leg_key <leg name> -> that leg's api_key value
+  awk -v want="$1" '
+    /"name":/ { n = $0; sub(/.*"name": "/, "", n); sub(/".*/, "", n) }
+    /"api_key":/ && n == want { v = $0; sub(/.*"api_key": "/, "", v); sub(/".*/, "", v); print v }
+  ' "$OUT"
+}
+assert_field refresh_token "$SENTINEL_RT" "opencode refresh_token"
+assert_field access_token "$SENTINEL_AT" "opencode access_token"
+assert_field x-opencode-session "$SENTINEL_SES" "opencode session header"
+[ "$(leg_key commandcode)" = "$SENTINEL_CC" ] && pass "commandcode leg holds its own api_key" \
+  || fail "commandcode leg holds '$(leg_key commandcode)'"
+[ "$(leg_key sinarcloud)" = "$SENTINEL_SC" ] && pass "sinarcloud leg holds its own api_key" \
+  || fail "sinarcloud leg holds '$(leg_key sinarcloud)'"
 grep -q '"legs"' "$OUT" && pass "the config still has the legs array" || fail "legs array missing"
 
 # ── scenario 2: a second run refuses to overwrite ──────────────────────────
@@ -130,7 +153,7 @@ rc=$?
 [ "$rc" != "0" ] && pass "a missing key exits non-zero ($rc)" || fail "a missing key was accepted"
 grep -q 'KORI_COMMANDCODE_API_KEY' "$ROOT/stderr" && pass "the error names the missing key" \
   || fail "the error does not name the missing key"
-[ -e "$OUT2" ] && fail "a config was written without all four values" \
+[ -e "$OUT2" ] && fail "a config was written without all five values" \
   || pass "no config written when a value is missing"
 
 # ── scenario 5: an empty value is refused ──────────────────────────────────
@@ -184,7 +207,7 @@ grep -q 'never argv' "$ROOT/stderr" && pass "the refusal says values never come 
 # The stub records its own argv. If the script had passed a value through an external process,
 # the sentinel would be in that record.
 leak=0
-for pair in "$SENTINEL_RT" "$SENTINEL_SES" "$SENTINEL_CC" "$SENTINEL_SC"; do
+for pair in "$SENTINEL_RT" "$SENTINEL_AT" "$SENTINEL_SES" "$SENTINEL_CC" "$SENTINEL_SC"; do
   grep -qF "$pair" "$STUB_ARGV" && leak=1
 done
 [ "$leak" = "0" ] && pass "no value appears in the binary's argv" \

@@ -12,7 +12,8 @@
       "oauth": {
         "token_url": "https://opencode.ai/console/auth/oauth/token",
         "client_id": "https://opencode.ai/oauth/opencode/client.json",
-        "refresh_token": "__KORI_OPENCODE_REFRESH_TOKEN__"
+        "refresh_token": "__KORI_OPENCODE_REFRESH_TOKEN__",
+        "access_token": "__KORI_OPENCODE_ACCESS_TOKEN__"
       }
     },
     {

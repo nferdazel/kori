@@ -22,6 +22,7 @@
 #
 # Values file format, one per line, '#' comments and blank lines ignored:
 #   KORI_OPENCODE_REFRESH_TOKEN=...
+#   KORI_OPENCODE_ACCESS_TOKEN=...
 #   KORI_OPENCODE_SESSION=...
 #   KORI_COMMANDCODE_API_KEY=...
 #   KORI_SINARCLOUD_API_KEY=...
@@ -71,7 +72,7 @@ done
 [ -r "$TEMPLATE" ] || die "template not readable: $TEMPLATE"
 if [ -n "$VALUES_FILE" ]; then
   [ -r "$VALUES_FILE" ] || die "values file not readable: $VALUES_FILE"
-  # The values file holds four live credentials. Writing a 0600 config from a wider source leaves
+  # The values file holds live credentials. Writing a 0600 config from a wider source leaves
   # the same secrets reachable by other local accounts, so refuse instead of warning: only a mode
   # whose group and other digits are both zero gets through.
   values_mode="$(file_mode "$VALUES_FILE")"
@@ -80,12 +81,13 @@ if [ -n "$VALUES_FILE" ]; then
     *) die "values file is $values_mode, group or other can reach it: chmod 600 $VALUES_FILE" ;;
   esac
 elif [ -t 0 ]; then
-  die "no values: pass --values FILE or pipe the four keys on stdin"
+  die "no values: pass --values FILE or pipe the five keys on stdin"
 fi
 
-# ── read the four values ─────────────────────────────────────────────────────
+# ── read the five values ─────────────────────────────────────────────────────
 UNSET=$'\001'
 v_refresh="$UNSET"
+v_access="$UNSET"
 v_session="$UNSET"
 v_commandcode="$UNSET"
 v_sinarcloud="$UNSET"
@@ -94,6 +96,7 @@ line_number=0
 set_value() { # set_value <key> <value>
   case "$1" in
     KORI_OPENCODE_REFRESH_TOKEN) v_refresh="$2" ;;
+    KORI_OPENCODE_ACCESS_TOKEN) v_access="$2" ;;
     KORI_OPENCODE_SESSION) v_session="$2" ;;
     KORI_COMMANDCODE_API_KEY) v_commandcode="$2" ;;
     KORI_SINARCLOUD_API_KEY) v_sinarcloud="$2" ;;
@@ -117,9 +120,10 @@ while IFS= read -r line || [ -n "$line" ]; do
   set_value "$key" "$value" || die "values line $line_number has an unknown key '$key'"
 done < "${VALUES_FILE:-/dev/stdin}"
 
-for key in KORI_OPENCODE_REFRESH_TOKEN KORI_OPENCODE_SESSION KORI_COMMANDCODE_API_KEY KORI_SINARCLOUD_API_KEY; do
+for key in KORI_OPENCODE_REFRESH_TOKEN KORI_OPENCODE_ACCESS_TOKEN KORI_OPENCODE_SESSION KORI_COMMANDCODE_API_KEY KORI_SINARCLOUD_API_KEY; do
   case "$key" in
     KORI_OPENCODE_REFRESH_TOKEN) value="$v_refresh" ;;
+    KORI_OPENCODE_ACCESS_TOKEN) value="$v_access" ;;
     KORI_OPENCODE_SESSION) value="$v_session" ;;
     KORI_COMMANDCODE_API_KEY) value="$v_commandcode" ;;
     KORI_SINARCLOUD_API_KEY) value="$v_sinarcloud" ;;
@@ -167,12 +171,14 @@ umask 077
 chmod 0600 "$TMP"
 
 esc_refresh="$(json_escape "$v_refresh")"
+esc_access="$(json_escape "$v_access")"
 esc_session="$(json_escape "$v_session")"
 esc_commandcode="$(json_escape "$v_commandcode")"
 esc_sinarcloud="$(json_escape "$v_sinarcloud")"
 
 while IFS= read -r line || [ -n "$line" ]; do
   line="$(subst "$line" __KORI_OPENCODE_REFRESH_TOKEN__ "$esc_refresh")"
+  line="$(subst "$line" __KORI_OPENCODE_ACCESS_TOKEN__ "$esc_access")"
   line="$(subst "$line" __KORI_OPENCODE_SESSION__ "$esc_session")"
   line="$(subst "$line" __KORI_COMMANDCODE_API_KEY__ "$esc_commandcode")"
   line="$(subst "$line" __KORI_SINARCLOUD_API_KEY__ "$esc_sinarcloud")"
