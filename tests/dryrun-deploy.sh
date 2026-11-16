@@ -236,6 +236,25 @@ cat >"$BIN/restorecon" <<'STUB'
 exit 0
 STUB
 
+# caddy validate: the deploy validates the rendered block before restarting the service.
+# FAKE_CADDY=invalid makes the block unadaptable, the way a site-block `servers` directive was on
+# 2026-11-16 — the real binary answers with the offending line, which is why the deploy masks the
+# token before logging anything it prints.
+cat >"$BIN/caddy" <<'STUB'
+#!/usr/bin/env bash
+printf 'caddy %s\n' "$*" >>"${PODMAN_STATE:?}/calls.log"
+if [ "${FAKE_CADDY:-ok}" = "invalid" ]; then
+  printf '{"level":"error","msg":"adapting config using caddyfile: site.caddy:46: unrecognized directive: servers"}\n' >&2
+  # An adapt error quotes the offending line, and one of those lines carries the bearer. Printing
+  # it here is what makes the masking assertion below prove anything: without it the test passes
+  # whether or not the deploy masks.
+  grep -h 'Bearer' "${KORI_APP_DIR:?}/caddy/site.caddy" >&2 2>/dev/null || true
+  exit 1
+fi
+printf 'Valid configuration\n'
+exit 0
+STUB
+
 # flock is not on macOS; the script only needs -n 9 to succeed.
 cat >"$BIN/flock" <<'STUB'
 #!/usr/bin/env bash
@@ -291,7 +310,7 @@ reset_state() {
   mkdir -p "$APP_DIR/logs"
   printf '{"ts":"2026-11-16T07:00:00Z","route":"leg-a","status":200,"latency_ms":42,"stream":false,"tokens_in":11,"tokens_out":7,"failover_from":"","failover_reason":"","model":"flash"}\n' \
     >"$APP_DIR/logs/requests.jsonl"
-  unset FAKE_MANIFEST FAKE_REPO_DIGESTS
+  unset FAKE_MANIFEST FAKE_REPO_DIGESTS FAKE_CADDY
 }
 
 run() { bash "$DEPLOY" kori "$@" >"$ROOT/out.txt" 2>&1; echo $?; }
@@ -477,6 +496,11 @@ grep -qE '^[[:space:]]*cp -p .*RENDERED' "$DEPLOY" \
   || pass "the caddy backup does not depend on the deploy user's group membership"
 grep -q 'Bearer dryrun-token' "$RENDERED" && pass "bearer line carries the rendered token" \
   || fail "bearer line not rendered: $(grep -n 'no_bearer' "$RENDERED" | head -2)"
+# `servers` is a global option in Caddy, not a site-block directive. Written inside the site block
+# it fails at adapt time and takes every site on the host down with the restart (2026-11-16).
+grep -qE '^[[:space:]]*servers[[:space:]]*\{' "$KIT/ops/caddy/Caddyfile.kori.example" \
+  && fail "the edge template carries a site-block 'servers' directive" \
+  || pass "the edge template has no site-block 'servers' directive"
 # An external process carrying the token in argv is the bug; a shell builtin substitution is not.
 TOKEN_ARGV="$(grep -nE '^[^#]*\b(sed|awk|printf)\b[^#]*\$\{?KORI_EDGE_TOKEN' "$DEPLOY" || true)"
 [ -z "$TOKEN_ARGV" ] && pass "no sed/awk/printf line carries the edge token" \
@@ -554,6 +578,52 @@ leftovers="$(find "$APP_DIR/caddy" -mindepth 1 -maxdepth 1 ! -name site.caddy -p
 git -C "$WORK" checkout --quiet HEAD~1 -- ops/caddy/Caddyfile.kori.example apps/api/src/kori.nim
 git -C "$WORK" -c user.email=arif@kori.local -c user.name=Arif commit --quiet -m "restore edge template"
 git -C "$WORK" push --quiet origin HEAD:main
+
+# ── scenario 3k: a block that does not validate never reaches the restart ────
+# `caddy validate` runs against the rendered block before the service is touched, so a syntax
+# error costs zero downtime: the previous block goes back, caddy is not restarted, and the app is
+# not touched either. Without this the host serves every site through a Caddy that refuses to
+# start (measured 2026-11-16).
+reset_state
+mkdir -p "$APP_DIR/caddy"
+printf '# previous block that was serving\n' >"$APP_DIR/caddy/site.caddy"
+chmod 0640 "$APP_DIR/caddy/site.caddy"
+PREV_SUM="$(cksum <"$APP_DIR/caddy/site.caddy")"
+happy_image
+export FAKE_CURL=ok FAKE_CADDY=invalid
+rc="$(run refs/heads/main)"
+[ "$rc" != "0" ] && pass "unvalidatable block exits non-zero ($rc)" \
+  || fail "unvalidatable block exited 0"
+grep -q 'does not validate' "$APP_DIR/logs/deploy.log" \
+  && pass "the validation failure is named in the deploy log" \
+  || fail "validation failure not logged: $(tail -3 "$APP_DIR/logs/deploy.log")"
+[ "$(cksum <"$APP_DIR/caddy/site.caddy")" = "$PREV_SUM" ] \
+  && pass "previous edge block restored byte-identical on a validation failure" \
+  || fail "previous edge block not restored: $(cat "$APP_DIR/caddy/site.caddy")"
+grep -q 'systemctl restart caddy' "$STATE/calls.log" \
+  && fail "caddy was restarted with a block that does not validate" \
+  || pass "caddy was not restarted with a block that does not validate"
+[ "$(restarts)" = "0" ] && pass "validation failure restarted no kori-api" \
+  || fail "validation failure still restarted kori-api"
+grep -q 'dryrun-token' "$APP_DIR/logs/deploy.log" \
+  && fail "the validation log leaked the edge token" \
+  || pass "the validation output is logged with the token masked"
+# No previous block to restore: the file must still exist. /etc/caddy/Caddyfile imports it
+# unconditionally, and a missing import target makes Caddy refuse to start on the next restart.
+reset_state
+happy_image
+rm -f "$APP_DIR/caddy/site.caddy"
+export FAKE_CURL=ok FAKE_CADDY=invalid
+rc="$(run refs/heads/main)"
+[ "$rc" != "0" ] && pass "validation failure without a previous block exits non-zero ($rc)" \
+  || fail "validation failure without a previous block exited 0"
+[ -f "$APP_DIR/caddy/site.caddy" ] \
+  && pass "a withdrawn block leaves the import target in place" \
+  || fail "validation failure removed site.caddy, the import target is now dangling"
+grep -q 'Bearer' "$APP_DIR/caddy/site.caddy" \
+  && fail "the withdrawn block still carries the bearer" \
+  || pass "the withdrawn block carries no bearer"
+unset FAKE_CADDY
 
 # ── scenario 4: a redeploy rotates :local to :prev ──────────────────────────
 reset_state

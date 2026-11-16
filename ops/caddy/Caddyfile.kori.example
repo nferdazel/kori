@@ -42,14 +42,14 @@ ai.qouver.com {
 		2a06:98c0::/29 2c0f:f248::/32
 	respond @not_cloudflare "direct origin access is not allowed" 403
 
-	# Real client address only from the trusted proxy.
-	servers {
-		trusted_proxies static 173.245.48.0/20 103.21.244.0/22 103.22.200.0/22 103.31.4.0/22 \
-			141.101.64.0/18 108.162.192.0/18 190.93.240.0/20 188.114.96.0/20 197.234.240.0/22 \
-			198.41.128.0/17 162.158.0.0/15 104.16.0.0/13 104.24.0.0/14 172.64.0.0/13 \
-			131.0.72.0/22
-		client_ip_headers CF-Connecting-IP
-	}
+	# `servers { trusted_proxies ... client_ip_headers CF-Connecting-IP }` is a GLOBAL option in
+	# Caddy: it belongs in the options block at the top of /etc/caddy/Caddyfile, not in a site
+	# block. Written here it was `unrecognized directive: servers` at adapt time, and the restart
+	# that carried it took every site on qouver1 down (2026-11-16). The global block is Dimas's
+	# file, so the change is his call, not a deploy side effect.
+	# It is not needed for the gate below: Cloudflare connects to this origin directly, so
+	# `remote_ip` already sees the Cloudflare edge address. Without it, the request log records
+	# that edge address instead of the real client; per-IP limiting lives at Cloudflare anyway.
 
 	encode zstd gzip
 

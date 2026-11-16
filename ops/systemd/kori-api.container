@@ -37,6 +37,12 @@ Wants=network-online.target
 [Container]
 Image=localhost/kori:local
 ContainerName=kori-api
+# The image drops to uid 10001 (apps/api/Dockerfile:60), and a rootless container's 10001 is a
+# subuid on the host, so a 0600 config owned by sachiel is unreadable and the unit dies at start
+# with "cannot read config '/etc/kori/config.json'" (measured 2026-11-16, first deploy). keep-id
+# maps host sachiel to 10001 inside, so the bind mount is readable and the OAuth rewrite stays
+# writable. Same line kran-api and majadu-api carry.
+UserNS=keep-id:uid=10001,gid=10001
 PublishPort=127.0.0.1:8787:8787
 Pull=never
 AutoUpdate=local

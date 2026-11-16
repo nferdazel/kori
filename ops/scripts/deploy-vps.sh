@@ -190,6 +190,12 @@ for key in NoNewPrivileges=true DropCapability=ALL ReadOnly=true; do
   grep -qEi "^[[:space:]]*${k}[[:space:]]*=[[:space:]]*${v}[[:space:]]*$" "$UNIT_SRC" \
     || die "quadlet hardening gate failed: $UNIT_SRC lacks ${key} — deploy aborted, unit on the host untouched"
 done
+# The image drops to uid 10001, which rootless podman maps to a subuid, so without keep-id the
+# 0600 config owned by the deploy user is unreadable and the unit dies at start with
+# "cannot read config '/etc/kori/config.json'" (measured 2026-11-16, first deploy). A unit that
+# loses this line is not deployed.
+grep -qEi "^[[:space:]]*UserNS[[:space:]]*=[[:space:]]*keep-id:uid=10001,gid=10001[[:space:]]*$" "$UNIT_SRC" \
+  || die "quadlet unit lacks UserNS=keep-id:uid=10001,gid=10001 — the container cannot read its 0600 config; deploy aborted, unit on the host untouched"
 # The config mount must be the writable DIRECTORY, not a single file at :ro. persistOauth writes a
 # temp in the same directory and renames it over the config; a file bind cannot take that rename
 # even at :rw, and at :ro every refresh is lost at the next container restart. A unit that goes
@@ -418,6 +424,37 @@ if [ -n "${KORI_EDGE_TOKEN:-}" ]; then
   # SELinux: Caddy runs as httpd_t and must be able to read this file (team note, 2026-11-15).
   restorecon "$RENDERED" 2>/dev/null || true
   log "==> rendered edge block $RENDERED"
+  # Validate before the restart. A block that does not adapt takes every site on this host down
+  # with it: the first run carried `servers` inside a site block (a global-only option), Caddy
+  # exited 1 and the whole edge was dark until the import was commented out by hand (2026-11-16).
+  # `caddy validate` adapts /etc/caddy/Caddyfile, which imports the block just rendered, so it
+  # catches this with zero downtime. It needs root for the same reason the restart does.
+  # The output goes to a 0600 file and is logged with the token masked: an adapt error quotes the
+  # offending line, and one of those lines carries the bearer.
+  VALIDATE_LOG="$(umask 077; mktemp)"
+  # The redirect stays on the deploy user's side on purpose: the file is created 0600 by mktemp,
+  # and `sudo tee` would need root to write into a path the script then has to read back.
+  # shellcheck disable=SC2024
+  if ! sudo caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >"$VALIDATE_LOG" 2>&1; then
+    log "ERROR: the rendered block does not validate; restoring the previous one, caddy untouched"
+    if [ -n "$CADDY_BAK" ]; then
+      mv -f "$CADDY_BAK" "$RENDERED"
+    else
+      # Never remove the file: /etc/caddy/Caddyfile imports it unconditionally, and a missing
+      # import target makes Caddy refuse to start ("File to import not found"), so the next
+      # restart would take every site down. A comment-only block adapts to nothing.
+      printf '# kori edge block withdrawn: the rendered block did not validate\n' >"$RENDERED"
+    fi
+    # Masking happens in the shell, not through sed: the token must never reach another
+    # process's argv, which is the same rule the render itself follows.
+    tail -n 5 "$VALIDATE_LOG" | while IFS= read -r vline; do
+      log "    caddy: ${vline//$KORI_EDGE_TOKEN/<redacted>}"
+    done
+    rm -f "$VALIDATE_LOG"
+    exit 1
+  fi
+  rm -f "$VALIDATE_LOG"
+  log "==> edge block validates (caddy validate)"
   # `admin off` on qouver1 makes `caddy reload` fail every time; restart is the switch.
   # A Caddy that cannot load the new block takes every site on this host down with it, so a failed
   # restart is not a warning: put back the block that was serving, restart once more, and fail the
