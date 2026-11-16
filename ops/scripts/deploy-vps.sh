@@ -90,6 +90,28 @@ restart_service() {
   systemctl --user restart "$SERVICE"
 }
 
+# CI publishes this tag only after the gate job is green, and the webhook reaches this host
+# before that. A tag that is not in the registry yet is therefore waited for, not read as "this
+# commit built none": the single attempt used to keep the previous revision for good whenever
+# the gate was slower than the webhook. Anything other than a missing tag (auth, network, 5xx)
+# still fails at once. 45 x 20s = 15 min covers gate + queue + build on a busy runner.
+IMAGE_WAIT_ATTEMPTS="${KORI_IMAGE_WAIT_ATTEMPTS:-45}"
+
+# 0 = pulled, 1 = still absent after the window, 2 = a real pull error
+pull_when_published() {
+  local ref="$1" out="$2" attempt=1
+  while :; do
+    if podman pull "$ref" >"$out" 2>&1; then return 0; fi
+    if ! grep -qiE 'manifest unknown|no such manifest|manifest for .* not found|name unknown' "$out"; then
+      return 2
+    fi
+    [ "$attempt" -lt "$IMAGE_WAIT_ATTEMPTS" ] || return 1
+    log "==> $ref not in the registry yet (gate or image job still running), attempt $attempt of $IMAGE_WAIT_ATTEMPTS"
+    attempt=$((attempt + 1))
+    sleep 20
+  done
+}
+
 # ── 4. Pull the image this commit built; the host never builds ───────────────
 # sha-<7> is a filename until the image proves which commit it is. Two independent proofs run
 # before any tag moves: the revision label must equal the commit just checked out, and the
@@ -102,7 +124,10 @@ IMAGE_REF="${IMAGE_REPO}:sha-${SHORT}"
 IMAGE_PULLED=0
 PULL_OUT="$(mktemp)"
 
-if podman pull "$IMAGE_REF" >"$PULL_OUT" 2>&1; then
+PULL_RC=0
+pull_when_published "$IMAGE_REF" "$PULL_OUT" || PULL_RC=$?
+
+if [ "$PULL_RC" = "0" ]; then
   IMAGE_REV="$(podman inspect -f '{{ index .Labels "org.opencontainers.image.revision" }}' "$IMAGE_REF" 2>/dev/null || true)"
   if [ "$IMAGE_REV" != "$REV" ]; then
     rm -f "$PULL_OUT"
@@ -121,9 +146,9 @@ if podman pull "$IMAGE_REF" >"$PULL_OUT" 2>&1; then
   podman rmi "$IMAGE_REF" >/dev/null 2>&1 || true   # :local and :prev stay the only local tags
   IMAGE_PULLED=1
   log "==> image pulled, verified and tagged :local (revision $IMAGE_REV)"
-elif grep -qiE 'manifest unknown|manifest for .* not found|no such manifest' "$PULL_OUT"; then
+elif [ "$PULL_RC" = "1" ]; then
   # Legitimate: this commit did not change the image side, so CI pushed nothing for it.
-  log "==> no image for ${SHORT} (this commit built none); keeping the running container"
+  log "==> no image for ${SHORT} after ${IMAGE_WAIT_ATTEMPTS} attempts (this commit built none); keeping the running container"
 else
   # A dead registry, an expired token or a 502 is NOT "not built". Fail closed.
   TAIL_OUT="$(tail -3 "$PULL_OUT" 2>/dev/null || true)"

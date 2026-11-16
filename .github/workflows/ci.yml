@@ -148,14 +148,40 @@ jobs:
           nim c -d:release --mm:orc --threads:on --hints:off -o:"$KORI_BIN" apps/api/src/kori.nim
           sh acceptance/selftest.sh
 
+  # One required status for branch protection, and the only door to publication: the image job
+  # below needs this job, so a commit whose quality gates are red can never become a pullable
+  # tag. Results travel through env, never interpolated into a shell script.
+  gate:
+    name: Gate
+    if: always()
+    needs: [contract, web, nim, security, ops]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      R_CONTRACT: ${{ needs.contract.result }}
+      R_WEB: ${{ needs.web.result }}
+      R_NIM: ${{ needs.nim.result }}
+      R_SECURITY: ${{ needs.security.result }}
+      R_OPS: ${{ needs.ops.result }}
+    steps:
+      - name: Require every job to be green
+        shell: bash
+        run: |
+          fail=0
+          for r in "$R_CONTRACT" "$R_WEB" "$R_NIM" "$R_SECURITY" "$R_OPS"; do
+            [ "$r" = "success" ] || { echo "required job: $r"; fail=1; }
+          done
+          exit "$fail"
+
   # Build always, push only on main: a Dockerfile that no longer compiles is a red PR instead of
   # a red production deploy at night. The host never builds — it pulls this tag and checks the
   # revision label against the commit it checked out.
   #
-  # The job stays unconditional. apps/api/src does not exist yet, so it is red until the gateway
-  # source lands; an `if:` here would hide that instead of reporting it.
+  # No `if:` filter here: a broken image must report red rather than disappear from the run.
+  # The `needs: [gate]` is the publication gate, not a skip.
   image-api:
     name: "Image: api"
+    needs: [gate]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
