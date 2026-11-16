@@ -108,12 +108,16 @@ log "==> rev $REV"
 # repo until the next image-bearing deploy (BACKLOG CM-05, 2026-11-16). The payload is handled
 # below, after the helpers are in place.
 OPS_ONLY=0
-PREV_MAIN="$(git -C "$MONO_DIR" rev-parse "${REV}^" 2>/dev/null || true)"
+PREV_DEPLOYED="$(cat "$STATE_FILE" 2>/dev/null || true)"
+PREV_MAIN="$PREV_DEPLOYED"
+if [ -z "$PREV_MAIN" ] || ! git -C "$MONO_DIR" rev-parse --verify "${PREV_MAIN}^{commit}" >/dev/null 2>&1; then
+  PREV_MAIN="$(git -C "$MONO_DIR" rev-parse "${REV}^" 2>/dev/null || true)"
+fi
 if [ -n "$PREV_MAIN" ] && [ "$PREV_MAIN" != "$REV" ]; then
   CHANGED="$(git -C "$MONO_DIR" diff --name-only "$PREV_MAIN" "$REV" || true)"
   if [ -n "$CHANGED" ] && ! printf '%s\n' "$CHANGED" | grep -qvE '^(docs/|\.github/|ops/|[^/]*\.md$)'; then
     OPS_ONLY=1
-    log "==> only docs/workflow/ops paths changed in $REV; no image to wait for"
+    log "==> only docs/workflow/ops paths changed since ${PREV_MAIN:0:7}; no image to wait for"
   fi
 fi
 
