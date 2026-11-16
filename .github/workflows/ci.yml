@@ -26,6 +26,7 @@ concurrency:
 env:
   NIM_VERSION: "2.4.2"
   NODE_VERSION: "22"
+  SHELLCHECK_VERSION: "v0.10.0"
 
 jobs:
   web:
@@ -142,3 +143,47 @@ jobs:
         uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  ops:
+    name: "Ops: shellcheck + deploy/smoke dry runs"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      # Nothing else in this pipeline reads ops/scripts. Without this job an edit to the ref guard
+      # or the rollback branch lands on main with only `bash -n` behind it, and the next deploy is
+      # the first time the change runs.
+      - name: Cache shellcheck
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/kori-shellcheck
+          key: shellcheck-${{ env.SHELLCHECK_VERSION }}
+
+      - name: Install shellcheck
+        env:
+          SHELLCHECK_VERSION: ${{ env.SHELLCHECK_VERSION }}
+        run: |
+          set -eu
+          DEST="$HOME/.cache/kori-shellcheck"
+          mkdir -p "$DEST"
+          if [ -x "$DEST/shellcheck" ]; then
+            echo "shellcheck restored from cache"
+          else
+            curl -fsSL "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz" -o /tmp/shellcheck.tar.xz
+            tar -xJf /tmp/shellcheck.tar.xz -C /tmp
+            install -m 0755 "/tmp/shellcheck-${SHELLCHECK_VERSION}/shellcheck" "$DEST/shellcheck"
+          fi
+          echo "$DEST" >> "$GITHUB_PATH"
+          "$DEST/shellcheck" --version
+
+      # -S warning on purpose: SC2015 (info) fires on the `[ test ] && pass || fail` idiom the
+      # harnesses use throughout, and `pass` cannot fail, so the pattern is not a bug there.
+      - name: Shellcheck
+        run: shellcheck -S warning -x ops/scripts/*.sh tools/gen-static.sh tests/dryrun-*.sh
+
+      - name: "Deploy dry run (ref guard, lock, retag, rollback)"
+        run: bash tests/dryrun-deploy.sh
+
+      - name: "Smoke dry run (edge matrix, bearer gate)"
+        run: bash tests/dryrun-smoke.sh
