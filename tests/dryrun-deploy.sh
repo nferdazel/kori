@@ -452,6 +452,11 @@ grep -qF 'config\.json:/etc/kori/config\.json' "$DEPLOY" \
 # `ps`, and the redirect created the temp at the shell umask (0644). Both are assertions now.
 reset_state
 rm -rf "${APP_DIR:?}/caddy"
+# An older deploy could have left the log at 0644; the script has to narrow it on every run, not
+# only set the mode when it creates the file.
+mkdir -p "$APP_DIR/logs"
+printf 'old run\n' >"$APP_DIR/logs/deploy.log"
+chmod 0644 "$APP_DIR/logs/deploy.log"
 happy_image
 export FAKE_CURL=ok
 rc="$(run refs/heads/main)"
@@ -464,6 +469,9 @@ leftovers="$(find "$APP_DIR/caddy" -mindepth 1 -maxdepth 1 ! -name site.caddy -p
 [ -n "$(find "$APP_DIR/logs/deploy.log" -maxdepth 0 -perm 0600 2>/dev/null)" ] \
   && pass "deploy log is 0600, so a journal line carrying a credential is not world-readable" \
   || fail "deploy log mode is not 0600"
+grep -q 'old run' "$APP_DIR/logs/deploy.log" \
+  && pass "a log left at 0644 by an older deploy is narrowed in place, not replaced" \
+  || fail "deploy log was replaced instead of narrowed: $(head -2 "$APP_DIR/logs/deploy.log")"
 grep -qE '^[[:space:]]*cp -p .*RENDERED' "$DEPLOY" \
   && fail "the caddy backup still uses cp -p, which needs caddy group membership" \
   || pass "the caddy backup does not depend on the deploy user's group membership"
@@ -516,6 +524,36 @@ grep -q 'public edge is down, human needed' "$APP_DIR/logs/deploy.log" \
 [ -f "$APP_DIR/caddy/site.caddy" ] && fail "dead caddy left the unloadable block in place" \
   || pass "dead caddy removed the unloadable block"
 unset FAKE_SYSTEMCTL_CADDY
+
+# ── scenario 3j: a run that dies after the backup leaves no token copy behind ─
+# The backup is a copy of the rendered block, so it carries the edge token; only the exit trap
+# removes it when the run dies between the backup and the restart.
+reset_state
+mkdir -p "$APP_DIR/caddy"
+printf '# previous block that was serving\n' >"$APP_DIR/caddy/site.caddy"
+chmod 0640 "$APP_DIR/caddy/site.caddy"
+# The commit needs a non-ops path too, or the script stops at the ops-only branch before the edge
+# render is ever reached.
+git -C "$WORK" rm --quiet ops/caddy/Caddyfile.kori.example
+printf 'placeholder 2\n' >"$WORK/apps/api/src/kori.nim"
+git -C "$WORK" add -A
+git -C "$WORK" -c user.email=arif@kori.local -c user.name=Arif commit --quiet -m "drop edge template"
+git -C "$WORK" push --quiet origin HEAD:main
+happy_image
+export FAKE_CURL=ok
+rc="$(run refs/heads/main)"
+[ "$rc" != "0" ] && pass "missing edge template exits non-zero ($rc)" \
+  || fail "missing edge template exited 0"
+grep -q 'edge template missing' "$APP_DIR/logs/deploy.log" \
+  && pass "missing edge template is named in the deploy log" \
+  || fail "missing edge template not logged: $(tail -3 "$APP_DIR/logs/deploy.log")"
+leftovers="$(find "$APP_DIR/caddy" -mindepth 1 -maxdepth 1 ! -name site.caddy -print 2>/dev/null)"
+[ -z "$leftovers" ] && pass "no token-bearing backup left behind after a die" \
+  || fail "backup left behind after a die: $leftovers"
+# Put the kit back, so the scenarios after this one deploy the same tree.
+git -C "$WORK" checkout --quiet HEAD~1 -- ops/caddy/Caddyfile.kori.example apps/api/src/kori.nim
+git -C "$WORK" -c user.email=arif@kori.local -c user.name=Arif commit --quiet -m "restore edge template"
+git -C "$WORK" push --quiet origin HEAD:main
 
 # ── scenario 4: a redeploy rotates :local to :prev ──────────────────────────
 reset_state

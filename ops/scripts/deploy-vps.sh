@@ -38,6 +38,15 @@ LOG="$APP_DIR/logs/deploy.log"
 HEALTH_URL="${KORI_HEALTH_URL:-http://127.0.0.1:8787/admin/state}"
 HEALTH_GATE_SECONDS="${KORI_HEALTH_GATE_SECONDS:-60}"
 
+# The edge block backup is a copy of the rendered block, so it carries the edge token. A run that
+# dies between the backup and the restart would leave it behind in caddy/; the exit trap removes
+# it. The restore path moves the backup back, so by then there is nothing left to delete.
+CADDY_BAK=""
+cleanup_edge_backup() {
+  if [ -n "${CADDY_BAK:-}" ] && [ -f "$CADDY_BAK" ]; then rm -f "$CADDY_BAK"; fi
+}
+trap cleanup_edge_backup EXIT
+
 # ── 1. Ref guard, fail-closed, and the first thing that runs ─────────────────
 # Only refs/heads/main deploys. An empty or unexpected $REF exits 0 (ignore), never falls
 # through: `[ -n "$REF" ] && deploy` is the fail-open shape this line exists to forbid.
@@ -55,8 +64,11 @@ command -v flock >/dev/null 2>&1 || {
 
 mkdir -p "$APP_DIR/logs"
 # The deploy log carries journal lines from the units it restarts, and a service that logs a
-# credential would put it here. 0600 at creation; the directory stays 0755 for the smoke script.
+# credential would put it here. 0600 at creation and again on every run, because a log left at
+# 0644 by an older deploy would keep that mode forever; the directory stays 0755 for the smoke
+# script.
 (umask 077; : >>"$LOG")
+chmod 0600 "$LOG"
 # The config mount is a directory, so the OAuth refresh can write its temp file next to the
 # config and rename it into place. 0700 here, the file inside stays 0600.
 install -d -m 0700 "$APP_DIR/etc"
