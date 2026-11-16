@@ -43,7 +43,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: "Contract: check this repo"
         run: ./ops/scripts/contract-check.sh .
@@ -53,10 +53,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Cache Nim toolchain
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.nimble
@@ -199,7 +199,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -215,13 +215,13 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Nothing else in this pipeline reads ops/scripts. Without this job an edit to the ref guard
       # or the rollback branch lands on main with only `bash -n` behind it, and the next deploy is
       # the first time the change runs.
       - name: Cache shellcheck
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/kori-shellcheck
           key: shellcheck-${{ env.SHELLCHECK_VERSION }}
