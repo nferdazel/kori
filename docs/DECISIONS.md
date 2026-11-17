@@ -98,19 +98,29 @@ fallback already handles.
 
 ---
 
-## DEC-6 — The request log is append-only, one line, ten keys
+## DEC-6 — The request log is append-only, one line, eleven keys
 
-**Status:** accepted.
+**Status:** accepted, amended 2026-11-17 (was: ten keys).
 
 **Context.** The claim this gateway has to make checkable is "how many failovers, when, on
 which route". That claim is only as strong as the log behind it.
 
 **Decision.** One line per request, appended with a single write, never rewritten and never
 rotated in v1. The keys are fixed and ordered: `ts`, `route`, `status`, `latency_ms`,
-`tokens_in`, `tokens_out`, `failover_from`, `failover_reason`, `stream`, and `alias` last.
-`alias` is there only when the caller named a `kori/<alias>`: a request that named a provider
-id has no such key at all, not an empty one, so the page shows the absence instead of
-inventing a value.
+`tokens_in`, `tokens_out`, `failover_from`, `failover_reason`, `stream`, and then the two
+conditional ones last: `alias` and `effort_clamped`. `alias` is there only when the caller
+named a `kori/<alias>`: a request that named a provider id has no such key at all, not an
+empty one, so the page shows the absence instead of inventing a value.
+
+**Amendment, 2026-11-17.** `effort_clamped` was added when the per-leg effort ceiling
+landed. Its value is `<asked>><sent>`, for example `max>high`, and it is written only when a
+leg's ceiling actually pulled the requested effort down. The reason it is a key and not a
+`failover_reason` value: a clamp is not a failure and starts no cooldown, so putting it in
+the reason field would have made a served request read like a rerouted one. The reason it is
+conditional rather than always present: a request that never clamped is exactly the request
+this log already described with nine keys, and adding a null to every line would have made
+every earlier row a special case. A clamp is recorded against the leg that answered, so a
+clamp on a leg that then failed is replaced by whatever the next leg decided.
 
 **Consequences.** A month-over-month comparison is repeatable, and a later reader can
 re-check the failover count without asking anyone. Redaction is structural: the writer takes

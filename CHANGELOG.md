@@ -10,6 +10,31 @@ templates under `ops/` describe the intended host shape and have not been run ag
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-17
+
+### Added
+
+- Per-leg thinking-effort ceiling: `legs[].efforts` lists the `reasoning_effort` values a
+  leg accepts, ranked `minimal < none < low < medium < high < xhigh < max`. A caller asking
+  above the ceiling is clamped DOWN to the highest value the leg still accepts, never up;
+  a leg whose list has nothing at or below the request is skipped without a cooldown, the
+  same way an unmapped alias is, and when every leg skips the caller gets one `400` whose
+  body type is `effort_unsupported` and which names the value. A leg with no `efforts` key
+  has no ceiling, and a caller who named no effort is untouched.
+- A conditional eleventh key in the request log, `effort_clamped`, holding `<asked>><sent>`
+  for example `max>high`, written only when the answering leg pulled the value down. A
+  request that never clamped keeps the nine keys it had. DEC-6 is amended accordingly.
+- `glm-5.3-flash` as an alias on two legs: `opencode-go` maps it to `glm-5.3-flash` and
+  `commandcode` to `z-ai/glm-5.3-flash`, so one caller name reaches each provider's own id.
+  sinarcloud carries no glm alias on purpose, because it does not serve that model.
+
+### Changed
+
+- `ops/etc/config.json.example` now carries the effort ceilings for its three legs
+  (`opencode-go` and `commandcode` `low, high, max`; `sinarcloud` `low, high`) and the two
+  glm aliases. sinarcloud's ceiling is unmeasured and `medium` is left out of every leg
+  until a probe says otherwise.
+
 ## [0.5.2] - 2026-11-17
 
 ### Fixed

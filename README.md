@@ -117,6 +117,7 @@ the repository, in an image or in a log.
 | `legs[].weight` | no | must be `1`; any other value is refused at startup |
 | `legs[].enabled` | no | `true` or `false`, default `true`; a leg set to `false` keeps its place in the failover order but is never dialled, and `/admin/state` reads it as `skipped` |
 | `legs[].aliases` | no | an object of caller alias to this leg's provider id, for example `{"fast": "prov-a-fast"}`; the key is the alias alone, without `kori/`, and one name may map to a different id on each leg |
+| `legs[].efforts` | no | the `reasoning_effort` values this leg accepts, for example `["low", "high", "max"]`; a value outside the rank table is refused at startup. See "Thinking effort" below |
 | `legs[].oauth` | no | makes the leg refresh its own access token; see below |
 | `legs[].oauth.token_url` | yes, with `oauth` | the endpoint kori POSTs to; must be `http` or `https` |
 | `legs[].oauth.client_id` | yes, with `oauth` | sent with the refresh grant |
@@ -181,6 +182,45 @@ carries `alias_unmapped` for it. A name no leg maps is a `400` whose body type i
 a `400` whose body type is `alias_too_long` and whose text is fixed, so the oversized name
 is never echoed back.
 
+## Thinking effort
+
+A client picks a thinking effort by sending a top-level `reasoning_effort` string in the
+chat-completions body; it is not a header and not a nested object. kori forwards that value
+byte-for-byte unless the leg it is about to dial declares a ceiling, which is what
+`legs[].efforts` is.
+
+The values are ranked, smallest to largest: `minimal`, `none`, `low`, `medium`, `high`,
+`xhigh`, `max`. A leg's `efforts` array lists what that leg accepts, and nothing else
+changes:
+
+| Caller asks | Leg accepts | Sent to the leg | Log carries |
+|---|---|---|---|
+| `high` | `["low", "high", "max"]` | `high` | no clamp key |
+| `max` | `["low", "high"]` | `high` | `"effort_clamped":"max>high"` |
+| `medium` | `["low", "high", "max"]` | `low` | `"effort_clamped":"medium>low"` |
+| `low` | `["high", "max"]` | nothing, the leg is skipped | `effort_unsupported` |
+| anything | no `efforts` key | the caller's value, untouched | no clamp key |
+| nothing | any | the field stays absent | no clamp key |
+
+A clamp only ever goes down. Asking for `low` against a leg that starts at `high` is skipped
+rather than upgraded, because spending more than the caller asked for is a cost decision
+nobody made. A skipped leg is not put on cooldown and does not count as a failure: the walk
+moves to the next leg exactly as it does for an unmapped alias. When every leg in the walk
+skips for this reason, the caller gets one `400` whose body type is `effort_unsupported` and
+which names the value.
+
+A value kori does not rank is forwarded untouched rather than guessed at, and the leg's own
+validation decides what happens to it.
+
+The committed `ops/etc/config.json.example` carries the three legs this deployment has:
+`opencode-go` and `commandcode` accept `low`, `high` and `max`; `sinarcloud` accepts `low`
+and `high` only. sinarcloud's real ceiling is not measured yet (the owner says high), and
+`medium` is left out of every leg on purpose until a probe says a leg accepts it, so a
+caller asking `medium` is clamped down and the log says so. `glm-5.3-flash` is an alias on
+two legs only: `opencode-go` maps it to `glm-5.3-flash` and `commandcode` to
+`z-ai/glm-5.3-flash`. sinarcloud has no glm alias, because it does not serve that model;
+without the alias the leg is skipped instead of being dialled into a `400`.
+
 Deadlines enforced by the binary, independent of any proxy in front of it:
 
 | Phase | Limit |
@@ -224,7 +264,7 @@ serves the refreshed credential from memory.
 ## Request log
 
 One line per request, appended with a single write, never rewritten and never rotated.
-Ten keys, in this order:
+Nine keys, in this order, plus two conditional ones at the end:
 
 ```json
 {"ts":"2026-11-16T13:20:04+07:00","route":"commandcode","status":200,"latency_ms":812,"tokens_in":128,"tokens_out":64,"failover_from":"opencode-go","failover_reason":"auth_401","stream":false,"alias":"kori/fast"}
@@ -241,6 +281,7 @@ Ten keys, in this order:
 | `failover_reason` | the first failure reason, empty when none did |
 | `stream` | whether the caller asked for a stream |
 | `alias` | the caller's `kori/<alias>` exactly as sent; present only on a request that named one, and clipped at a rune boundary to at most 261 bytes (`MaxAliasBytes` plus the `kori/` prefix) |
+| `effort_clamped` | `<asked>><sent>` when the answering leg's ceiling pulled the effort down, for example `max>high`; absent when no clamp happened, so a request that never clamped still carries the nine keys above |
 
 No header, body or credential is ever written to the log.
 

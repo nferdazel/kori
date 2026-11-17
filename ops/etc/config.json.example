@@ -8,6 +8,8 @@
       "base_url": "https://opencode.ai/inference/go/openai/v1",
       "model": "deepseek-v4.1-flash",
       "role": "primary",
+      "efforts": ["low", "high", "max"],
+      "aliases": { "glm-5.3-flash": "glm-5.3-flash" },
       "headers": { "x-opencode-session": "__KORI_OPENCODE_SESSION__" },
       "oauth": {
         "token_url": "https://opencode.ai/console/auth/oauth/token",
@@ -20,13 +22,16 @@
       "name": "commandcode",
       "base_url": "https://api.commandcode.ai/provider/v1",
       "role": "fallback",
-      "api_key": "__KORI_COMMANDCODE_API_KEY__"
+      "api_key": "__KORI_COMMANDCODE_API_KEY__",
+      "efforts": ["low", "high", "max"],
+      "aliases": { "glm-5.3-flash": "z-ai/glm-5.3-flash" }
     },
     {
       "name": "sinarcloud",
       "base_url": "https://ai.sinarcloud.com/v1",
       "role": "fallback",
-      "api_key": "__KORI_SINARCLOUD_API_KEY__"
+      "api_key": "__KORI_SINARCLOUD_API_KEY__",
+      "efforts": ["low", "high"]
     }
   ]
 }
