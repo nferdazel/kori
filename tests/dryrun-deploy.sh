@@ -175,6 +175,14 @@ cat >"$BIN/systemctl" <<'STUB'
 #!/usr/bin/env bash
 S="${PODMAN_STATE:?}"
 printf 'systemctl %s\n' "$*" >>"$S/calls.log"
+# FAKE_SYSTEMCTL_RENDER: what systemd answers for the unit's LoadState after the daemon-reload.
+# The deploy asks before it restarts, because a unit systemd will not load takes the service
+# down while the old container keeps serving. A stub that answers nothing reads as a failed
+# render, which is why every scenario here used to look like one.
+if [ "${1:-}" = "--user" ] && [ "${2:-}" = "show" ]; then
+  printf '%s\n' "${FAKE_SYSTEMCTL_RENDER:-loaded}"
+  exit 0
+fi
 # FAKE_SYSTEMCTL_CADDY: only caddy refuses to restart, so the edge path is what is under test
 # while every kori-api restart stays green.
 #   once : the first caddy restart fails, the retry after the restore succeeds
@@ -310,7 +318,7 @@ reset_state() {
   mkdir -p "$APP_DIR/logs"
   printf '{"ts":"2026-11-16T07:00:00Z","route":"leg-a","status":200,"latency_ms":42,"stream":false,"tokens_in":11,"tokens_out":7,"failover_from":"","failover_reason":"","model":"flash"}\n' \
     >"$APP_DIR/logs/requests.jsonl"
-  unset FAKE_MANIFEST FAKE_REPO_DIGESTS FAKE_CADDY
+  unset FAKE_MANIFEST FAKE_REPO_DIGESTS FAKE_CADDY FAKE_SYSTEMCTL_RENDER
 }
 
 run() { bash "$DEPLOY" kori "$@" >"$ROOT/out.txt" 2>&1; echo $?; }
@@ -760,7 +768,7 @@ rc="$(run refs/heads/main)"
 [ "$rc" != "0" ] && pass "unhealthy deploy exits non-zero ($rc)" || fail "unhealthy deploy exited 0"
 grep -q 'health gate failed' "$APP_DIR/logs/deploy.log" && pass "health gate logged as failed" \
   || fail "health gate failure not logged"
-grep -q 'rollback to :prev healthy; deploy of' "$APP_DIR/logs/deploy.log" && pass "rollback to :prev succeeded" \
+grep -q 'rollback to :prev healthy (image only); deploy of' "$APP_DIR/logs/deploy.log" && pass "rollback to :prev succeeded" \
   || fail "no successful rollback line: $(tail -3 "$APP_DIR/logs/deploy.log")"
 [ "$(restarts)" = "2" ] && pass "restarted twice: new image, then :prev" \
   || fail "expected 2 restarts, saw $(restarts)"
@@ -783,7 +791,7 @@ grep -q 'health gate passed but smoke failed' "$APP_DIR/logs/deploy.log" \
 grep -q 'body is not JSON' "$APP_DIR/logs/deploy.log" \
   && pass "smoke's reason is in the deploy log" \
   || fail "deploy log does not carry smoke's reason: $(tail -4 "$APP_DIR/logs/deploy.log")"
-grep -q 'rollback to :prev healthy; deploy of' "$APP_DIR/logs/deploy.log" \
+grep -q 'rollback to :prev healthy (image only); deploy of' "$APP_DIR/logs/deploy.log" \
   && pass "smoke failure rolled back to :prev" \
   || fail "no rollback after smoke failure: $(tail -3 "$APP_DIR/logs/deploy.log")"
 [ -f "$APP_DIR/.deployed_rev" ] && fail ".deployed_rev written for a smoke-rejected deploy" \
@@ -797,7 +805,7 @@ happy_image
 export FAKE_CURL=fail
 rc="$(run refs/heads/main)"
 [ "$rc" != "0" ] && pass "double failure exits non-zero ($rc)" || fail "double failure exited 0"
-grep -q 'rollback also unhealthy' "$APP_DIR/logs/deploy.log" && pass "double failure says a human is needed" \
+grep -q 'the :prev image is not healthy either' "$APP_DIR/logs/deploy.log" && pass "double failure says a human is needed" \
   || fail "double failure not reported: $(tail -2 "$APP_DIR/logs/deploy.log")"
 [ -f "$APP_DIR/.deployed_rev" ] && fail ".deployed_rev written after double failure" \
   || pass "no .deployed_rev after double failure"
@@ -831,6 +839,26 @@ grep -q 'env file missing' "$APP_DIR/logs/deploy.log" && pass "missing env file 
 grep -q 'podman pull' "$STATE/calls.log" && fail "pulled without an env file" \
   || pass "no pull without an env file"
 mv "$ROOT/env.bak" "$APP_DIR/env/kori-prod.env"
+
+# ── scenario 15: a unit systemd will not load is never restarted into ───────
+reset_state
+printf 'local\n' >"$STATE/tags"
+# The render gate only runs when the unit changed this deploy; without a live unit the staged one
+# is installed, which is the path a first deploy takes.
+rm -f "$UNIT_DIR/kori-api.container"
+export FAKE_CURL=ok
+happy_image
+export FAKE_SYSTEMCTL_RENDER=not-found
+rc="$(run refs/heads/main)"
+[ "$rc" != "0" ] && pass "unrenderable unit exits non-zero ($rc)" || fail "unrenderable unit exited 0"
+grep -q 'does not render' "$APP_DIR/logs/deploy.log" \
+  && pass "the failed render is named in the deploy log" \
+  || fail "render failure not named: $(tail -3 "$APP_DIR/logs/deploy.log")"
+[ "$(restarts)" = "0" ] && pass "never restarted into a unit that does not render" \
+  || fail "restarted into a unit that does not render"
+[ -f "$APP_DIR/.deployed_rev" ] && fail ".deployed_rev written for an unrenderable unit" \
+  || pass "unrenderable unit did not move .deployed_rev"
+unset FAKE_SYSTEMCTL_RENDER
 
 # ── scenario 14: the host never builds ─────────────────────────────────────
 builds="$(grep -c 'podman build' "$DEPLOY" || true)"
