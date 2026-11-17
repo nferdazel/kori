@@ -10,6 +10,55 @@ templates under `ops/` describe the intended host shape and have not been run ag
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-17
+
+### Added
+
+- Per-leg `enabled`: a leg set to `false` keeps its place in the failover order but is never
+  dialled, and `/admin/state` reads it as `skipped`.
+- Per-leg `aliases`: a caller model of `kori/<alias>` resolves through each leg's own table,
+  so one caller-facing name can reach a different provider id on each leg. A leg with no
+  entry for the name is skipped for that request without a cooldown and records
+  `alias_unmapped` in the log; a name no leg maps is a `400` with an `unknown_alias` body; the
+  response `model` still names the provider id the serving leg actually sent.
+- The request log carries a tenth key, `alias`, holding the caller's `kori/<alias>` exactly
+  as sent and only on a request that named one. A request that named a provider id has no
+  `alias` key at all, not an empty one. `/admin/log` takes an `alias` filter that matches only
+  rows carrying the key.
+- An alias is bounded at 256 bytes before any leg is touched: a longer name is a `400`
+  `alias_too_long` whose body is fixed text that never repeats the name, and the log keeps the
+  first 261 bytes of it (`MaxAliasBytes` plus the `kori/` prefix) so the line still says which
+  request it was.
+
+### Changed
+
+- The deploy templates widen the stop budget so the drain fits inside it: the binary drains
+  for 5 s, podman gets `StopTimeout=15` and systemd `TimeoutStopSec=25`. `StopTimeout` is
+  written by the deploy because quadlet only honours it from podman 4.4; an older podman is
+  detected and the key left out with a warning instead of being silently ignored. The unit is
+  staged once, so the compare, the install and the gate read the same bytes, and an unchanged
+  unit is no longer rewritten.
+- `README.md` and `docs/DECISIONS.md` describe the ten-key log, the two leg fields and the
+  request-side alias rules, so the feature can be switched on from the documents alone.
+
+### Fixed
+
+- A container stop no longer ends in exit 137. kori is PID 1 in its container, so the kernel
+  discarded the `SIGTERM` podman sent, podman `SIGKILL`ed at its timeout, the unit failed and
+  `OnFailure=alert@` fired a false critical on every deploy. The binary now installs
+  `SIGTERM`/`SIGINT` handlers, closes the listener, waits up to 5 s for in-flight requests to
+  reach zero and exits 0.
+- The drain no longer reports an exit it did not have: it re-reads the in-flight count after
+  the wait loop, and a cut-short drain prints `drained X of Y ... N still in flight` and exits
+  75 instead of the line a clean drain prints. `75` is deliberately absent from
+  `RestartPreventExitStatus`, so the service still comes back on its own.
+- A request whose alias was unknown *and* whose legs were all cooling wrote a `400` body and
+  then a `502` body on the same connection, with the status staying `400`. The cooling branch
+  now sits behind the same flag the rest of the handler uses, so one connection gets one body.
+- The alias log budget counts the `kori/` prefix (261 bytes), so a legal 252-256 byte alias
+  survives whole and still matches its own `?alias=` filter, and the cut backs off to a rune
+  boundary instead of leaving half a rune in the line.
+
 ## [0.4.0] - 2026-11-17
 
 ### Added
@@ -39,8 +88,7 @@ templates under `ops/` describe the intended host shape and have not been run ag
   and non-streaming, idle between chunks, and a whole-request limit.
 - Append-only request log, one JSON line per request with nine keys: `ts`, `route`,
   `status`, `latency_ms`, `tokens_in`, `tokens_out`, `failover_from`, `failover_reason`,
-  `stream`, plus a tenth key `alias` carrying the caller's `kori/<alias>` exactly as sent,
-  present only on requests that named one. No header, body or credential is ever written.
+  `stream`. No header, body or credential is ever written.
 - `stream_options.include_usage` is set on streaming requests that omit it, so token counts
   come from the provider instead of being estimated.
 - Read-only admin GETs: `/admin/state`, `/admin/log` with paging and filters, and

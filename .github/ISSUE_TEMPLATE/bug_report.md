@@ -31,7 +31,7 @@ Include the request or the config that triggers it, with credentials replaced by
 ## Log and response
 
 <!--
-The matching line from the request log, if you have it. Nine keys, no secrets in them.
+The matching line from the request log, if you have it. Ten keys, no secrets in them.
 The response status and body, if the caller got one.
 -->
 

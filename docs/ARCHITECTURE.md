@@ -39,7 +39,7 @@ caller ──POST /v1/chat/completions──► kori
 |---|---|
 | CLI flags | flag parsing, precedence over config, exit `2` on bad input |
 | config | JSON loading, leg defaults, the one refusal (`weight` other than 1) |
-| log writer | the nine-key line, the single append, the descriptor held for the process |
+| log writer | the ten-key line, the single append, the descriptor held for the process |
 | time | RFC 3339 stamps used by the log and the admin GETs |
 | router | leg availability, pick order, cooldown, served/attempted counters, the latency ring |
 | upstream IO | raw socket dial, TLS wrap, the deadline-bounded send and receive |

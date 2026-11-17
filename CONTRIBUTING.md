@@ -64,8 +64,8 @@ CI runs the same scan in the `Security` job over the full history.
 
 - Match the style around you. Smallest change that solves the problem.
 - No new dependency unless it removes more complexity than it adds.
-- The request log line has nine keys in a fixed order. Adding a key is a spec change, not a
-  local edit.
+- The request log line has ten keys in a fixed order; the last one, `alias`, is present only
+  when the caller asked for a `kori/<alias>`. Adding a key is a spec change, not a local edit.
 - The dashboard is committed as `apps/web/dist`, and the embedded module
   `apps/api/src/generated/static_files.nim` is committed too. If you change one, regenerate
   the other with `tools/gen-static.sh`. CI fails on drift.

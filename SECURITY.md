@@ -28,7 +28,7 @@ In scope:
   returned when every leg is dead.
 - The admin surface: `GET /admin/state`, `GET /admin/log`, `GET /admin/config`, including
   credential redaction in the config response and the bounded log tail scan.
-- The request log: the nine keys, the single-write append, and the guarantee that no
+- The request log: the ten keys, the single-write append, and the guarantee that no
   header, body or credential reaches the file.
 - The edge as this repo configures it: the bearer token gate and the per-IP rate limit in
   `ops/caddy/Caddyfile.kori.example`.
