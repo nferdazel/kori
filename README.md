@@ -115,6 +115,8 @@ the repository, in an image or in a log.
 | `legs[].headers` | no | extra request headers, for example `x-opencode-session` |
 | `legs[].role` | no | `primary` or `fallback`, default `primary` |
 | `legs[].weight` | no | must be `1`; any other value is refused at startup |
+| `legs[].enabled` | no | `true` or `false`, default `true`; a leg set to `false` keeps its place in the failover order but is never dialled, and `/admin/state` reads it as `skipped` |
+| `legs[].aliases` | no | an object of caller alias to this leg's provider id, for example `{"fast": "prov-a-fast"}`; the key is the alias alone, without `kori/`, and one name may map to a different id on each leg |
 | `legs[].oauth` | no | makes the leg refresh its own access token; see below |
 | `legs[].oauth.token_url` | yes, with `oauth` | the endpoint kori POSTs to; must be `http` or `https` |
 | `legs[].oauth.client_id` | yes, with `oauth` | sent with the refresh grant |
@@ -170,6 +172,15 @@ A response that dies after its first byte is aborted and logged as `mid_stream_a
 is not rerouted. When every leg is dead the caller gets one `502` carrying the last
 failure reason.
 
+A caller asks for a gateway alias by sending `model` as `kori/<alias>`. The name resolves
+per leg through that leg's own `aliases` table, so one alias can reach a different provider
+id on each leg, and the response reports the id the serving leg actually sent. A leg with
+no entry for the name is skipped for that request and is not put on cooldown; the log
+carries `alias_unmapped` for it. A name no leg maps is a `400` whose body type is
+`unknown_alias`. An alias longer than 256 bytes is refused before any leg is touched, with
+a `400` whose body type is `alias_too_long` and whose text is fixed, so the oversized name
+is never echoed back.
+
 Deadlines enforced by the binary, independent of any proxy in front of it:
 
 | Phase | Limit |
@@ -213,10 +224,10 @@ serves the refreshed credential from memory.
 ## Request log
 
 One line per request, appended with a single write, never rewritten and never rotated.
-Nine keys, in this order:
+Ten keys, in this order:
 
 ```json
-{"ts":"2026-11-16T13:20:04+07:00","route":"commandcode","status":200,"latency_ms":812,"tokens_in":128,"tokens_out":64,"failover_from":"opencode-go","failover_reason":"auth_401","stream":false}
+{"ts":"2026-11-16T13:20:04+07:00","route":"commandcode","status":200,"latency_ms":812,"tokens_in":128,"tokens_out":64,"failover_from":"opencode-go","failover_reason":"auth_401","stream":false,"alias":"kori/fast"}
 ```
 
 | Key | Meaning |
@@ -229,6 +240,7 @@ Nine keys, in this order:
 | `failover_from` | the first leg that failed, empty when none did |
 | `failover_reason` | the first failure reason, empty when none did |
 | `stream` | whether the caller asked for a stream |
+| `alias` | the caller's `kori/<alias>` exactly as sent; present only on a request that named one, and clipped at a rune boundary to at most 261 bytes (`MaxAliasBytes` plus the `kori/` prefix) |
 
 No header, body or credential is ever written to the log.
 
