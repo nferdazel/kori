@@ -10,6 +10,17 @@ templates under `ops/` describe the intended host shape and have not been run ag
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-11-17
+
+### Fixed
+
+- An image built from this tree reported `dev` on `/healthz` and in the startup line. The
+  revision was read from git inside the build context, and `.git` is not part of that context,
+  so the answer depended on whether a checkout happened to sit next to the Dockerfile.
+  `KORI_REVISION` is now a required build-arg that fails the build when it is missing, a new
+  `.dockerignore` keeps `.git` out of the context, and `config.nims` prefers the environment
+  over git, so a local build still reports the commit it was built from.
+
 ## [0.5.0] - 2026-11-17
 
 ### Added
