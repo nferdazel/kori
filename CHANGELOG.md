@@ -10,6 +10,8 @@ templates under `ops/` describe the intended host shape and have not been run ag
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-17
+
 ### Added
 
 - OAuth credential refresh per leg: an expired token is refreshed before the dial, a `401`
