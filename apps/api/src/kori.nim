@@ -94,6 +94,12 @@ const
   AliasPrefix* = "kori/"
   TokenAliasUnmapped* = "alias_unmapped"
   TokenUnknownAlias* = "unknown_alias"
+  TokenAliasTooLong* = "alias_too_long"
+
+  ## Item 3. The alias is echoed into the request log, so it is bounded far below
+  ## MaxRequestBytes: 256 bytes is longer than any real alias and short enough
+  ## that one request cannot widen a log line.
+  MaxAliasBytes* = 256
 
 type
   CliError* = object of CatchableError
@@ -1075,6 +1081,23 @@ proc unknownAliasBody*(alias: string): string =
   "{\"error\":{\"type\":\"unknown_alias\",\"message\":" &
     jsonEscape("no leg maps the model alias '" & alias & "'") & "}}"
 
+proc aliasTooLong*(alias: string): bool =
+  ## Item 3: checked before any leg is touched, so an over-long name never reaches
+  ## the walk, the log line at full length, or the response body.
+  alias.len > MaxAliasBytes
+
+proc aliasLogValue*(alias: string): string =
+  ## The caller's own string, prefix included, cut to MaxAliasBytes. A name that
+  ## was refused for length still says which request it was without carrying the
+  ## rest of a 33 MB body into the log.
+  let value = AliasPrefix & alias
+  if value.len > MaxAliasBytes: value[0 ..< MaxAliasBytes] else: value
+
+proc aliasTooLongBody*(): string =
+  ## Fixed text: the offending name is never echoed back.
+  "{\"error\":{\"type\":\"" & TokenAliasTooLong &
+    "\",\"message\":\"model alias is longer than " & $MaxAliasBytes & " bytes\"}}"
+
 proc wantsStream*(body: string): bool =
   try:
     let node = parseJson(body)
@@ -1788,12 +1811,19 @@ proc handleChat(gateway: Gateway, request: Request): Future[void] {.async.} =
   var hardStopDetail = ""
 
   var aliasKnown = false
-  if alias.isSome:
+  if alias.isSome and not aliasTooLong(alias.get):
     for leg in gateway.cfg.legs:
       if leg.aliases.hasKey(alias.get):
         aliasKnown = true
         break
-  if alias.isSome and not aliasKnown:
+  if alias.isSome and aliasTooLong(alias.get):
+    # Item 3: bounded here, before any leg is touched. The body is fixed text, so
+    # an oversized model string is never echoed back at the caller.
+    await request.sendErrorBody(400, aliasTooLongBody())
+    status = 400
+    answered = true
+    chain.firstReason = TokenAliasTooLong
+  elif alias.isSome and not aliasKnown:
     # No leg in the config maps this name: a client error with a body that says
     # so, not a 500 and not a walk that ends in an all-legs-failed 502.
     await request.sendErrorBody(400, unknownAliasBody(alias.get))
@@ -1802,7 +1832,7 @@ proc handleChat(gateway: Gateway, request: Request): Future[void] {.async.} =
     chain.firstReason = TokenUnknownAlias
 
   let order = gateway.pickOrder()
-  if order.len == 0:
+  if not answered and order.len == 0:
     # Every leg is cooling: no dial at all (D12.3's third sentence).
     route = gateway.cfg.legs[^1].name
     await request.sendErrorBody(502, allLegsFailedBody("all_legs_cooling"))
@@ -1940,7 +1970,7 @@ proc handleChat(gateway: Gateway, request: Request): Future[void] {.async.} =
       stream = stream,
       # The caller's own string, prefix included, so the line says what was
       # asked for while `route` keeps saying which leg answered.
-      alias = (if alias.isSome: AliasPrefix & alias.get else: ""))):
+      alias = (if alias.isSome: aliasLogValue(alias.get) else: ""))):
     inc gateway.logLines
 
 # ---------------------------------------------------------------- log tail ---
@@ -2626,7 +2656,9 @@ proc stopSignalName*(signalNumber: cint): string =
 
 proc drainAndExit*(gateway: Gateway, server: AsyncHttpServer) =
   ## Close the listener, let what is already in flight finish inside
-  ## ShutdownDrainMs, then exit 0 with one line at each end of the shutdown.
+  ## ShutdownDrainMs, then exit: 0 when everything drained, 75 when the ceiling
+  ## was reached with work still in flight. Either way one line at each end, and
+  ## the second line never claims a drain that did not happen.
   let started = epochTime()
   let draining = gateway.inFlight
   stderr.writeLine("kori: " & stopSignalName(stopSignalNumber) &
@@ -2637,6 +2669,16 @@ proc drainAndExit*(gateway: Gateway, server: AsyncHttpServer) =
         (epochTime() - started) * 1000.0 < ShutdownDrainMs.float:
     waitFor sleepAsync(ShutdownPollMs)
   let elapsedMs = int((epochTime() - started) * 1000.0)
+  let remaining = gateway.inFlight
+  if remaining > 0:
+    # 75 is deliberately not in RestartPreventExitStatus: the service comes back on
+    # its own and the journal keeps the one line that says the drain was cut short.
+    # A silent exit 0 here would make every drain proof meaningless.
+    stderr.writeLine("kori: shutdown complete, drained " &
+                     $(draining - remaining) & " of " & $draining &
+                     " connection(s) in " & $elapsedMs & " ms, " & $remaining &
+                     " still in flight at the " & $ShutdownDrainMs & " ms ceiling")
+    quit(75)
   stderr.writeLine("kori: shutdown complete, drained " & $draining &
                    " connection(s) in " & $elapsedMs & " ms, exit 0")
   quit(0)

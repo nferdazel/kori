@@ -67,6 +67,33 @@ let aliasRow = buildLogRow(parseJson(requestLogLine(
 check "the row projection keeps the alias when the line has one",
   aliasRow{"alias"} != nil and aliasRow{"alias"}.getStr() == "kori/fast"
 
+let tooLongAlias = repeat('a', MaxAliasBytes + 1)
+check "an alias of exactly 256 bytes is still accepted",
+  not aliasTooLong(repeat('a', MaxAliasBytes))
+
+check "an alias of 257 bytes is refused",
+  aliasTooLong(tooLongAlias)
+
+let tooLongBody = aliasTooLongBody()
+check "the too-long body names the type and the limit and nothing else",
+  tooLongBody.contains("\"type\":\"alias_too_long\"") and
+    tooLongBody.contains("longer than 256 bytes") and tooLongBody.len < 120
+
+check "the too-long body does not carry the alias",
+  not tooLongBody.contains("aaaa")
+
+check "the log value of an over-long alias is cut to 256 bytes",
+  aliasLogValue(tooLongAlias).len == MaxAliasBytes
+
+check "the log value of a normal alias keeps the caller's prefix",
+  aliasLogValue("fast") == "kori/fast"
+
+let longLine = parseJson(requestLogLine(
+  "t", "leg-a", 400, 1, none(int), none(int), "", "alias_too_long", false,
+  aliasLogValue(tooLongAlias)))
+check "a refused over-long alias still fits one log line",
+  longLine{"alias"} != nil and longLine{"alias"}.getStr().len == MaxAliasBytes
+
 # ---------------------------------------------------------------------- CLI ---
 
 block:
