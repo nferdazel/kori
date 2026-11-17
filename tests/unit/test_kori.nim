@@ -430,7 +430,7 @@ check "an encoded traversal is not normalised into a real path",
   resolveStaticPath("/%2e%2e/kori.nim") == "/%2e%2e/kori.nim"
 
 check "a hashed asset is immutable",
-  cacheControlFor("/assets/main-BYeE7fmQ.css") == StaticAssetCache
+  cacheControlFor("/assets/main-3LGz82B_.css") == StaticAssetCache
 check "a font keeps its name, so it is not immutable",
   cacheControlFor("/fonts/inter-latin-var.woff2") == StaticFontCache
 check "a page is never cached across a deploy",
@@ -445,7 +445,7 @@ check "the root path is no-store too, because it is a page",
 block:
   let table = staticFileTable()
   for path in ["/index.html", "/requests.html", "/routes.html", "/config.html",
-               "/assets/main-BYeE7fmQ.css", "/assets/main-ntOxUyYS.js",
+               "/assets/main-3LGz82B_.css", "/assets/main-3kqSlnGk.js",
                "/fonts/inter-latin-var.woff2", "/fonts/jetbrains-mono-latin-var.woff2"]:
     check "the embedded table carries " & path, table.hasKey(path)
   check "every embedded page is html",
