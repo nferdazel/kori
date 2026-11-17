@@ -24,6 +24,8 @@ export interface WindowCounters {
   requests: number;
   failover_availability: number;
   failover_capacity: number;
+  tokens_in: number;
+  tokens_out: number;
 }
 
 export interface FailoverEvent {

@@ -172,6 +172,8 @@ type
     requests*: int
     failoverAvailability*: int
     failoverCapacity*: int
+    tokensInTotal*: int
+    tokensOutTotal*: int
     cursor: int
     ssl*: SslContext
     legs*: seq[LegRuntime]
@@ -1792,6 +1794,10 @@ proc handleChat(gateway: Gateway, request: Request): Future[void] {.async.} =
     tokensOut = none(int)
 
   gateway.requests.inc
+  if tokensIn.isSome:
+    gateway.tokensInTotal += tokensIn.get
+  if tokensOut.isSome:
+    gateway.tokensOutTotal += tokensOut.get
   if chain.availability:
     gateway.failoverAvailability.inc
   if chain.capacity:
@@ -2137,6 +2143,8 @@ proc stateJson*(gateway: Gateway): string =
   windowNode["requests"] = %gateway.requests
   windowNode["failover_availability"] = %gateway.failoverAvailability
   windowNode["failover_capacity"] = %gateway.failoverCapacity
+  windowNode["tokens_in"] = %gateway.tokensInTotal
+  windowNode["tokens_out"] = %gateway.tokensOutTotal
   root["window"] = windowNode
 
   var events = newJArray()

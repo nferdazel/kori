@@ -32,6 +32,14 @@ export function pct(part: number, total: number): string {
   return Math.round((part / total) * 100) + "%";
 }
 
+// Token counts are large and rarely exact; a readout wants the magnitude, not every digit.
+export function compact(n: number | null | undefined): string {
+  if (n === null || n === undefined) return "-";
+  if (n < 1000) return String(n);
+  if (n < 1000000) return (n / 1000).toFixed(n < 10000 ? 1 : 0) + "k";
+  return (n / 1000000).toFixed(1) + "M";
+}
+
 export function age(iso: string | null, nowMs: number): string {
   if (!iso) return "never";
   const s = Math.max(0, Math.round((nowMs - Date.parse(iso)) / 1000));

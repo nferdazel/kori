@@ -18,6 +18,9 @@ templates under `ops/` describe the intended host shape and have not been run ag
 - A leg's `model` is the id that leg is sent (DEC-10): the caller's top-level `model` is
   replaced with it on that leg alone, so one gateway can chain providers that do not share
   model ids. A leg without `model` still forwards the caller's body byte for byte.
+- `/admin/state` carries window token totals (`window.tokens_in`, `window.tokens_out`), summed
+  from the usage each served request reported, and the dashboard shows them as a sixth
+  readout so cost is visible without opening the log.
 
 ## [0.3.0] - 2026-11-16
 

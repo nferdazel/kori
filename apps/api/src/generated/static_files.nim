@@ -9,8 +9,8 @@ type StaticFile* = object
 type StaticEntry* = tuple[path: string, contentType: string, body: string]
 
 const staticEntries* = [
-  (path: "/assets/main-BYeE7fmQ.css", contentType: "text/css; charset=utf-8", body: staticRead("../../../web/dist/assets/main-BYeE7fmQ.css")),
-  (path: "/assets/main-ntOxUyYS.js", contentType: "text/javascript; charset=utf-8", body: staticRead("../../../web/dist/assets/main-ntOxUyYS.js")),
+  (path: "/assets/main-3LGz82B_.css", contentType: "text/css; charset=utf-8", body: staticRead("../../../web/dist/assets/main-3LGz82B_.css")),
+  (path: "/assets/main-3kqSlnGk.js", contentType: "text/javascript; charset=utf-8", body: staticRead("../../../web/dist/assets/main-3kqSlnGk.js")),
   (path: "/config.html", contentType: "text/html; charset=utf-8", body: staticRead("../../../web/dist/config.html")),
   (path: "/fonts/inter-latin-var.woff2", contentType: "font/woff2", body: staticRead("../../../web/dist/fonts/inter-latin-var.woff2")),
   (path: "/fonts/jetbrains-mono-latin-var.woff2", contentType: "font/woff2", body: staticRead("../../../web/dist/fonts/jetbrains-mono-latin-var.woff2")),

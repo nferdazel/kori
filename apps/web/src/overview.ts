@@ -1,4 +1,4 @@
-// Overview: the route strip, five readouts, the request tape, the served-share split bar, the
+// Overview: the route strip, six readouts, the request tape, the served-share split bar, the
 // failover events and a ten-row preview. Three GETs feed it; none of the numbers is derived.
 
 import { fetchConfig, fetchLog, fetchState } from "./api";
@@ -7,6 +7,7 @@ import {
   age,
   bytesLabel,
   clock,
+  compact,
   cooldownWindow,
   mbLabel,
   num,
@@ -209,6 +210,7 @@ function renderReadouts(): void {
   item("slowest p50", slowest ? secs(slowest.latency_ms_p50) : "-", slowest ? slowest.name : "no samples", true);
   const medianSub = w.requests === 1 ? "1 request, median of 1" : serving ? "on " + serving.name : "no route serving";
   item("median", serving ? secs(serving.latency_ms_p50) : "-", medianSub, true);
+  item("tokens", `${compact(w.tokens_in)} / ${compact(w.tokens_out)}`, "tokens in / out", true);
 
   const asof = q("[data-asof]");
   if (asof) asof.textContent = "as of " + clock(state.window.to);
