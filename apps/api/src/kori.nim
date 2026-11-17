@@ -47,6 +47,12 @@ const
   ChunkIdleMs* = 120_000
   TotalNonStreamMs* = 300_000
 
+  # Slice 6. A container stop is a SIGTERM and podman waits 10 s before it
+  # escalates to SIGKILL, so the listener closes at once, the requests already in
+  # flight get this budget, and the process exits 0 inside that window.
+  ShutdownDrainMs* = 5_000
+  ShutdownPollMs = 20
+
   # SPEC §4: the token call gets its own budget on top of connect and TLS, so a
   # hung token endpoint is a refresh timeout and never a slow provider.
   RefreshDeadlineMs* = 5_000
@@ -170,6 +176,7 @@ type
     startedAt: string
     listenAddr: string
     requests*: int
+    inFlight*: int             ## requests being served right now; read by the drain
     failoverAvailability*: int
     failoverCapacity*: int
     tokensInTotal*: int
@@ -2419,7 +2426,7 @@ proc handleStatic(gateway: Gateway,
   let payload = if request.reqMethod == HttpHead: "" else: entry.body
   await request.client.send(buildHead(200, headers) & payload)
 
-proc dispatch(gateway: Gateway, request: Request): Future[void] {.async.} =
+proc routeRequest(gateway: Gateway, request: Request): Future[void] {.async.} =
   let path = request.url.path
   if path == "/healthz":
     if request.reqMethod notin {HttpGet, HttpHead}:
@@ -2450,6 +2457,53 @@ proc dispatch(gateway: Gateway, request: Request): Future[void] {.async.} =
     # Last in the chain on purpose: /healthz, /admin/* and /v1/* keep their
     # priority, so the D11 envelope is untouched by the static surface.
     await gateway.handleStatic(request)
+
+proc dispatch*(gateway: Gateway, request: Request): Future[void] {.async.} =
+  ## Every client request passes here, so a shutdown knows how much is still in
+  ## flight without asking the HTTP layer.
+  inc gateway.inFlight
+  try:
+    await gateway.routeRequest(request)
+  finally:
+    dec gateway.inFlight
+
+# ----------------------------------------------------------------- shutdown ---
+
+var stopSignalNumber {.volatile.}: cint = 0
+
+proc onStopSignal(signalNumber: cint) {.noconv.} =
+  ## Signal context: one store, no allocation, no lock, no logging.
+  stopSignalNumber = signalNumber
+
+proc installStopHandlers*() =
+  ## SIGTERM is what `podman stop` and systemd send; SIGINT is what a terminal
+  ## sends. Both take the same path, so a stop in development proves the stop in
+  ## the container.
+  discard posix.signal(SIGTERM, onStopSignal)
+  discard posix.signal(SIGINT, onStopSignal)
+
+proc stopSignalName*(signalNumber: cint): string =
+  case int(signalNumber)
+  of 2: "SIGINT"
+  of 15: "SIGTERM"
+  else: "signal " & $int(signalNumber)
+
+proc drainAndExit*(gateway: Gateway, server: AsyncHttpServer) =
+  ## Close the listener, let what is already in flight finish inside
+  ## ShutdownDrainMs, then exit 0 with one line at each end of the shutdown.
+  let started = epochTime()
+  let draining = gateway.inFlight
+  stderr.writeLine("kori: " & stopSignalName(stopSignalNumber) &
+                   " received, listener closed, draining " & $draining &
+                   " in-flight connection(s)")
+  server.close()
+  while gateway.inFlight > 0 and
+        (epochTime() - started) * 1000.0 < ShutdownDrainMs.float:
+    waitFor sleepAsync(ShutdownPollMs)
+  let elapsedMs = int((epochTime() - started) * 1000.0)
+  stderr.writeLine("kori: shutdown complete, drained " & $draining &
+                   " connection(s) in " & $elapsedMs & " ms, exit 0")
+  quit(0)
 
 # ---------------------------------------------------------------------- main ---
 
@@ -2499,10 +2553,27 @@ proc main() =
   stderr.writeLine("kori " & KoriVersion & " (" & KoriRevision & ") listening on " &
                    gateway.listenAddr & ", log " & cfg.logPath)
 
+  installStopHandlers()
   let server = newAsyncHttpServer(maxBody = MaxRequestBytes)
   let handler = proc (request: Request): Future[void] {.async, gcsafe.} =
     await gateway.dispatch(request)
-  waitFor server.serve(Port(cfg.listenPort), handler, cfg.listenHost)
+  let serving = server.serve(Port(cfg.listenPort), handler, cfg.listenHost)
+  # serve() ends only when the listener does: during a shutdown its accept fails
+  # on the closed socket, and that error is read here so the way out is not an
+  # unhandled future failure.
+  serving.addCallback(proc (future: Future[void]) {.gcsafe.} =
+    if future.failed:
+      try:
+        future.read()
+      except CatchableError:
+        discard)
+  while not serving.finished and stopSignalNumber == 0:
+    waitFor sleepAsync(ShutdownPollMs)
+  if stopSignalNumber == 0:
+    # The listener died on its own; surface it exactly as waitFor used to.
+    serving.read()
+    quit(0)
+  drainAndExit(gateway, server)
 
 when isMainModule:
   main()
