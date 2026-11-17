@@ -47,8 +47,17 @@ RUN nimble install -d -y
 # reason NIM_SHA256 has none: .dockerignore keeps .git out of the build context, so config.nims
 # cannot read the commit from git inside the image. Without it the image would report "dev",
 # a value nobody chose, so the build stops instead of shipping it.
+#
+# Non-empty is not enough. A build-arg of spaces passes `-n`, config.nims then finds nothing
+# usable in it, the build falls through to git, .git is not in the context, and the image
+# reports "dev" again — silently, which is the symptom 0.5.1 was meant to close. The value also
+# lands in the startup line verbatim, so a newline or a control character in it could forge a
+# log line. Only a git sha shape gets through: lowercase hex, 7 to 40 characters.
 ARG KORI_REVISION=
-RUN [ -n "$KORI_REVISION" ] || { echo "KORI_REVISION build-arg is required" >&2; exit 1; }
+RUN v="$KORI_REVISION"; \
+    case "$v" in '' | *[!0-9a-f]*) ok=0 ;; *) ok=1 ;; esac; \
+    [ "$ok" = 1 ] && [ "${#v}" -ge 7 ] && [ "${#v}" -le 40 ] \
+      || { echo "KORI_REVISION must be a lowercase hex git sha of 7 to 40 characters" >&2; exit 1; }
 ENV KORI_REVISION=${KORI_REVISION}
 
 COPY . .
