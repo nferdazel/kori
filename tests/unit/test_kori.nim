@@ -445,7 +445,7 @@ check "the root path is no-store too, because it is a page",
 block:
   let table = staticFileTable()
   for path in ["/index.html", "/requests.html", "/routes.html", "/config.html",
-               "/assets/main-BYeE7fmQ.css", "/assets/main-DD-mDHpI.js",
+               "/assets/main-BYeE7fmQ.css", "/assets/main-ntOxUyYS.js",
                "/fonts/inter-latin-var.woff2", "/fonts/jetbrains-mono-latin-var.woff2"]:
     check "the embedded table carries " & path, table.hasKey(path)
   check "every embedded page is html",

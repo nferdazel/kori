@@ -800,6 +800,7 @@ proc readSlice(reader: UpstreamReader,
       reader.chunkRemaining -= result.data.len
       if reader.chunkRemaining == 0:
         reader.needCrlf = true
+      return
 
 proc parseHead(raw: string): tuple[status: int, headers: seq[(string, string)]] =
   let lines = raw.split("\r\n")

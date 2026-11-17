@@ -5,7 +5,11 @@ import type { AdminState, RouteLeg } from "./types";
 
 export function clock(iso: string | null | undefined): string {
   if (!iso) return "-";
-  return iso.length >= 19 ? iso.slice(11, 19) : iso;
+  const ms = Date.parse(iso);
+  if (Number.isNaN(ms)) {
+    return iso.length >= 19 ? iso.slice(11, 19) : iso;
+  }
+  return clockFromMs(ms);
 }
 
 export function clockFromMs(ms: number): string {
