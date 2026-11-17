@@ -534,11 +534,14 @@ proc jsonIntOrNull(value: Option[int]): string =
 proc requestLogLine*(ts, route: string, status, latencyMs: int,
                      tokensIn, tokensOut: Option[int],
                      failoverFrom, failoverReason: string,
-                     stream: bool): string =
-  ## The nine keys of SPEC §5.1 in that order, and nothing else. Redaction is
-  ## structural (R17): no header, no body and no credential is a parameter here,
-  ## so there is nothing for a later pass to strip.
-  "{\"ts\":" & jsonEscape(ts) &
+                     stream: bool, alias = ""): string =
+  ## The nine keys of SPEC §5.1 in that order, plus `alias` as a tenth when the
+  ## caller named a gateway alias. Redaction is structural (R17): no header, no
+  ## body and no credential is a parameter here, so there is nothing for a later
+  ## pass to strip. A request that named a provider id instead has no `alias` key
+  ## at all, not an empty one: "no alias" and "an empty alias" are different
+  ## facts, and only the first one reaches this proc.
+  result = "{\"ts\":" & jsonEscape(ts) &
     ",\"route\":" & jsonEscape(route) &
     ",\"status\":" & $status &
     ",\"latency_ms\":" & $latencyMs &
@@ -546,7 +549,10 @@ proc requestLogLine*(ts, route: string, status, latencyMs: int,
     ",\"tokens_out\":" & jsonIntOrNull(tokensOut) &
     ",\"failover_from\":" & jsonEscape(failoverFrom) &
     ",\"failover_reason\":" & jsonEscape(failoverReason) &
-    ",\"stream\":" & (if stream: "true" else: "false") & "}"
+    ",\"stream\":" & (if stream: "true" else: "false")
+  if alias.len > 0:
+    result.add ",\"alias\":" & jsonEscape(alias)
+  result.add "}"
 
 proc openRequestLog*(path: string): RequestLog =
   ## Opened once, for the process lifetime: O_WRONLY|O_CREAT|O_APPEND, mode 0640.
@@ -1931,7 +1937,10 @@ proc handleChat(gateway: Gateway, request: Request): Future[void] {.async.} =
       tokensOut = tokensOut,
       failoverFrom = (if hardStop.len > 0: "" else: chain.firstFrom),
       failoverReason = logReason,
-      stream = stream)):
+      stream = stream,
+      # The caller's own string, prefix included, so the line says what was
+      # asked for while `route` keeps saying which leg answered.
+      alias = (if alias.isSome: AliasPrefix & alias.get else: ""))):
     inc gateway.logLines
 
 # ---------------------------------------------------------------- log tail ---
@@ -1941,13 +1950,19 @@ const
   LogScanBudget = 5000
   LogTailBlock = 8192
 
+## The row projection. `alias` is last and is only there when the line carries
+## one: a request that named a provider id has no such key, and the page shows
+## that absence rather than inventing an empty string.
 const LogRowKeys = ["ts", "route", "status", "latency_ms", "tokens_in",
-                    "tokens_out", "failover_from", "failover_reason", "stream"]
+                    "tokens_out", "failover_from", "failover_reason", "stream",
+                    "alias"]
 
 type
   LogFilter* = object
     route*: string
     hasRoute*: bool
+    alias*: string
+    hasAlias*: bool
     statusClass*: int        ## 0 absent, else 2, 4 or 5
     reason*: string
     hasReason*: bool
@@ -2009,6 +2024,10 @@ proc buildLogRow*(node: JsonNode): JsonNode =
   for key in LogRowKeys:
     let value = node{key}
     if value == nil:
+      # `alias` is the one key a line may legitimately lack; every other key is
+      # written on every line, so a null there means the line itself is damaged.
+      if key == "alias":
+        continue
       result[key] = newJNull()
     else:
       result[key] = value
@@ -2017,6 +2036,12 @@ proc rowMatches*(node: JsonNode, filter: LogFilter): bool =
   if filter.hasRoute:
     let route = node{"route"}
     if route == nil or route.kind != JString or route.getStr() != filter.route:
+      return false
+  if filter.hasAlias:
+    # The exact string the caller sent, prefix included. A row without the key
+    # never matches: it answered a provider id, not an alias.
+    let alias = node{"alias"}
+    if alias == nil or alias.kind != JString or alias.getStr() != filter.alias:
       return false
   if filter.statusClass != 0:
     let status = node{"status"}
@@ -2418,6 +2443,11 @@ proc handleAdminLog(gateway: Gateway,
   if routeValue.isSome:
     filter.hasRoute = true
     filter.route = routeValue.get
+
+  let aliasValue = queryValue(params, "alias")
+  if aliasValue.isSome:
+    filter.hasAlias = true
+    filter.alias = aliasValue.get
 
   let classValue = queryValue(params, "status_class")
   if classValue.isSome:

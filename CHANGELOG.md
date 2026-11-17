@@ -39,7 +39,8 @@ templates under `ops/` describe the intended host shape and have not been run ag
   and non-streaming, idle between chunks, and a whole-request limit.
 - Append-only request log, one JSON line per request with nine keys: `ts`, `route`,
   `status`, `latency_ms`, `tokens_in`, `tokens_out`, `failover_from`, `failover_reason`,
-  `stream`. No header, body or credential is ever written.
+  `stream`, plus a tenth key `alias` carrying the caller's `kori/<alias>` exactly as sent,
+  present only on requests that named one. No header, body or credential is ever written.
 - `stream_options.include_usage` is set on streaming requests that omit it, so token counts
   come from the provider instead of being estimated.
 - Read-only admin GETs: `/admin/state`, `/admin/log` with paging and filters, and

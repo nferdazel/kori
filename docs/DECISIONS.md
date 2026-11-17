@@ -191,7 +191,10 @@ leg unchanged, the same promise `injectIncludeUsage` keeps. A body with no top-l
 string is not refused and not given one.
 
 **Consequences.** One gateway can front three providers with different ids, and the caller
-keeps asking for one model name. The cost is that a leg with `model` set cannot serve a
-per-request model choice: the route decides the model, not the caller. That is consistent
-with a fixed chain and it is visible in the config, but a future need for caller-side model
-selection is a new decision, not a config flag.
+keeps asking for one model name. In the request log the three facts stay separate: `route`
+is the leg that answered, the response `model` is the provider id that leg actually sent,
+and `alias` is the name the caller asked for, written only when the caller used one. A leg
+with a static `model` still cannot serve a per-request provider id: the config decides what
+a leg sends, not the caller. That is consistent with a fixed chain and it is visible in the
+config, but a wider need for caller-side model selection is a new decision, not a config
+flag.

@@ -17,7 +17,7 @@ What it does:
   a plain `429`) is returned unchanged and nothing fails over.
 - **Cooldown.** A dead leg is skipped without a dial until its cooldown expires.
 - **One log line per request.** Append-only JSONL carrying route, status, latency, token
-  counts and the failover reason.
+  counts, the failover reason and, when the caller asked for a `kori/<alias>`, that alias.
 - **A read-only dashboard** compiled into the binary, served from memory.
 
 ## Requirements
@@ -249,8 +249,9 @@ read from disk at runtime: the dashboard files are compiled into the binary.
 
 `/admin/log` takes `limit` (1–200, default 50), `offset`, `route`, `status_class`
 (`2xx`, `4xx`, `5xx`), `reason` (the token, or `none` for requests that did not fail
-over), `stream` (`true`, `false`) and `since` (RFC 3339). A malformed value is a `400`
-that names the parameter, and no file read happens.
+over), `stream` (`true`, `false`), `since` (RFC 3339) and `alias` (the exact
+`kori/<alias>` a caller named). A malformed value is a `400` that names the
+parameter, and no file read happens.
 
 Router state is memory only. After a restart every leg reads `unknown` with no cooldown
 and zero counters; the log is the durable record, not a source of router state.

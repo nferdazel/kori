@@ -54,6 +54,19 @@ check "log line escapes a quote in the route name",
   requestLogLine("t", "a\"b", 200, 1, none(int), none(int), "", "", false)
     .contains("\"route\":\"a\\\"b\"")
 
+check "log line carries the alias the caller asked for",
+  requestLogLine("t", "leg-a", 200, 1, none(int), none(int), "", "", false,
+                 "kori/fast").contains("\"alias\":\"kori/fast\"")
+
+check "a request that named no alias has no alias key at all",
+  not requestLogLine("t", "leg-a", 200, 1, none(int), none(int), "", "", false)
+    .contains("\"alias\"")
+
+let aliasRow = buildLogRow(parseJson(requestLogLine(
+  "t", "leg-a", 200, 1, none(int), none(int), "", "", false, "kori/fast")))
+check "the row projection keeps the alias when the line has one",
+  aliasRow{"alias"} != nil and aliasRow{"alias"}.getStr() == "kori/fast"
+
 # ---------------------------------------------------------------------- CLI ---
 
 block:
