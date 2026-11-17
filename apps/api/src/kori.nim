@@ -106,6 +106,18 @@ const
   ## has to survive whole, or its row stops matching its own `?alias=` filter.
   MaxAliasLogBytes* = MaxAliasBytes + AliasPrefix.len
 
+  ## Effort ranks, smallest to largest. A leg lists the values it accepts; a
+  ## request above the leg's ceiling is clamped DOWN to the highest value the leg
+  ## still accepts, and never up, because spending more than the caller asked for
+  ## is a cost decision nobody made. A value outside this table is not ranked and
+  ## is forwarded untouched: kori does not invent a position for a name it does
+  ## not know, and the leg's own validation is the authority on it.
+  EffortRanks* = ["minimal", "none", "low", "medium", "high", "xhigh", "max"]
+
+  ## Every leg skipped for effort is a client error with a body that names the
+  ## value, the same shape `unknown_alias` uses: the caller can fix it.
+  TokenEffortUnsupported* = "effort_unsupported"
+
 type
   CliError* = object of CatchableError
   ConfigError* = object of CatchableError
@@ -138,6 +150,8 @@ type
     hasOauth*: bool
     enabled*: bool             ## false only when the config says so: skipped, never dialled
     aliases*: Table[string, string]  ## `kori/<alias>` -> this leg's provider id
+    efforts*: seq[string]      ## the reasoning_effort values this leg accepts
+    hasEfforts*: bool          ## `efforts` came from the config, so the ceiling applies
 
   Config* = object
     listenHost*: string
@@ -352,6 +366,15 @@ proc optionalString(node: JsonNode, key, ctx: string): string =
     failConfig(ctx & "." & key & " must be a string")
   child.getStr()
 
+proc effortRank*(effort: string): int =
+  ## The position of `effort` in `EffortRanks`, or -1 when this gateway does not
+  ## rank that name. -1 is a real answer, not an error: an unranked value is one
+  ## kori cannot compare, so it is forwarded untouched rather than guessed at.
+  for index, name in EffortRanks:
+    if name == effort:
+      return index
+  -1
+
 proc loadConfig*(path: string): Config =
   var raw: string
   try:
@@ -460,6 +483,24 @@ proc loadConfig*(path: string): Config =
         if value.kind != JString or value.getStr().len == 0:
           failConfig(ctx & ".aliases." & alias & " must be a non-empty string")
         leg.aliases[alias] = value.getStr()
+    # Item 4. A leg's effort ceiling. The list is the values this leg accepts;
+    # a value outside the rank table is a typo in a config file, so it fails at
+    # load with the leg and the value named instead of at request time.
+    let effortsNode = item{"efforts"}
+    if effortsNode != nil and effortsNode.kind != JNull:
+      if effortsNode.kind != JArray:
+        failConfig(ctx & ".efforts must be an array of strings")
+      for effortIndex in 0 ..< effortsNode.len:
+        let value = effortsNode[effortIndex]
+        if value.kind != JString:
+          failConfig(ctx & ".efforts[" & $effortIndex & "] must be a string")
+        let effort = value.getStr()
+        if effortRank(effort) < 0:
+          failConfig(ctx & ".efforts[" & $effortIndex & "] '" & effort &
+                     "' is not a known effort; expected one of " &
+                     EffortRanks.join(", "))
+        leg.efforts.add(effort)
+      leg.hasEfforts = true
     # SPEC §4. A leg with no `oauth` block behaves exactly as it did before: one
     # static bearer from api_key.
     let oauth = item{"oauth"}
@@ -545,13 +586,15 @@ proc jsonIntOrNull(value: Option[int]): string =
 proc requestLogLine*(ts, route: string, status, latencyMs: int,
                      tokensIn, tokensOut: Option[int],
                      failoverFrom, failoverReason: string,
-                     stream: bool, alias = ""): string =
+                     stream: bool, alias = "", effortClamped = ""): string =
   ## The nine keys of SPEC §5.1 in that order, plus `alias` as a tenth when the
-  ## caller named a gateway alias. Redaction is structural (R17): no header, no
-  ## body and no credential is a parameter here, so there is nothing for a later
-  ## pass to strip. A request that named a provider id instead has no `alias` key
-  ## at all, not an empty one: "no alias" and "an empty alias" are different
-  ## facts, and only the first one reaches this proc.
+  ## caller named a gateway alias, plus `effort_clamped` as an eleventh when the
+  ## leg's ceiling pulled the requested effort down. Both extra keys are
+  ## conditional and come last: a request that named no alias and never clamped
+  ## carries exactly the nine. Redaction is structural (R17): no header, no body
+  ## and no credential is a parameter here, so there is nothing for a later pass
+  ## to strip. "no alias" and "an empty alias" are different facts, and only the
+  ## first one reaches this proc; the same holds for a clamp that never happened.
   result = "{\"ts\":" & jsonEscape(ts) &
     ",\"route\":" & jsonEscape(route) &
     ",\"status\":" & $status &
@@ -563,6 +606,8 @@ proc requestLogLine*(ts, route: string, status, latencyMs: int,
     ",\"stream\":" & (if stream: "true" else: "false")
   if alias.len > 0:
     result.add ",\"alias\":" & jsonEscape(alias)
+  if effortClamped.len > 0:
+    result.add ",\"effort_clamped\":" & jsonEscape(effortClamped)
   result.add "}"
 
 proc openRequestLog*(path: string): RequestLog =
@@ -943,24 +988,26 @@ proc injectIncludeUsage*(body: string): string =
   else:
     body[0 .. brace] & addition & "," & body[after .. ^1]
 
-proc isModelKey(rawKey: string): bool =
-  if rawKey == "model":
+proc isKeyNamed(rawKey, name: string): bool =
+  ## A top-level key as it appears in the caller's bytes, matched after unescaping:
+  ## `"model"` and `"mo\u0064el"` are the same key, and a rewrite has to catch both.
+  if rawKey == name:
     return true
   if rawKey.contains('\\'):
     try:
       let parsed = parseJson("\"" & rawKey & "\"")
-      if parsed.kind == JString and parsed.getStr() == "model":
+      if parsed.kind == JString and parsed.getStr() == name:
         return true
     except CatchableError:
       discard
   false
 
-proc rewriteModel*(body, model: string): string =
-  ## DEC-10: the leg's own model id replaces the caller's, at the top level and
-  ## nowhere else. Textual on purpose: every other byte the caller sent still
-  ## reaches the leg, the same promise `injectIncludeUsage` keeps. A body with no
-  ## top-level `model` string is returned untouched, never refused.
-  if model.len == 0 or body.len == 0:
+proc rewriteTopLevelString*(body, key, value: string): string =
+  ## The top-level string `key` becomes `value`, at the top level and nowhere
+  ## else. Textual on purpose: every other byte the caller sent still reaches the
+  ## leg, the same promise `injectIncludeUsage` keeps. A body with no such key, or
+  ## with a non-string value there, is returned untouched, never refused.
+  if key.len == 0 or body.len == 0:
     return body
 
   var stack: seq[char] = @[]
@@ -1017,7 +1064,7 @@ proc rewriteModel*(body, model: string): string =
           inc cursor
           while cursor < body.len and body[cursor] in {' ', '\t', '\r', '\n'}:
             inc cursor
-          if isModelKey(rawKey):
+          if isKeyNamed(rawKey, key):
             if cursor < body.len and body[cursor] == '"':
               let vStart = cursor
               var vCursor = cursor + 1
@@ -1041,7 +1088,7 @@ proc rewriteModel*(body, model: string): string =
   if replacements.len == 0:
     return body
 
-  let replacement = $(%model)
+  let replacement = $(%value)
   var res = ""
   var lastIdx = 0
   for r in replacements:
@@ -1051,6 +1098,64 @@ proc rewriteModel*(body, model: string): string =
   if lastIdx < body.len:
     res.add body[lastIdx .. ^1]
   res
+
+proc rewriteModel*(body, model: string): string =
+  ## DEC-10: the leg's own model id replaces the caller's. One key, one rewrite,
+  ## nothing else touched.
+  if model.len == 0:
+    return body
+  rewriteTopLevelString(body, "model", model)
+
+proc requestEffort*(body: string): string =
+  ## The caller's top-level `reasoning_effort` string, or "" when the body has
+  ## none. A parse, not a rewrite: nothing here has to keep the caller's bytes.
+  try:
+    let node = parseJson(body)
+    if node.kind == JObject:
+      let effort = node{"reasoning_effort"}
+      if effort != nil and effort.kind == JString:
+        return effort.getStr()
+  except CatchableError:
+    discard
+  ""
+
+type EffortDecision* = object
+  ## What one leg should do with the caller's effort. `skip` means the leg cannot
+  ## serve this value at any level below it, so the walk moves on without a dial
+  ## and without a cooldown, exactly as an unmapped alias does.
+  sent*: string
+  clamped*: bool
+  skip*: bool
+
+proc decideEffort*(leg: Leg, asked: string): EffortDecision =
+  ## `asked` empty means the caller named no effort, and a leg with no `efforts`
+  ## key has no ceiling: both pass through untouched. A value kori does not rank
+  ## is also passed through, because there is no honest position to compare it to.
+  result = EffortDecision(sent: asked)
+  if not leg.hasEfforts or asked.len == 0:
+    return
+  let askedRank = effortRank(asked)
+  if askedRank < 0:
+    return
+  for accepted in leg.efforts:
+    if accepted == asked:
+      return
+  var bestRank = -1
+  for accepted in leg.efforts:
+    let rank = effortRank(accepted)
+    if rank >= 0 and rank < askedRank and rank > bestRank:
+      bestRank = rank
+  if bestRank < 0:
+    result.skip = true
+    result.sent = ""
+    return
+  result.sent = EffortRanks[bestRank]
+  result.clamped = true
+
+proc effortUnsupportedBody*(asked: string): string =
+  ## A client error with a body that names the value no leg could serve.
+  "{\"error\":{\"type\":\"effort_unsupported\",\"message\":" &
+    jsonEscape("no leg accepts reasoning_effort '" & asked & "'") & "}}"
 
 proc requestModel*(body: string): string =
   ## The caller's top-level `model` string, or "" when the body has none. A parse,
@@ -1829,6 +1934,12 @@ proc handleChat(gateway: Gateway, request: Request): Future[void] {.async.} =
   var hardStop = ""
   var hardStopDetail = ""
 
+  # Item 4: the caller's effort, read once from the bytes that reach the legs.
+  # Empty means the caller named none, and then nothing here changes the body.
+  let callerEffort = requestEffort(forwardBody)
+  var effortSkips = 0
+  var effortClampedLog = ""
+
   var aliasKnown = false
   if alias.isSome and not aliasTooLong(alias.get):
     for leg in gateway.cfg.legs:
@@ -1872,6 +1983,22 @@ proc handleChat(gateway: Gateway, request: Request): Future[void] {.async.} =
           gateway.recordEvent(leg.name, gateway.cfg.legs[order[position + 1]].name,
                               TokenAliasUnmapped)
         continue
+      # Item 4: a leg whose ceiling has nothing at or below the caller's value
+      # cannot serve this request at any level the caller agreed to. It is
+      # skipped the same way an unmapped alias is: no dial, no cooldown, no
+      # half-open probe, and the walk moves to the next leg.
+      let effortChoice = decideEffort(leg, callerEffort)
+      if effortChoice.skip:
+        inc effortSkips
+        chain.lastReason = TokenEffortUnsupported
+        if chain.firstReason.len == 0:
+          chain.firstReason = TokenEffortUnsupported
+          chain.firstFrom = leg.name
+          chain.availability = true
+        if position + 1 < order.len:
+          gateway.recordEvent(leg.name, gateway.cfg.legs[order[position + 1]].name,
+                              TokenEffortUnsupported)
+        continue
       # §4: a credential that cannot be refreshed stops the request here. Nothing
       # is dialled, nothing is failed over, no stale bearer leaves the process.
       if leg.hasOauth:
@@ -1889,10 +2016,20 @@ proc handleChat(gateway: Gateway, request: Request): Future[void] {.async.} =
       # DEC-10: a leg that names a model gets that id, and only that leg does. An
       # alias request resolves per leg instead: a leg's static `model` does not
       # stand in for a missing alias mapping, it is only the non-alias default.
-      let legBody =
+      var legBody =
         if alias.isSome: rewriteModel(forwardBody, leg.aliases[alias.get])
         elif leg.hasModel: rewriteModel(forwardBody, leg.model)
         else: forwardBody
+      # Item 4: a clamped value is rewritten in place, textually, so every other
+      # byte the caller sent still reaches the leg. A clamp is recorded against
+      # the leg that answers, so a clamp on a leg that then failed is replaced by
+      # whatever the next leg decided.
+      if effortChoice.clamped:
+        legBody = rewriteTopLevelString(legBody, "reasoning_effort",
+                                        effortChoice.sent)
+      effortClampedLog =
+        if effortChoice.clamped: callerEffort & ">" & effortChoice.sent
+        else: ""
       var outcome = await gateway.attemptLeg(request, leg,
                                              gateway.bearerFor(index), legBody,
                                              stream, totalDeadline)
@@ -1948,6 +2085,18 @@ proc handleChat(gateway: Gateway, request: Request): Future[void] {.async.} =
     tokensOut = none(int)
     answered = true
 
+  if not answered and effortSkips > 0 and effortSkips == order.len and
+     hardStop.len == 0:
+    # Item 4: every leg in the walk was skipped for effort, so the value the
+    # caller asked for is the thing to name. A 400 with a body that says which
+    # value, the same shape an unknown alias gets, and no cooldown was started.
+    route = gateway.cfg.legs[^1].name
+    await request.sendErrorBody(400, effortUnsupportedBody(callerEffort))
+    status = 400
+    tokensIn = none(int)
+    tokensOut = none(int)
+    answered = true
+
   if not answered:
     # §5.5: one 502 whatever the legs returned, carrying the terminal reason.
     let message = if chain.lastReason.len > 0: chain.lastReason else: "all_legs_failed"
@@ -1989,7 +2138,10 @@ proc handleChat(gateway: Gateway, request: Request): Future[void] {.async.} =
       stream = stream,
       # The caller's own string, prefix included, so the line says what was
       # asked for while `route` keeps saying which leg answered.
-      alias = (if alias.isSome: aliasLogValue(alias.get) else: ""))):
+      alias = (if alias.isSome: aliasLogValue(alias.get) else: ""),
+      # Empty unless the answering leg pulled the effort down, so a request that
+      # never clamped keeps the nine keys it had before this feature.
+      effortClamped = effortClampedLog)):
     inc gateway.logLines
 
 # ---------------------------------------------------------------- log tail ---
@@ -1999,12 +2151,13 @@ const
   LogScanBudget = 5000
   LogTailBlock = 8192
 
-## The row projection. `alias` is last and is only there when the line carries
-## one: a request that named a provider id has no such key, and the page shows
-## that absence rather than inventing an empty string.
+## The row projection. `alias` and `effort_clamped` are last and are only there
+## when the line carries them: a request that named a provider id and never
+## clamped has neither key, and the page shows that absence rather than inventing
+## an empty string.
 const LogRowKeys = ["ts", "route", "status", "latency_ms", "tokens_in",
                     "tokens_out", "failover_from", "failover_reason", "stream",
-                    "alias"]
+                    "alias", "effort_clamped"]
 
 type
   LogFilter* = object
@@ -2067,16 +2220,18 @@ proc parseRfc3339*(value: string): Option[float] =
     result = none(float)
 
 proc buildLogRow*(node: JsonNode): JsonNode =
-  ## Exactly the ten keys of SPEC §5.1, in that order. `alias` is last and is
-  ## only there when the line carries one. Anything else a line carries is
-  ## dropped, so the page cannot widen the row by accident.
+  ## Exactly the eleven keys of SPEC §5.1, in that order. `alias` and
+  ## `effort_clamped` are conditional and come last: they are there only when the
+  ## line carries them. Anything else a line carries is dropped, so the page
+  ## cannot widen the row by accident.
   result = newJObject()
   for key in LogRowKeys:
     let value = node{key}
     if value == nil:
-      # `alias` is the one key a line may legitimately lack; every other key is
-      # written on every line, so a null there means the line itself is damaged.
-      if key == "alias":
+      # `alias` and `effort_clamped` are the two keys a line may legitimately
+      # lack; every other key is written on every line, so a null there means the
+      # line itself is damaged.
+      if key == "alias" or key == "effort_clamped":
         continue
       result[key] = newJNull()
     else:

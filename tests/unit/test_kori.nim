@@ -312,6 +312,106 @@ block:
     rewriteModel("""[{"model":"caller-id"}]""", "leg-model") ==
       """[{"model":"caller-id"}]"""
 
+# ------------------------------------------------------------------- effort ---
+
+block:
+  # Item 4: the leg's ceiling. Rank order is minimal < none < low < medium <
+  # high < xhigh < max, so a value above the leg's list is pulled DOWN to the
+  # highest member still below it, never up.
+  let wide = Leg(name: "wide", hasEfforts: true,
+                 efforts: @["low", "high", "max"])
+  let narrow = Leg(name: "narrow", hasEfforts: true, efforts: @["low", "high"])
+  check "effort: a member of the leg's list is sent as asked",
+    decideEffort(wide, "high") == EffortDecision(sent: "high", clamped: false,
+                                                 skip: false)
+  check "effort: max above a low/high list clamps to high",
+    decideEffort(narrow, "max") == EffortDecision(sent: "high", clamped: true,
+                                                  skip: false)
+  check "effort: medium clamps DOWN to low, not up to high",
+    decideEffort(wide, "medium") == EffortDecision(sent: "low", clamped: true,
+                                                   skip: false)
+  check "effort: xhigh clamps to high, because max is not below it",
+    decideEffort(wide, "xhigh") == EffortDecision(sent: "high", clamped: true,
+                                                  skip: false)
+  check "effort: max on a list that has max is sent as asked",
+    decideEffort(wide, "max") == EffortDecision(sent: "max", clamped: false,
+                                                skip: false)
+
+  let highOnly = Leg(name: "highOnly", hasEfforts: true,
+                     efforts: @["high", "max"])
+  check "effort: low against high/max is a skip, never an upgrade",
+    decideEffort(highOnly, "low") == EffortDecision(sent: "", clamped: false,
+                                                    skip: true)
+  check "effort: an empty effort list skips every ranked request",
+    decideEffort(Leg(name: "none", hasEfforts: true, efforts: @[]),
+                 "high").skip
+
+  let open = Leg(name: "open")
+  check "effort: a leg with no efforts key passes the value through",
+    decideEffort(open, "max") == EffortDecision(sent: "max", clamped: false,
+                                                skip: false)
+  check "effort: a caller with no effort is passed through untouched",
+    decideEffort(wide, "") == EffortDecision(sent: "", clamped: false,
+                                             skip: false)
+  check "effort: an unranked value is forwarded, not guessed at",
+    decideEffort(wide, "turbo") == EffortDecision(sent: "turbo", clamped: false,
+                                                  skip: false)
+
+block:
+  check "effort: rank order matches the agreed ladder",
+    EffortRanks == @["minimal", "none", "low", "medium", "high", "xhigh", "max"]
+  check "effort: an unknown name has no rank", effortRank("turbo") == -1
+
+block:
+  # The clamp is a textual rewrite of one key, so every other byte survives.
+  let body = """{"model":"x","reasoning_effort":"max","messages":[]}"""
+  let clamped = rewriteTopLevelString(body, "reasoning_effort", "high")
+  check "effort: the clamp rewrites the top-level value",
+    parseJson(clamped){"reasoning_effort"}.getStr() == "high"
+  check "effort: the clamp leaves every other byte alone",
+    clamped.replace("\"high\"", "\"max\"") == body
+  check "effort: the clamp does not touch a nested reasoning_effort",
+    rewriteTopLevelString(
+      """{"a":{"reasoning_effort":"max"},"reasoning_effort":"max"}""",
+      "reasoning_effort", "low") ==
+      """{"a":{"reasoning_effort":"max"},"reasoning_effort":"low"}"""
+  check "effort: a body without the key is untouched",
+    rewriteTopLevelString("""{"model":"x"}""", "reasoning_effort", "low") ==
+      """{"model":"x"}"""
+  check "effort: a non-string effort is left alone",
+    rewriteTopLevelString("""{"reasoning_effort":3}""", "reasoning_effort",
+                          "low") == """{"reasoning_effort":3}"""
+
+block:
+  check "effort: the caller's value is read from the body",
+    requestEffort("""{"reasoning_effort":"medium"}""") == "medium"
+  check "effort: a body with no field reads as empty",
+    requestEffort("""{"model":"x"}""") == ""
+  check "effort: a non-string field reads as empty",
+    requestEffort("""{"reasoning_effort":7}""") == ""
+
+block:
+  let clampedLine = requestLogLine("t", "leg", 200, 1, none(int), none(int), "",
+                                   "", false, "", "max>high")
+  check "effort: a clamp adds the eleventh key",
+    clampedLine.endsWith("\"effort_clamped\":\"max>high\"}")
+  check "effort: a clamped line has no alias key unless the caller named one",
+    not clampedLine.contains("\"alias\"")
+  check "effort: a line without a clamp keeps the nine keys",
+    requestLogLine("t", "leg", 200, 1, none(int), none(int), "", "", false) ==
+      "{\"ts\":\"t\",\"route\":\"leg\",\"status\":200,\"latency_ms\":1," &
+      "\"tokens_in\":null,\"tokens_out\":null,\"failover_from\":\"\"," &
+      "\"failover_reason\":\"\",\"stream\":false}"
+  let clampedRow = buildLogRow(parseJson(clampedLine))
+  check "effort: the row projection keeps the clamp",
+    clampedRow{"effort_clamped"} != nil and
+      clampedRow{"effort_clamped"}.getStr() == "max>high"
+  let plainRow = buildLogRow(parseJson(requestLogLine("t", "leg", 200, 1,
+                                                      none(int), none(int),
+                                                      "", "", false)))
+  check "effort: the row projection does not invent a clamp",
+    plainRow{"effort_clamped"} == nil
+
 # ---------------------------------------------------------------- the router ---
 
 proc makeGateway(legs: seq[Leg], balance: bool): Gateway =
@@ -543,6 +643,33 @@ checkRaises "a non-object aliases is rejected", ConfigError:
 checkRaises "an empty alias target is rejected", ConfigError:
   discard loadConfig(writeConfig("bad-alias-value.json", """
 {"legs":[{"name":"a","base_url":"http://127.0.0.1:1/v1","aliases":{"fast":""}}]}
+"""))
+
+# ------------------------------------------------------------- effort config ---
+
+block:
+  let cfg = loadConfig(writeConfig("efforts.json", """
+{"legs":[
+ {"name":"leg-a","base_url":"http://127.0.0.1:1/v1","efforts":["low","high","max"]},
+ {"name":"leg-b","base_url":"http://127.0.0.1:2/v1"}]}
+"""))
+  check "efforts are read per leg", cfg.legs[0].efforts == @["low", "high", "max"]
+  check "a leg with an efforts key has a ceiling", cfg.legs[0].hasEfforts
+  check "a leg with no efforts key has none", not cfg.legs[1].hasEfforts
+
+checkRaises "an effort outside the rank table is rejected", ConfigError:
+  discard loadConfig(writeConfig("bad-efforts.json", """
+{"legs":[{"name":"a","base_url":"http://127.0.0.1:1/v1","efforts":["low","turbo"]}]}
+"""))
+
+checkRaises "a non-array efforts is rejected", ConfigError:
+  discard loadConfig(writeConfig("bad-efforts-type.json", """
+{"legs":[{"name":"a","base_url":"http://127.0.0.1:1/v1","efforts":"low"}]}
+"""))
+
+checkRaises "a non-string effort is rejected", ConfigError:
+  discard loadConfig(writeConfig("bad-efforts-value.json", """
+{"legs":[{"name":"a","base_url":"http://127.0.0.1:1/v1","efforts":[3]}]}
 """))
 
 check "kori/<alias> names an alias", aliasOf("kori/fast") == some("fast")
