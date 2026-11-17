@@ -1,0 +1,10 @@
+# The build context is the repo root. .git is deliberately absent: the image revision comes
+# from the KORI_REVISION build-arg (see apps/api/Dockerfile and apps/api/src/config.nims),
+# never from a repository that happens to sit next to the Dockerfile. The rest is local
+# scratch that must not travel into a layer.
+.git
+node_modules
+apps/web/node_modules
+mcp-results/
+skills/
+*.log

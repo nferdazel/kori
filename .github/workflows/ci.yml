@@ -203,6 +203,7 @@ jobs:
           push: ${{ github.event_name == 'push' }}
           build-args: |
             NIM_SHA256=0ee5b16e81852a956d4fddb4aa44b5958c645c992132fa43be45f489573ee325
+            KORI_REVISION=${{ steps.short.outputs.sha7 }}
           tags: |
             ghcr.io/nferdazel/kori-api:sha-${{ steps.short.outputs.sha7 }}
             ghcr.io/nferdazel/kori-api:main

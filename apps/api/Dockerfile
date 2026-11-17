@@ -43,6 +43,14 @@ WORKDIR /src
 COPY kori.nimble ./
 RUN nimble install -d -y
 
+# KORI_REVISION is what /healthz and the startup line report. It has no default for the same
+# reason NIM_SHA256 has none: .dockerignore keeps .git out of the build context, so config.nims
+# cannot read the commit from git inside the image. Without it the image would report "dev",
+# a value nobody chose, so the build stops instead of shipping it.
+ARG KORI_REVISION=
+RUN [ -n "$KORI_REVISION" ] || { echo "KORI_REVISION build-arg is required" >&2; exit 1; }
+ENV KORI_REVISION=${KORI_REVISION}
+
 COPY . .
 RUN nim c -d:release --mm:orc --threads:on --hints:off --out:/out/kori apps/api/src/kori.nim
 
