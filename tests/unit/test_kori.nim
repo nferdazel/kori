@@ -82,17 +82,35 @@ check "the too-long body names the type and the limit and nothing else",
 check "the too-long body does not carry the alias",
   not tooLongBody.contains("aaaa")
 
-check "the log value of an over-long alias is cut to 256 bytes",
-  aliasLogValue(tooLongAlias).len == MaxAliasBytes
+check "the log value of an over-long alias is cut to the log budget",
+  aliasLogValue(tooLongAlias).len == MaxAliasLogBytes
 
 check "the log value of a normal alias keeps the caller's prefix",
   aliasLogValue("fast") == "kori/fast"
+
+let maxAlias = repeat('a', MaxAliasBytes)
+check "a legal 256-byte alias survives the log value whole",
+  aliasLogValue(maxAlias) == AliasPrefix & maxAlias and
+    aliasLogValue(maxAlias).len == MaxAliasLogBytes
+
+let twoByteStraddle = repeat('a', MaxAliasBytes - 1) & "\u00e9"
+check "a two-byte rune at the cut is dropped whole, not half",
+  aliasLogValue(twoByteStraddle) == AliasPrefix & repeat('a', MaxAliasBytes - 1) and
+    aliasLogValue(twoByteStraddle).len == MaxAliasLogBytes - 1
+
+let fourByteStraddle = repeat('a', 254) & "\xF0\x9F\x98\x80"
+check "a four-byte rune at the cut is dropped whole, not half",
+  aliasLogValue(fourByteStraddle) == AliasPrefix & repeat('a', 254) and
+    aliasLogValue(fourByteStraddle).len == 259
+
+check "a limit of zero yields the empty string, not an exception",
+  cutUtf8("kori/fast", 0) == ""
 
 let longLine = parseJson(requestLogLine(
   "t", "leg-a", 400, 1, none(int), none(int), "", "alias_too_long", false,
   aliasLogValue(tooLongAlias)))
 check "a refused over-long alias still fits one log line",
-  longLine{"alias"} != nil and longLine{"alias"}.getStr().len == MaxAliasBytes
+  longLine{"alias"} != nil and longLine{"alias"}.getStr().len == MaxAliasLogBytes
 
 # ---------------------------------------------------------------------- CLI ---
 

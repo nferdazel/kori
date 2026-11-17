@@ -101,6 +101,11 @@ const
   ## that one request cannot widen a log line.
   MaxAliasBytes* = 256
 
+  ## The log carries the caller's string with its `kori/` prefix, so the budget
+  ## for a log value is the alias limit plus that prefix. A legal 256-byte name
+  ## has to survive whole, or its row stops matching its own `?alias=` filter.
+  MaxAliasLogBytes* = MaxAliasBytes + AliasPrefix.len
+
 type
   CliError* = object of CatchableError
   ConfigError* = object of CatchableError
@@ -1086,12 +1091,26 @@ proc aliasTooLong*(alias: string): bool =
   ## the walk, the log line at full length, or the response body.
   alias.len > MaxAliasBytes
 
+proc cutUtf8*(value: string, limit: int): string =
+  ## A byte cut can land inside a multi-byte rune, and jsonEscape passes every
+  ## byte >= 0x20 through raw, so half a rune would make the log line invalid
+  ## UTF-8. Back off to the start of that rune instead. A rune longer than the
+  ## limit cannot happen in UTF-8 (four bytes at most), but the loop still ends
+  ## at 0 and yields the empty string rather than reading out of bounds.
+  if limit <= 0: return ""
+  if limit >= value.len: return value
+  var stop = limit
+  while stop > 0 and (ord(value[stop]) and 0b1100_0000) == 0b1000_0000:
+    dec stop
+  result = value[0 ..< stop]
+
 proc aliasLogValue*(alias: string): string =
-  ## The caller's own string, prefix included, cut to MaxAliasBytes. A name that
-  ## was refused for length still says which request it was without carrying the
-  ## rest of a 33 MB body into the log.
-  let value = AliasPrefix & alias
-  if value.len > MaxAliasBytes: value[0 ..< MaxAliasBytes] else: value
+  ## The caller's own string, prefix included, so the line says what was asked
+  ## for. A legal alias (at most MaxAliasBytes) survives whole, which is what
+  ## keeps its row matching an exact `?alias=` filter; a refused one is cut to
+  ## MaxAliasLogBytes on a rune boundary, so it still says which request it was
+  ## without carrying the rest of a 33 MB body into the log.
+  cutUtf8(AliasPrefix & alias, MaxAliasLogBytes)
 
 proc aliasTooLongBody*(): string =
   ## Fixed text: the offending name is never echoed back.
