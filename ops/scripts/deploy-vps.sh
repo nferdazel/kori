@@ -41,11 +41,16 @@ HEALTH_GATE_SECONDS="${KORI_HEALTH_GATE_SECONDS:-60}"
 # The edge block backup is a copy of the rendered block, so it carries the edge token. A run that
 # dies between the backup and the restart would leave it behind in caddy/; the exit trap removes
 # it. The restore path moves the backup back, so by then there is nothing left to delete.
+# The staged quadlet unit is a plain temp copy and goes with it. The `.bak-*` unit backups are
+# NOT removed here: they record what the host ran before, and the restore path reads them, so a
+# run that dies still leaves the previous unit on disk.
 CADDY_BAK=""
-cleanup_edge_backup() {
+UNIT_STAGE=""
+cleanup_temps() {
   if [ -n "${CADDY_BAK:-}" ] && [ -f "$CADDY_BAK" ]; then rm -f "$CADDY_BAK"; fi
+  if [ -n "${UNIT_STAGE:-}" ] && [ -f "$UNIT_STAGE" ]; then rm -f "$UNIT_STAGE"; fi
 }
-trap cleanup_edge_backup EXIT
+trap cleanup_temps EXIT
 
 # ── 1. Ref guard, fail-closed, and the first thing that runs ─────────────────
 # Only refs/heads/main deploys. An empty or unexpected $REF exits 0 (ignore), never falls
@@ -166,6 +171,26 @@ restart_service() {
     || log "WARN: restart of $SERVICE returned non-zero; health gate decides"
 }
 
+# A quadlet unit systemd will not load is worse than an old one: the service is gone and nothing
+# says so until a request fails. After the daemon-reload that turns the file into a unit, ask
+# systemd what it thinks; anything but `loaded` is a failed render and must not be restarted into.
+# UNTESTED on this laptop: it needs systemd + quadlet, which macOS does not have.
+unit_renders() {
+  systemctl --user daemon-reload || true
+  local state
+  state="$(systemctl --user show -p LoadState --value "$SERVICE" 2>/dev/null || true)"
+  if [ "$state" != "loaded" ]; then
+    log "ERROR: $SERVICE does not render: LoadState='${state:-<empty>}' after daemon-reload"
+    return 1
+  fi
+  if [ "${PODMAN_STOP_TIMEOUT_OK:-0}" = "1" ]; then
+    if ! systemctl --user cat "$SERVICE" 2>/dev/null | grep -q 'stop-timeout'; then
+      log "WARN: $SERVICE renders but its unit text carries no stop-timeout; StopTimeout=15 may not have been honoured"
+    fi
+  fi
+  return 0
+}
+
 # smoke.sh is part of the release gate, not a suggestion: a container that answers /admin/state
 # while its request log is unparseable, or that listens on a non-loopback address, is not a
 # deploy. Its output goes to its own log so a failed run is readable afterwards.
@@ -189,7 +214,7 @@ run_smoke() {
 # replaces it. Aborts before anything is pulled, tagged or restarted.
 UNIT_SRC="$MONO_DIR/ops/systemd/${SERVICE}.container"
 [ -f "$UNIT_SRC" ] || die "quadlet unit missing: $UNIT_SRC — deploy aborted, unit on the host untouched"
-for key in NoNewPrivileges=true DropCapability=ALL ReadOnly=true; do
+for key in NoNewPrivileges=true DropCapability=ALL ReadOnly=true TimeoutStopSec=25; do
   k="${key%%=*}"; v="${key#*=}"
   grep -qEi "^[[:space:]]*${k}[[:space:]]*=[[:space:]]*${v}[[:space:]]*$" "$UNIT_SRC" \
     || die "quadlet hardening gate failed: $UNIT_SRC lacks ${key} — deploy aborted, unit on the host untouched"
@@ -211,7 +236,46 @@ grep -qE "^[[:space:]]*Volume=[^:]+:/etc/kori:rw,Z[[:space:]]*$" "$UNIT_SRC" \
 if grep -qE "^[[:space:]]*Volume=.*config\.json:/etc/kori/config\.json" "$UNIT_SRC"; then
   die "quadlet mounts config.json as a single file; OAuth rotation cannot persist — deploy aborted, unit on the host untouched"
 fi
-log "==> quadlet hardening gate passed (NoNewPrivileges, DropCapability=ALL, ReadOnly, config dir rw)"
+log "==> quadlet hardening gate passed (NoNewPrivileges, DropCapability=ALL, ReadOnly, TimeoutStopSec=25, config dir rw)"
+
+# ── 4a. Stage the unit: the podman stop window goes in only where it is honoured ─
+# Quadlet understands `StopTimeout=` in [Container] from podman 4.4. An older podman drops the
+# key without a word, so the container would keep the 10s default and the 25s outer ring would be
+# the only guard. Read the version first; empty or unparseable is "not supported", never a guess.
+PODMAN_STOP_TIMEOUT_OK=0
+PODMAN_VERSION="$(podman --version 2>/dev/null || true)"
+PODMAN_SEMVER="$(printf '%s' "$PODMAN_VERSION" \
+  | sed -n 's/.*version[[:space:]][[:space:]]*\([0-9][0-9]*\)\.\([0-9][0-9]*\).*/\1.\2/p' | head -1)"
+case "$PODMAN_SEMVER" in
+  [0-9]*.[0-9]*) ;;
+  *) PODMAN_SEMVER="" ;;
+esac
+if [ -n "$PODMAN_SEMVER" ]; then
+  PODMAN_MAJOR="${PODMAN_SEMVER%%.*}"
+  PODMAN_MINOR="${PODMAN_SEMVER#*.}"
+  if [ "$PODMAN_MAJOR" -gt 4 ] || { [ "$PODMAN_MAJOR" -eq 4 ] && [ "$PODMAN_MINOR" -ge 4 ]; }; then
+    PODMAN_STOP_TIMEOUT_OK=1
+  fi
+fi
+
+# One staging file for the whole run: the ops-only comparison, the install and the gate all read
+# it, so the key is inserted exactly once. 0600 from mktemp, outside the unit directory.
+stage_unit() {
+  UNIT_STAGE="$(umask 077; mktemp "${TMPDIR:-/tmp}/kori-unit.XXXXXX")" \
+    || die "could not create a staging file for the quadlet unit"
+  if [ "${PODMAN_STOP_TIMEOUT_OK:-0}" = "1" ]; then
+    # The key belongs at the end of [Container], so it is emitted just before [Service].
+    awk '/^\[Service\]$/ && !done { print "StopTimeout=15"; done = 1 } { print }' "$UNIT_SRC" >"$UNIT_STAGE" \
+      || die "could not stage $UNIT_SRC"
+    grep -qx 'StopTimeout=15' "$UNIT_STAGE" \
+      || die "staged unit is missing StopTimeout=15 — deploy aborted, unit on the host untouched"
+    log "==> staged quadlet unit with StopTimeout=15 (podman $PODMAN_SEMVER)"
+  else
+    cp -f "$UNIT_SRC" "$UNIT_STAGE" || die "could not stage $UNIT_SRC"
+    log "WARN: podman ${PODMAN_SEMVER:-unknown} predates quadlet StopTimeout (needs >= 4.4); the container keeps podman's default 10s stop window and the 25s outer ring is the only guard"
+  fi
+}
+stage_unit
 
 # ── 4b. Ops-only commit: the unit is the whole payload ─────────────────────
 # No image is pulled here, so .deployed_rev keeps the running image's revision. Install the unit
@@ -220,7 +284,7 @@ log "==> quadlet hardening gate passed (NoNewPrivileges, DropCapability=ALL, Rea
 if [ "$OPS_ONLY" = "1" ]; then
   mkdir -p "$UNIT_DIR"
   UNIT_LIVE="$UNIT_DIR/${SERVICE}.container"
-  if cmp -s "$UNIT_SRC" "$UNIT_LIVE"; then
+  if cmp -s "$UNIT_STAGE" "$UNIT_LIVE"; then
     log "==> ops-only commit $REV: live unit already matches, nothing to deploy or restart"
     exit 0
   fi
@@ -229,8 +293,8 @@ if [ "$OPS_ONLY" = "1" ]; then
     UNIT_BAK="$UNIT_LIVE.bak-$(date '+%Y%m%d-%H%M%S')"
     cp -p "$UNIT_LIVE" "$UNIT_BAK" || die "could not back up $UNIT_LIVE — unit untouched"
   fi
-  install -m 0600 "$UNIT_SRC" "$UNIT_LIVE.new.$$" && mv -f "$UNIT_LIVE.new.$$" "$UNIT_LIVE" \
-    || die "could not install $UNIT_SRC"
+  install -m 0600 "$UNIT_STAGE" "$UNIT_LIVE.new.$$" && mv -f "$UNIT_LIVE.new.$$" "$UNIT_LIVE" \
+    || die "could not install $UNIT_STAGE"
   log "==> ops-only commit $REV: quadlet unit updated (backup ${UNIT_BAK:-none}), restarting $SERVICE"
   restart_service || true
   if wait_healthy; then
@@ -393,10 +457,25 @@ if [ "$IMAGE_PULLED" != "1" ]; then
 fi
 
 # ── 6. Unit + edge block from the repo (host is not the source of truth) ─────
+# A unit that did not change is not rewritten and not backed up: rewriting it would restart the
+# service for nothing, and a `.bak-*` per deploy is noise in the unit directory.
 mkdir -p "$UNIT_DIR"
-install -m 0600 "$UNIT_SRC" "$UNIT_DIR/${SERVICE}.container.new.$$" \
-  && mv -f "$UNIT_DIR/${SERVICE}.container.new.$$" "$UNIT_DIR/${SERVICE}.container" \
-  || die "could not install $UNIT_SRC"
+UNIT_LIVE="$UNIT_DIR/${SERVICE}.container"
+UNIT_BAK=""
+UNIT_CHANGED=0
+if cmp -s "$UNIT_STAGE" "$UNIT_LIVE"; then
+  log "==> quadlet unit unchanged, not reinstalling"
+else
+  if [ -f "$UNIT_LIVE" ]; then
+    UNIT_BAK="$UNIT_LIVE.bak-$(date '+%Y%m%d-%H%M%S')"
+    cp -p "$UNIT_LIVE" "$UNIT_BAK" || die "could not back up $UNIT_LIVE — unit untouched"
+  fi
+  install -m 0600 "$UNIT_STAGE" "$UNIT_LIVE.new.$$" \
+    && mv -f "$UNIT_LIVE.new.$$" "$UNIT_LIVE" \
+    || die "could not install $UNIT_STAGE"
+  UNIT_CHANGED=1
+  log "==> quadlet unit updated (backup ${UNIT_BAK:-none})"
+fi
 
 if [ -n "${KORI_EDGE_TOKEN:-}" ]; then
   RENDERED="$APP_DIR/caddy/site.caddy"
@@ -488,6 +567,14 @@ if [ -n "${KORI_EDGE_TOKEN:-}" ]; then
 fi
 
 # ── 7. Restart + health gate + smoke, with automatic rollback ───────────────
+# A unit that does not render is never restarted into: systemd would drop the service and the old
+# container would keep serving, which is the better of the two failures. Nothing was pulled or
+# tagged back yet, so the running container is still the previous revision.
+if [ "$UNIT_CHANGED" = "1" ] && ! unit_renders; then
+  GATE_OK=0
+  log "ERROR: the new quadlet unit does not render; not restarting — the running container keeps serving ${PREV_DEPLOYED:-the previous revision}"
+  exit 1
+fi
 restart_service
 GATE_OK=1
 if ! wait_healthy; then
@@ -499,16 +586,38 @@ elif ! run_smoke; then
 fi
 if [ "$GATE_OK" != "1" ]; then
   log "ERROR: rolling back to :prev"
+  ROLLBACK_OK=0
   if podman image exists "${IMAGE}:prev"; then
     podman tag "${IMAGE}:prev" "${IMAGE}:local"
     restart_service
     if wait_healthy; then
-      log "==> rollback to :prev healthy; deploy of $REV REJECTED"
+      ROLLBACK_OK=1
+      log "==> rollback to :prev healthy (image only); deploy of $REV REJECTED"
     else
-      log "ERROR: rollback also unhealthy — service is down, human needed"
+      log "ERROR: the :prev image is not healthy either"
     fi
   else
     log "ERROR: no :prev image to roll back to"
+  fi
+  if [ "$ROLLBACK_OK" != "1" ]; then
+    # The unit moved as well, so an image-only rollback can leave a unit the previous binary
+    # cannot run under. Put the previous unit back and say which outcome this run reached.
+    if [ -n "$UNIT_BAK" ] && [ -f "$UNIT_BAK" ]; then
+      install -m 0600 "$UNIT_BAK" "$UNIT_LIVE" \
+        && log "==> previous quadlet unit restored from $(basename "$UNIT_BAK")" \
+        || log "ERROR: could not restore $(basename "$UNIT_BAK") over $UNIT_LIVE — human needed"
+      restart_service
+      if wait_healthy; then
+        ROLLBACK_OK=1
+        log "==> rollback healthy with the previous unit and the :prev image; deploy of $REV REJECTED"
+      else
+        log "ERROR: rollback failed with the previous unit as well — service is down, human needed"
+      fi
+    elif [ "$UNIT_CHANGED" = "1" ]; then
+      log "WARN: the unit changed this run and no backup was taken — the new unit stays installed"
+    else
+      log "==> the unit did not change this run, so there is nothing to restore"
+    fi
   fi
   exit 1
 fi

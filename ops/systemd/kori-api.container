@@ -27,6 +27,11 @@
 #     failure this host already paid for once.
 #   - No `Network=qouver`: kori talks to upstream providers and has no database, so it does not
 #     need to see the app network.
+#   - Split stop budget, outer ring wider than inner: the binary drains in-flight requests for at
+#     most 5s (ShutdownDrainMs), podman gives the container 15s (StopTimeout=15, inserted into
+#     [Container] by deploy-vps.sh because quadlet only honours that key from podman 4.4), and
+#     systemd gives the unit 25s (TimeoutStopSec). A normal stop ends at the innermost ring, so a
+#     stop that ever reaches a kill is the bug the drain exists to prevent.
 
 [Unit]
 OnFailure=alert@%N.service
@@ -61,6 +66,12 @@ Restart=always
 # Exit 2 is "bad config" — a permanent condition; restarting just repeats it and hides the cause.
 RestartPreventExitStatus=2
 RestartSec=3
+# Split stop budget, outer to inner: 25s here > podman's StopTimeout=15 > the binary's own 5s
+# drain. Each ring is wider than the one it wraps, so a healthy stop finishes inside the drain.
+TimeoutStopSec=25
+# The 143 success-exit-status override is deliberately NOT used: podman's SIGKILL surfaces as
+# 137, and 137 has to keep failing the unit so OnFailure=alert@%N.service still fires. A stop
+# that needed a kill is a bug in the drain, not a normal stop.
 PrivateTmp=true
 # Leak guard, not a measurement. A gateway with one upstream per request should sit in the
 # tens of MB; 512M means a leak or an unbounded buffer.
