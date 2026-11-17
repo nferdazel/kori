@@ -89,6 +89,12 @@ const
   TokenRefreshFailed* = "credential_refresh_failed"
   TokenRefreshTimeout* = "refresh_timeout"
 
+  # Item 2. `kori/<alias>` is a gateway name, never a provider id, and the two
+  # reasons an alias request can carry are its own.
+  AliasPrefix* = "kori/"
+  TokenAliasUnmapped* = "alias_unmapped"
+  TokenUnknownAlias* = "unknown_alias"
+
 type
   CliError* = object of CatchableError
   ConfigError* = object of CatchableError
@@ -119,6 +125,8 @@ type
     weight*: int
     oauth*: Oauth
     hasOauth*: bool
+    enabled*: bool             ## false only when the config says so: skipped, never dialled
+    aliases*: Table[string, string]  ## `kori/<alias>` -> this leg's provider id
 
   Config* = object
     listenHost*: string
@@ -422,6 +430,25 @@ proc loadConfig*(path: string): Config =
       # no defined split (TAKEOVER-plan-team-c §5).
       if leg.weight != 1:
         failConfig(ctx & ".weight must be 1 in v1; the weighted split is not built")
+    # Item 2. A leg can be switched off without leaving the chain, so the order the
+    # operator wrote stays the order the walk uses.
+    leg.enabled = true
+    let enabledNode = item{"enabled"}
+    if enabledNode != nil and enabledNode.kind != JNull:
+      if enabledNode.kind != JBool:
+        failConfig(ctx & ".enabled must be true or false")
+      leg.enabled = enabledNode.getBool()
+    # Item 2. The alias table is per leg: one caller name, one provider id per leg.
+    let aliasesNode = item{"aliases"}
+    if aliasesNode != nil and aliasesNode.kind != JNull:
+      if aliasesNode.kind != JObject:
+        failConfig(ctx & ".aliases must be an object")
+      for alias, value in aliasesNode:
+        if alias.len == 0:
+          failConfig(ctx & ".aliases has an empty alias name")
+        if value.kind != JString or value.getStr().len == 0:
+          failConfig(ctx & ".aliases." & alias & " must be a non-empty string")
+        leg.aliases[alias] = value.getStr()
     # SPEC §4. A leg with no `oauth` block behaves exactly as it did before: one
     # static bearer from api_key.
     let oauth = item{"oauth"}
@@ -582,7 +609,10 @@ proc newGateway*(cfg: Config, log: RequestLog,
 proc legAvailable*(gateway: Gateway, index: int, now: float): bool =
   ## A cooling leg is skipped without a dial. Once the cooldown expires the leg
   ## is eligible again, and the first request that picks it is the half-open
-  ## probe (§3.2): a second failure starts a fresh full cooldown.
+  ## probe (§3.2): a second failure starts a fresh full cooldown. A leg the config
+  ## switched off is never available, and it keeps its place in the order.
+  if not gateway.cfg.legs[index].enabled:
+    return false
   let runtime = gateway.legs[index]
   if runtime.coolingUntil <= 0:
     return true
@@ -668,9 +698,12 @@ proc markServed*(gateway: Gateway, index: int, latencyMs: int) =
 proc markAttempted*(gateway: Gateway, index: int) =
   gateway.legs[index].attempted = true
 
-proc legStateName*(runtime: LegRuntime, now: float): string =
-  ## D7: `dead` is not a router state, and `unknown` is a fresh start.
-  if runtime.coolingUntil > now:
+proc legStateName*(runtime: LegRuntime, now: float, enabled = true): string =
+  ## D7: `dead` is not a router state, and `unknown` is a fresh start. A leg the
+  ## config switched off reads as `skipped`: still in the chain, never dialled.
+  if not enabled:
+    "skipped"
+  elif runtime.coolingUntil > now:
     "cooling"
   elif runtime.attempted:
     "ok"
@@ -1001,6 +1034,40 @@ proc rewriteModel*(body, model: string): string =
   if lastIdx < body.len:
     res.add body[lastIdx .. ^1]
   res
+
+proc requestModel*(body: string): string =
+  ## The caller's top-level `model` string, or "" when the body has none. A parse,
+  ## not a rewrite: nothing here has to keep the caller's bytes.
+  try:
+    let node = parseJson(body)
+    if node.kind == JObject:
+      let model = node{"model"}
+      if model != nil and model.kind == JString:
+        return model.getStr()
+  except CatchableError:
+    discard
+  ""
+
+proc aliasOf*(model: string): Option[string] =
+  ## `kori/<alias>` names a gateway alias; any other name is a provider id that is
+  ## forwarded as it always was.
+  if model.startsWith(AliasPrefix):
+    some(model[AliasPrefix.len .. ^1])
+  else:
+    none(string)
+
+proc aliasModel*(leg: Leg, alias: string): Option[string] =
+  ## The provider id this leg sends for an alias. `none` means the leg has no
+  ## mapping for that name and is skipped for that request, never cooled.
+  if leg.aliases.hasKey(alias):
+    some(leg.aliases[alias])
+  else:
+    none(string)
+
+proc unknownAliasBody*(alias: string): string =
+  ## A client error with a body that says what the caller can fix.
+  "{\"error\":{\"type\":\"unknown_alias\",\"message\":" &
+    jsonEscape("no leg maps the model alias '" & alias & "'") & "}}"
 
 proc wantsStream*(body: string): bool =
   try:
@@ -1700,6 +1767,10 @@ proc handleChat(gateway: Gateway, request: Request): Future[void] {.async.} =
   let stream = wantsStream(callerBody)
   let forwardBody = if stream: injectIncludeUsage(callerBody) else: callerBody
 
+  # Item 2: a `kori/<alias>` model is a gateway name resolved per leg, so one
+  # caller name can reach providers that do not share model ids.
+  let alias = aliasOf(requestModel(callerBody))
+
   var chain = Chain()
   var status = 502
   var route = ""
@@ -1709,6 +1780,20 @@ proc handleChat(gateway: Gateway, request: Request): Future[void] {.async.} =
   var answered = false
   var hardStop = ""
   var hardStopDetail = ""
+
+  var aliasKnown = false
+  if alias.isSome:
+    for leg in gateway.cfg.legs:
+      if leg.aliases.hasKey(alias.get):
+        aliasKnown = true
+        break
+  if alias.isSome and not aliasKnown:
+    # No leg in the config maps this name: a client error with a body that says
+    # so, not a 500 and not a walk that ends in an all-legs-failed 502.
+    await request.sendErrorBody(400, unknownAliasBody(alias.get))
+    status = 400
+    answered = true
+    chain.firstReason = TokenUnknownAlias
 
   let order = gateway.pickOrder()
   if order.len == 0:
@@ -1720,6 +1805,18 @@ proc handleChat(gateway: Gateway, request: Request): Future[void] {.async.} =
   if not answered:
     for position, index in order:
       let leg = gateway.cfg.legs[index]
+      # Item 2: a leg with no mapping for this alias is skipped. No dial, no
+      # cooldown, no half-open probe, and the reason the log carries names it.
+      if alias.isSome and not leg.aliases.hasKey(alias.get):
+        chain.lastReason = TokenAliasUnmapped
+        if chain.firstReason.len == 0:
+          chain.firstReason = TokenAliasUnmapped
+          chain.firstFrom = leg.name
+          chain.availability = true
+        if position + 1 < order.len:
+          gateway.recordEvent(leg.name, gateway.cfg.legs[order[position + 1]].name,
+                              TokenAliasUnmapped)
+        continue
       # §4: a credential that cannot be refreshed stops the request here. Nothing
       # is dialled, nothing is failed over, no stale bearer leaves the process.
       if leg.hasOauth:
@@ -1734,9 +1831,13 @@ proc handleChat(gateway: Gateway, request: Request): Future[void] {.async.} =
         gateway.legs[index].probeInFlight = true
       gateway.markAttempted(index)
       route = leg.name
-      # DEC-10: a leg that names a model gets that id, and only that leg does.
-      let legBody = if leg.hasModel: rewriteModel(forwardBody, leg.model)
-                    else: forwardBody
+      # DEC-10: a leg that names a model gets that id, and only that leg does. An
+      # alias request resolves per leg instead: a leg's static `model` does not
+      # stand in for a missing alias mapping, it is only the non-alias default.
+      let legBody =
+        if alias.isSome: rewriteModel(forwardBody, leg.aliases[alias.get])
+        elif leg.hasModel: rewriteModel(forwardBody, leg.model)
+        else: forwardBody
       var outcome = await gateway.attemptLeg(request, leg,
                                              gateway.bearerFor(index), legBody,
                                              stream, totalDeadline)
@@ -2119,7 +2220,7 @@ proc stateJson*(gateway: Gateway): string =
     route["name"] = %leg.name
     route["role"] = %($leg.role)
     route["model"] = %leg.model
-    route["state"] = %legStateName(runtime, now)
+    route["state"] = %legStateName(runtime, now, leg.enabled)
     if runtime.coolingUntil > now:
       route["cooling_until"] = %stampAt(runtime.coolingUntil)
     else:
@@ -2203,6 +2304,11 @@ proc configJson*(gateway: Gateway): string =
     node["weight"] = %leg.weight
     node["base_url"] = %redactUrl(leg.baseUrl)
     node["model"] = %leg.model
+    node["enabled"] = %leg.enabled
+    var aliases = newJObject()
+    for alias, providerId in leg.aliases:
+      aliases[alias] = %providerId
+    node["aliases"] = aliases
     var headers = newJArray()
     for (headerName, _) in leg.headers:
       headers.add(%headerName)

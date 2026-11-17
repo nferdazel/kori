@@ -264,7 +264,7 @@ proc makeGateway(legs: seq[Leg], balance: bool): Gateway =
 
 proc legSpec(name: string, role: LegRole): Leg =
   Leg(name: name, baseUrl: "http://127.0.0.1:1/v1", model: name, role: role,
-      weight: 1)
+      weight: 1, enabled: true)
 
 block:
   let gateway = makeGateway(@[legSpec("a", lrPrimary), legSpec("b", lrPrimary),
@@ -455,6 +455,74 @@ block:
   check "an embedded body is not empty", table["/index.html"].body.len > 0
   check "no path in the table is a directory or a traversal",
     table.keys().toSeq().allIt(it.startsWith("/") and not it.contains(".."))
+
+# --------------------------------------------------------- alias and enabled ---
+
+block:
+  let path = writeConfig("alias.json", """
+{"legs":[
+ {"name":"leg-a","base_url":"http://127.0.0.1:1/v1","model":"prov-a",
+  "aliases":{"fast":"prov-a-fast","deep":"prov-a-deep"}},
+ {"name":"leg-b","base_url":"http://127.0.0.1:2/v1","enabled":false,
+  "aliases":{"fast":"prov-b-fast"}}]}
+""")
+  let cfg = loadConfig(path)
+  check "a leg is enabled unless the config says otherwise", cfg.legs[0].enabled
+  check "enabled false is read", not cfg.legs[1].enabled
+  check "aliases are read per leg", cfg.legs[0].aliases["fast"] == "prov-a-fast"
+  check "a leg's alias table is only its own", not cfg.legs[1].aliases.hasKey("deep")
+
+checkRaises "a non-boolean enabled is rejected", ConfigError:
+  discard loadConfig(writeConfig("bad-enabled.json", """
+{"legs":[{"name":"a","base_url":"http://127.0.0.1:1/v1","enabled":"yes"}]}
+"""))
+
+checkRaises "a non-object aliases is rejected", ConfigError:
+  discard loadConfig(writeConfig("bad-aliases.json", """
+{"legs":[{"name":"a","base_url":"http://127.0.0.1:1/v1","aliases":["fast"]}]}
+"""))
+
+checkRaises "an empty alias target is rejected", ConfigError:
+  discard loadConfig(writeConfig("bad-alias-value.json", """
+{"legs":[{"name":"a","base_url":"http://127.0.0.1:1/v1","aliases":{"fast":""}}]}
+"""))
+
+check "kori/<alias> names an alias", aliasOf("kori/fast") == some("fast")
+check "a provider id is not an alias", aliasOf("flash").isNone
+check "an alias may carry a slash", aliasOf("kori/fast/mini") == some("fast/mini")
+check "an empty alias name is still an alias", aliasOf("kori/") == some("")
+check "requestModel reads the caller's top-level model",
+  requestModel(StreamRequest) == "flash"
+check "requestModel is empty when the body has none",
+  requestModel("""{"messages":[]}""") == ""
+check "requestModel survives a body that is not JSON", requestModel("not json") == ""
+
+block:
+  let cfg = loadConfig(writeConfig("alias-map.json", """
+{"legs":[
+ {"name":"leg-a","base_url":"http://127.0.0.1:1/v1","aliases":{"fast":"prov-a-fast"}},
+ {"name":"leg-b","base_url":"http://127.0.0.1:2/v1","aliases":{"deep":"prov-b-deep"}}]}
+"""))
+  check "a leg resolves the alias it maps",
+    aliasModel(cfg.legs[0], "fast") == some("prov-a-fast")
+  check "a leg with no mapping resolves to none",
+    aliasModel(cfg.legs[0], "deep").isNone
+  check "the unknown-alias body names the alias and the type",
+    unknownAliasBody("nope").contains("\"type\":\"unknown_alias\"") and
+      unknownAliasBody("nope").contains("nope")
+
+block:
+  var a = legSpec("a", lrPrimary)
+  var b = legSpec("b", lrPrimary)
+  b.enabled = false
+  let gateway = makeGateway(@[a, b], balance = false)
+  check "a disabled leg is never available", not gateway.legAvailable(1, epochTime())
+  check "a disabled leg is skipped without changing the order",
+    gateway.pickOrder() == @[0]
+  check "a disabled leg reads as skipped",
+    legStateName(gateway.legs[1], epochTime(), b.enabled) == "skipped"
+  check "an enabled leg keeps its own state",
+    legStateName(gateway.legs[0], epochTime(), a.enabled) == "unknown"
 
 # --------------------------------------------------------------------- report ---
 
