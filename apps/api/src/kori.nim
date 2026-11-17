@@ -2048,8 +2048,9 @@ proc parseRfc3339*(value: string): Option[float] =
     result = none(float)
 
 proc buildLogRow*(node: JsonNode): JsonNode =
-  ## Exactly the nine keys of SPEC §5.1, in that order. Anything else a line
-  ## carries is dropped, so the page cannot widen the row by accident.
+  ## Exactly the ten keys of SPEC §5.1, in that order. `alias` is last and is
+  ## only there when the line carries one. Anything else a line carries is
+  ## dropped, so the page cannot widen the row by accident.
   result = newJObject()
   for key in LogRowKeys:
     let value = node{key}

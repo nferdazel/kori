@@ -98,7 +98,7 @@ fallback already handles.
 
 ---
 
-## DEC-6 — The request log is append-only, one line, nine keys
+## DEC-6 — The request log is append-only, one line, ten keys
 
 **Status:** accepted.
 
@@ -107,7 +107,10 @@ which route". That claim is only as strong as the log behind it.
 
 **Decision.** One line per request, appended with a single write, never rewritten and never
 rotated in v1. The keys are fixed and ordered: `ts`, `route`, `status`, `latency_ms`,
-`tokens_in`, `tokens_out`, `failover_from`, `failover_reason`, `stream`.
+`tokens_in`, `tokens_out`, `failover_from`, `failover_reason`, `stream`, and `alias` last.
+`alias` is there only when the caller named a `kori/<alias>`: a request that named a provider
+id has no such key at all, not an empty one, so the page shows the absence instead of
+inventing a value.
 
 **Consequences.** A month-over-month comparison is repeatable, and a later reader can
 re-check the failover count without asking anyone. Redaction is structural: the writer takes
