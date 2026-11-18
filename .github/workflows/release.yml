@@ -1,3 +1,4 @@
+# class: B
 name: Release
 
 # A tag is what makes a version a release, and this workflow is the only thing that

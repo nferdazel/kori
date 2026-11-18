@@ -1,3 +1,4 @@
+# class: A
 name: CI
 
 # Build in GitHub, pull on the host. image-api builds the container on every PR and pushes
