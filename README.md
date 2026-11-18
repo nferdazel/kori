@@ -404,7 +404,7 @@ record of a running host.
 
 ## Documentation
 
-Two documents, both under `docs/`:
+Two documents, both under `docs/`, indexed at [`docs/README.md`](docs/README.md):
 
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md): the request path, leg state and module boundaries.
 - [`docs/DECISIONS.md`](docs/DECISIONS.md): the decision records this README refers to, including DEC-10.
