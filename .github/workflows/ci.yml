@@ -35,10 +35,8 @@ env:
 jobs:
 
   # Golden CI/CD contract: the same rules the server repo enforces, run here so drift fails
-  # this repo's own build instead of waiting for a manual audit. The script is qouver's
-  # ops/scripts/contract-check.sh with one data entry added to its repo_exempt table: kori's
-  # dashboard is embedded in the api binary, so the C3 quadlet rule cannot apply. Port any other
-  # fix back to qouver and copy it out again.
+  # this repo's own build instead of waiting for a manual audit. The script is a byte-identical
+  # copy of the server repo's ops/scripts/contract-check.sh; fix it there and copy it out again.
   contract:
     name: "Contract: golden CI/CD rules"
     runs-on: ubuntu-24.04
