@@ -11,6 +11,8 @@ this one, is the answer to "what is live".
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-18
+
 ### Added
 
 - `SIGHUP` reloads the config without a restart: legs, keys, models, aliases, efforts, `prices`,
