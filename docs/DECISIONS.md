@@ -54,7 +54,7 @@ deployed independently of the gateway.
 end-to-end case.
 
 **Decision.** The harness lives at `acceptance/`, with `selftest.sh` as the fast gate and
-`run-all.sh` as the ten end-to-end cases. Both are driven by `KORI_BIN` and nothing else.
+`run-all.sh` as the end-to-end cases. Both are driven by `KORI_BIN` and nothing else.
 CI builds a release binary and runs `run-all.sh`; `./task nim` runs `selftest.sh`.
 
 **Consequences.** A clone can prove the router without reading a report. The harness is
@@ -122,6 +122,14 @@ this log already described with nine keys, and adding a null to every line would
 every earlier row a special case. A clamp is recorded against the leg that answered, so a
 clamp on a leg that then failed is replaced by whatever the next leg decided.
 
+**Amendment, 2026-11-18.** No key was added: the retry, key-pool and
+`caller_fault` work of 0.6.2 all fit the eleven keys. A retry is a second dial on the
+same route, so it is not a failover and writes nothing new; a key rotation is likewise
+invisible in the line, because the log may say which route answered and never which
+credential did. A caller that hangs up after the first byte is named in
+`failover_reason` as `caller_fault` instead of `mid_stream_abort`, because the leg was
+healthy and a push of abandoned requests must not read as a provider going bad.
+
 **Consequences.** A month-over-month comparison is repeatable, and a later reader can
 re-check the failover count without asking anyone. Redaction is structural: the writer takes
 no header, body or credential parameter, so there is nothing for a later pass to strip.
@@ -151,7 +159,8 @@ place wording and runtime disagree, and it is deliberate.
 
 ## DEC-8 — One weight, refused otherwise
 
-**Status:** accepted.
+**Status:** superseded on 2026-11-18 by DEC-11. Left in place because a superseded
+decision is recorded, not edited away.
 
 **Context.** Weighted splitting across primaries is a feature with a real cost: the split has
 to be defined, observable and testable.
@@ -211,3 +220,104 @@ with a static `model` still cannot serve a per-request provider id: the config d
 a leg sends, not the caller. That is consistent with a fixed chain and it is visible in the
 config, but a wider need for caller-side model selection is a new decision, not a config
 flag.
+
+## DEC-11 — A weight is a small integer, and the split is smooth weighted round-robin
+
+**Status:** accepted 2026-11-18. Supersedes DEC-8, which refused every weight but 1.
+
+**Context.** DEC-8 refused a weighted split because an unhonoured weight is a lie in a
+config file. The cost of that refusal was one honest line in the comparison table: kori
+cannot balance. The split itself is 40 lines, and the reason to refuse it was never the
+size, it was that an undefined split is worse than none. So the decision changes with the
+rounding defined, not with the workload.
+
+**Decision.** `legs[].weight` is an integer from 1 to 1000 (`MaxWeight`). Zero, a negative
+number and anything above the ceiling are refused at startup with the leg and the value
+named, because a zero weight would silently remove a leg from the split. With `balance:
+true`, the pick is nginx's smooth weighted round-robin over the available primaries: each
+turn a candidate gains its weight, the largest current wins, and the winner pays the total
+back. Equal weights degenerate to plain round-robin, so a config that never names a weight
+behaves exactly as it did. A cooling leg leaves the pool, so its share is redistributed
+rather than silently halved onto nobody. `balance: false` keeps strict config order and the
+weight is then inert, which the README says in one line instead of leaving it to be guessed.
+
+**Consequences.** A 3:1 config serves three requests on the heavy leg and one on the light
+one, repeatably, and the unit tests assert the exact 300:100 over 400 picks. The state is
+the per-leg `weightCurrent` credit, which lives in memory with the rest of the router state
+(DEC-5) and resets on restart. The cost is a per-request cursor and one arithmetic pass over
+the candidate pool; no lock, no allocation beyond one small seq, and no effect on a config
+that keeps weight at 1.
+
+---
+
+## DEC-12 — A retry is a dial on the same leg, and it is not a failover
+
+**Status:** accepted 2026-11-18.
+
+**Context.** kori's only retry was failover. One-second blip on a healthy provider was
+enough to mark the leg dead and start a 60 s cooldown, which turns a tiny provider hiccup
+into a minute of lost capacity on the leg that was about to work.
+
+**Decision.** `legs[].retries` is how many more dials that leg gets before the walk moves
+on. The default is 0, so no existing config changes behaviour. The pause doubles from 200 ms
+to a 2 s ceiling, plus up to a quarter of the pause as jitter so a fleet of callers does not
+resynchronise on one leg. Only the transport classes are retried: `conn_refused`,
+`dial_timeout`, `header_timeout`, `upstream_5xx`. A `401` rotates a key instead, and a quota
+`429`, a missing session, a dead model and any caller `4xx` are decided facts, so retrying
+them only spends time and the owner's quota.
+
+**Consequences.** A one-dial blip is absorbed without a failover event, a cooldown, or a
+second provider spending tokens. The log line is unchanged: the request never left the leg,
+so `failover_from` and `failover_reason` stay empty and the retry is visible only as the
+leg's dial count. The bound is per leg and per request, so the worst case added latency is
+the sum of the pauses, not a loop.
+
+---
+
+## DEC-13 — A dead key is a dead credential, not a dead leg
+
+**Status:** accepted 2026-11-18.
+
+**Context.** One key per leg means one revoked or capped key takes the whole leg out of the
+chain for a full cooldown, even when the provider would answer the same route with another
+key.
+
+**Decision.** `legs[].api_keys` is an ordered pool. `api_key` stays supported and is the
+pool of one when the pool is absent, so no config in use changes. On a `401` or a quota
+`429`, the key in use is cooled for its own cooldown (60 s, or 900 s for quota) and the next
+live entry is tried on the same leg before the leg is blamed. When every entry is cooling,
+the leg cannot be dialled and the walk moves on without a cooldown of its own. A pool with
+more than one entry and an `oauth` block are refused at startup: only one of them can be the
+bearer, and picking silently would hide a config mistake. `/admin/config` reports the pool
+size and how many entries are cooling, never a key. The request log carries no key and no
+key index: it says which route answered, not which credential paid.
+
+**Consequences.** A revoked key costs one dial, not the leg. The cost is that rotation is
+in memory and resets on restart, which is the same contract the rest of the router state
+keeps (DEC-5).
+
+---
+
+## DEC-14 — `/v1/models` is derived from the config, and `/healthz?deep` dials nothing
+
+**Status:** accepted 2026-11-18.
+
+**Context.** Every OpenAI-shaped SDK probes a model list before it will talk to a gateway, and kori
+served one path and no list, so a client either could not enumerate or had to be
+hand-configured. The same clients probe model health; both vendors do it by dialling the
+provider, which spends the owner's quota to answer a question the router already knows.
+
+**Decision.** `GET /v1/models` returns an OpenAI-shaped list built from the config alone: one entry
+per `kori/<alias>` (deduplicated across legs, because one caller name is one model) and one
+per leg model id the config names. No provider is dialled and no credential is read, so the
+endpoint answers on a fresh process with every leg dead. `GET /healthz?deep` is a variant of
+the existing health path, not a second path: each leg's state, cooling time, last success,
+last failure and window counters, read from router state with zero dials. Liveness stays
+`status: ok` in both answers, because a process answering at all is the liveness fact.
+
+**Consequences.** A client can enumerate what this door accepts, which was the only real
+blocker to a drop-in replacement. The cost: the list reflects the config, not what the
+provider will actually accept, so a config that names a model the provider has dropped keeps
+listing it until the operator fixes the config. That is visible in `/healthz?deep` the first
+time the leg answers `404 model_not_found`, which is classified as `model_gone` and fails
+over rather than being returned as a caller error.

@@ -188,9 +188,57 @@ checkRaises "a leg without base_url is rejected", ConfigError:
 checkRaises "an empty legs array is rejected", ConfigError:
   discard loadConfig(writeConfig("nolegs.json", """{"legs":[]}"""))
 
-checkRaises "a weight v1 cannot honour is rejected", ConfigError:
-  discard loadConfig(writeConfig("weight.json", """
-{"legs":[{"name":"a","base_url":"http://127.0.0.1:1/v1","weight":2}]}
+checkRaises "a weight of zero is rejected", ConfigError:
+  discard loadConfig(writeConfig("weight-zero.json", """
+{"legs":[{"name":"a","base_url":"http://127.0.0.1:1/v1","weight":0}]}
+"""))
+
+checkRaises "a weight above the ceiling is rejected", ConfigError:
+  discard loadConfig(writeConfig("weight-high.json", """
+{"legs":[{"name":"a","base_url":"http://127.0.0.1:1/v1","weight":1001}]}
+"""))
+
+let weighted = loadConfig(writeConfig("weight-ok.json", """
+{"legs":[{"name":"a","base_url":"http://127.0.0.1:1/v1","weight":3}]}
+"""))
+check "DEC-11: a weight above 1 is accepted and kept",
+  weighted.legs[0].weight == 3
+
+let retried = loadConfig(writeConfig("retries-ok.json", """
+{"legs":[{"name":"a","base_url":"http://127.0.0.1:1/v1","retries":2}]}
+"""))
+check "retries: a leg keeps the count it names", retried.legs[0].retries == 2
+
+check "retries: a leg that names none retries nothing",
+  loadConfig(writeConfig("retries-none.json", """
+{"legs":[{"name":"a","base_url":"http://127.0.0.1:1/v1"}]}
+""")).legs[0].retries == 0
+
+checkRaises "retries above the ceiling are rejected", ConfigError:
+  discard loadConfig(writeConfig("retries-high.json", """
+{"legs":[{"name":"a","base_url":"http://127.0.0.1:1/v1","retries":6}]}
+"""))
+
+let pooled = loadConfig(writeConfig("keys-ok.json", """
+{"legs":[{"name":"a","base_url":"http://127.0.0.1:1/v1","api_keys":["k1","k2"]}]}
+"""))
+check "key pool: the pool is read in order",
+  pooled.legs[0].apiKeys == @["k1", "k2"]
+
+check "key pool: a single api_key is a pool of one",
+  loadConfig(writeConfig("keys-one.json", """
+{"legs":[{"name":"a","base_url":"http://127.0.0.1:1/v1","api_key":"only"}]}
+""")).legs[0].apiKeys == @["only"]
+
+checkRaises "key pool: an empty api_keys is refused", ConfigError:
+  discard loadConfig(writeConfig("keys-empty.json", """
+{"legs":[{"name":"a","base_url":"http://127.0.0.1:1/v1","api_keys":[]}]}
+"""))
+
+checkRaises "key pool: a pool with an oauth block is refused", ConfigError:
+  discard loadConfig(writeConfig("keys-oauth.json", """
+{"legs":[{"name":"a","base_url":"http://127.0.0.1:1/v1","api_keys":["k1","k2"],
+"oauth":{"token_url":"https://example.test/token","client_id":"c","refresh_token":"r"}}]}
 """))
 
 block:
@@ -446,6 +494,15 @@ proc makeGateway(legs: seq[Leg], balance: bool): Gateway =
 proc legSpec(name: string, role: LegRole): Leg =
   Leg(name: name, baseUrl: "http://127.0.0.1:1/v1", model: name, role: role,
       weight: 1, enabled: true)
+
+proc weightedGateway(weights: seq[int]): Gateway =
+  var cfg = Config(listenHost: "127.0.0.1", listenPort: 4011,
+                   logPath: "/tmp/unused.jsonl", balance: true)
+  for position, weight in weights:
+    var leg = legSpec("leg-" & $position, lrPrimary)
+    leg.weight = weight
+    cfg.legs.add leg
+  newGateway(cfg, RequestLog(fd: -1), "127.0.0.1:4011")
 
 block:
   let gateway = makeGateway(@[legSpec("a", lrPrimary), legSpec("b", lrPrimary),
@@ -731,6 +788,155 @@ block:
     legStateName(gateway.legs[1], epochTime(), b.enabled) == "skipped"
   check "an enabled leg keeps its own state",
     legStateName(gateway.legs[0], epochTime(), a.enabled) == "unknown"
+
+block:
+  # DEC-11: a weight is honoured as a share over many picks. 3:1 over 400 picks is
+  # 300:100 by the nginx smooth algorithm, and equal weights degenerate to plain
+  # round-robin, so nothing about a single-weight config changed.
+  let gateway = weightedGateway(@[3, 1])
+  var counts = [0, 0]
+  for _ in 1 .. 400:
+    let order = gateway.pickOrder()
+    if order.len > 0:
+      inc counts[order[0]]
+  check "DEC-11: weights 3:1 split 300:100 over 400 picks",
+    counts[0] == 300 and counts[1] == 100
+
+block:
+  let equal = weightedGateway(@[1, 1])
+  var counts = [0, 0]
+  for _ in 1 .. 10:
+    let order = equal.pickOrder()
+    if order.len > 0:
+      inc counts[order[0]]
+  check "DEC-11: equal weights stay an even round-robin",
+    counts[0] == 5 and counts[1] == 5
+
+block:
+  # A cooling leg leaves the pool entirely, so the surviving weight takes every
+  # pick rather than the split silently shifting to a half.
+  let gateway = weightedGateway(@[3, 1])
+  gateway.startCooldown(1, "conn_refused")
+  var pickedB = 0
+  for _ in 1 .. 20:
+    let order = gateway.pickOrder()
+    if order.len > 0 and order[0] == 1:
+      inc pickedB
+  check "DEC-11: a cooling leg takes no share", pickedB == 0
+
+block:
+  # A weighted leg that is the only available fallback still enters the walk when
+  # no primary can serve.
+  var cfg = Config(listenHost: "127.0.0.1", listenPort: 4011,
+                   logPath: "/tmp/unused.jsonl", balance: true)
+  var primary = legSpec("a", lrPrimary)
+  var fallback = legSpec("f", lrFallback)
+  fallback.weight = 5
+  cfg.legs = @[primary, fallback]
+  let gateway = newGateway(cfg, RequestLog(fd: -1), "127.0.0.1:4011")
+  gateway.startCooldown(0, "conn_refused")
+  let order = gateway.pickOrder()
+  check "DEC-11: the fallback is picked when no primary can serve",
+    order.len == 1 and order[0] == 1
+
+block:
+  # The retry pause doubles and caps, and the jitter never pushes it past the cap
+  # plus a quarter of it.
+  check "retry: the first pause is the base", retryPauseMs(0, 0) == RetryBaseMs
+  check "retry: the pause doubles", retryPauseMs(1, 0) == RetryBaseMs * 2
+  check "retry: the pause is capped at the ceiling",
+    retryPauseMs(9, 0) == RetryCeilingMs
+  check "retry: jitter stays inside a quarter of the pause",
+    retryPauseMs(0, 999_999) <= RetryBaseMs + RetryBaseMs div 4
+  check "retry: only transport classes are retried",
+    isRetryable(TokenConnRefused) and isRetryable(TokenDialTimeout) and
+      isRetryable(TokenHeaderTimeout) and isRetryable(TokenUpstream5xx)
+  check "retry: a decided class is not retried",
+    not isRetryable(TokenAuth401) and not isRetryable(TokenQuota429) and
+      not isRetryable(TokenMissingSession) and not isRetryable(TokenModelGone) and
+      not isRetryable(TokenCallerFault)
+
+block:
+  # The key pool: a dead entry is skipped for its own cooldown, and the leg stays
+  # available while any other entry is live.
+  var pooled = legSpec("p", lrPrimary)
+  pooled.apiKeys = @["k1", "k2"]
+  pooled.apiKey = ""
+  let gateway = makeGateway(@[pooled], balance = false)
+  check "key pool: the first live entry is used",
+    gateway.pickKeyIndex(0, epochTime()) == 0
+  check "key pool: cooling one entry leaves the other live",
+    gateway.coolKey(0, 0, TokenAuth401)
+  check "key pool: the next pick is the live entry",
+    gateway.pickKeyIndex(0, epochTime()) == 1
+  check "key pool: cooling the last entry reports nothing left",
+    not gateway.coolKey(0, 1, TokenAuth401)
+  check "key pool: every entry cooling means no dial",
+    gateway.pickKeyIndex(0, epochTime()) == -1
+
+block:
+  let pooled3 = legSpec("p3", lrPrimary)
+  var cfg = Config(listenHost: "127.0.0.1", listenPort: 4011,
+                   logPath: "/tmp/unused.jsonl")
+  var leg3 = pooled3
+  leg3.apiKeys = @["k1"]
+  leg3.apiKey = ""
+  cfg.legs = @[leg3]
+  let gw3 = newGateway(cfg, RequestLog(fd: -1), "127.0.0.1:4011")
+  check "key pool: a pool of one never rotates",
+    gw3.pickKeyIndex(0, epochTime()) == 0 and
+      not gw3.coolKey(0, 0, TokenAuth401)
+
+block:
+  # DEC-11's model list: an alias and a named leg model both appear, once each.
+  var cfg = Config(listenHost: "127.0.0.1", listenPort: 4011,
+                   logPath: "/tmp/unused.jsonl")
+  var first = legSpec("leg-a", lrPrimary)
+  first.hasModel = true
+  first.model = "prov-a"
+  first.aliases["fast"] = "prov-a-fast"
+  var second = legSpec("leg-b", lrFallback)
+  second.hasModel = false
+  second.model = "leg-b"
+  second.aliases["fast"] = "prov-b-fast"
+  cfg.legs = @[first, second]
+  let gateway = newGateway(cfg, RequestLog(fd: -1), "127.0.0.1:4011")
+  let models = parseJson(gateway.modelsJson())
+  check "models: the list is an OpenAI list object",
+    models{"object"}.getStr() == "list"
+  check "models: an alias appears once even when two legs map it",
+    models{"data"}.len == 2
+  check "models: the alias id carries the kori prefix",
+    models{"data"}[0]{"id"}.getStr() == "kori/fast"
+  check "models: a leg's own model id is listed",
+    models{"data"}[1]{"id"}.getStr() == "prov-a"
+  check "models: a leg without its own model contributes no id",
+    not gateway.modelsJson().contains("\"id\":\"leg-b\"")
+
+block:
+  var cfg = Config(listenHost: "127.0.0.1", listenPort: 4011,
+                   logPath: "/tmp/unused.jsonl")
+  cfg.legs = @[legSpec("leg-a", lrPrimary)]
+  let gateway = newGateway(cfg, RequestLog(fd: -1), "127.0.0.1:4011")
+  gateway.startCooldown(0, "auth_401")
+  let deep = parseJson(gateway.deepHealthJson())
+  check "deep health: liveness stays ok", deep{"status"}.getStr() == "ok"
+  check "deep health: every leg is reported", deep{"legs"}.len == 1
+  check "deep health: the cooling leg reads as cooling",
+    deep{"legs"}[0]{"state"}.getStr() == "cooling"
+  check "deep health: the failure class is named",
+    deep{"legs"}[0]{"last_failure_class"}.getStr() == "auth_401"
+
+block:
+  # The three named classes P1 adds, and the one that must stay a caller error.
+  check "404 model_not_found on a mapped alias is model_gone",
+    failureToken(404, """{"error":{"code":"model_not_found"}}""", true) == "model_gone"
+  check "404 model gone on a caller's own id stays a client error",
+    failureToken(404, """{"error":{"code":"model_not_found"}}""", false) == ""
+  check "a bare 404 is never model_gone",
+    failureToken(404, """{"error":{"message":"not found"}}""", true) == ""
+  check "caller_fault is its own name, not mid_stream_abort",
+    TokenCallerFault == "caller_fault" and TokenCallerFault != TokenMidStreamAbort
 
 # --------------------------------------------------------------------- report ---
 

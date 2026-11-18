@@ -62,6 +62,25 @@ const
   AvailabilityCooldownS* = 60.0
   CapacityCooldownS* = 900.0
 
+  # Item 5. A leg gets `retries` more dials before it is classed as failed and the
+  # walk moves on, with a doubling pause between them. The pause is capped so one
+  # leg can never spend the whole request budget waiting: 200, 400, 800, 1600 then
+  # 2000 ms at the ceiling, which is 5 s for the five retries this ceiling allows.
+  # The default is 0: an operator turns retries on per leg, so 0.6.1 behaviour is
+  # unchanged for every config that does not name the key.
+  RetryBaseMs* = 200
+  RetryCeilingMs* = 2_000
+  MaxRetriesPerLeg* = 5
+
+  # DEC-11 (supersedes DEC-8): a weight is a small integer, not a percentage and
+  # not a float, so a config cannot ask for a share that has no defined rounding.
+  MaxWeight* = 1_000
+
+  ## Item 4. A 404 whose body says the model does not exist is a dead route on
+  ## that leg, not a caller error, and only when the alias table named the id:
+  ## a caller that sent a provider id kori never touched keeps its own 404.
+  TokenModelGone* = "model_gone"
+
   LatencyRingSize = 50
   RecentLimit = 10
   FailoverEventLimit = 20
@@ -82,6 +101,15 @@ const
   TokenUpstream5xx* = "upstream_5xx"
   TokenQuota429* = "quota_429"
   TokenMidStreamAbort* = "mid_stream_abort"
+
+  ## The caller hung up before the answer was finished. It is not a leg failure:
+  ## the leg was healthy and the stream it produced was the one the caller stopped
+  ## reading. It cools nothing, fails over to nothing, and is its own value so a
+  ## push of abandoned requests cannot be read as a provider going bad. An
+  ## OpenAI-shaped client signals this by closing the socket; there is no separate
+  ## cancel frame in SSE, so one name covers it instead of two that nothing could
+  ## tell apart.
+  TokenCallerFault* = "caller_fault"
 
   # Log-only values, not failure classes: a request that cannot refresh its
   # credential stops where it is, so nothing is failed over and nothing is cooled
@@ -141,11 +169,13 @@ type
     name*: string
     baseUrl*: string
     apiKey*: string
+    apiKeys*: seq[string]      ## the pool; `api_key` is a pool of one when this is empty
     model*: string
     hasModel*: bool          ## `model` came from the config, so it is sent upstream
     headers*: seq[(string, string)]
     role*: LegRole
     weight*: int
+    retries*: int              ## extra dials on this leg before it is classed failed
     oauth*: Oauth
     hasOauth*: bool
     enabled*: bool             ## false only when the config says so: skipped, never dialled
@@ -183,6 +213,13 @@ type
     servedInWindow*: int
     failedInWindow*: int
     latencies*: seq[int]
+    ## Key pool state (P1). `keyIndex` is the pool entry in use; a dead key is
+    ## skipped by `keyCooling` until its own cooldown expires. Only the index is
+    ## observable, never the key.
+    keyIndex*: int
+    keyCooling*: seq[float]     ## epoch seconds per pool entry, 0 when live
+    ## DEC-11: smooth weighted round-robin credit, never negative.
+    weightCurrent*: int
 
   FailoverEvent* = object
     at*: string
@@ -430,6 +467,27 @@ proc loadConfig*(path: string): Config =
     if leg.baseUrl.len == 0:
       failConfig(ctx & ".base_url is required")
     leg.apiKey = optionalString(item, "api_key", ctx)
+    # P1 key pool: `api_keys` is an ordered pool, rotated on a 401 or a quota
+    # 429. `api_key` stays supported and is the pool of one when this is absent,
+    # so no config in use has to change.
+    let apiKeysNode = item{"api_keys"}
+    if apiKeysNode != nil and apiKeysNode.kind != JNull:
+      if apiKeysNode.kind != JArray:
+        failConfig(ctx & ".api_keys must be an array of strings")
+      for keyIndex in 0 ..< apiKeysNode.len:
+        let value = apiKeysNode[keyIndex]
+        if value.kind != JString or value.getStr().len == 0:
+          failConfig(ctx & ".api_keys[" & $keyIndex & "] must be a non-empty string")
+        leg.apiKeys.add(value.getStr())
+      if leg.apiKeys.len == 0:
+        failConfig(ctx & ".api_keys must not be empty when the key is present")
+    if leg.apiKeys.len == 0 and leg.apiKey.len > 0:
+      leg.apiKeys.add(leg.apiKey)
+    if leg.apiKeys.len > 1 and item{"oauth"} != nil and item{"oauth"}.kind == JObject:
+      # A pool and an oauth block are two answers to the same question, and only
+      # one of them can be the bearer. Refuse rather than pick silently.
+      failConfig(ctx & " cannot carry both api_keys and oauth")
+
     # CONTRACT §1: model is optional; the leg name stands in, never a refusal.
     # A model the config names is also what kori sends upstream (DEC-10): the
     # three providers do not share model ids, so the leg's id replaces the
@@ -460,10 +518,22 @@ proc loadConfig*(path: string): Config =
       if weight.kind != JInt:
         failConfig(ctx & ".weight must be an integer")
       leg.weight = weight.getInt()
-      # v1 refuses a weight it cannot honour rather than accepting a number with
-      # no defined split (TAKEOVER-plan-team-c §5).
-      if leg.weight != 1:
-        failConfig(ctx & ".weight must be 1 in v1; the weighted split is not built")
+      # DEC-11, which supersedes DEC-8's refusal of every weight but 1: a weight
+      # is now honoured, and it is a small integer so a share always has a defined
+      # rounding. 0 or a negative weight would remove a leg from the split without
+      # saying so, so it is refused; so is anything above the ceiling.
+      if leg.weight < 1 or leg.weight > MaxWeight:
+        failConfig(ctx & ".weight must be 1-" & $MaxWeight)
+    # P1 retry: how many more dials this leg gets before the walk moves on. The
+    # default is 0, so a config that does not name the key keeps 0.6.1's
+    # failover-as-the-only-retry behaviour.
+    let retries = item{"retries"}
+    if retries != nil and retries.kind != JNull:
+      if retries.kind != JInt:
+        failConfig(ctx & ".retries must be an integer")
+      leg.retries = retries.getInt()
+      if leg.retries < 0 or leg.retries > MaxRetriesPerLeg:
+        failConfig(ctx & ".retries must be 0-" & $MaxRetriesPerLeg)
     # Item 2. A leg can be switched off without leaving the chain, so the order the
     # operator wrote stays the order the walk uses.
     leg.enabled = true
@@ -682,10 +752,31 @@ proc legAvailable*(gateway: Gateway, index: int, now: float): bool =
     return false
   not runtime.probeInFlight
 
+proc pickWeighted(legs: seq[Leg], pool: seq[int],
+                  currents: var seq[int]): int =
+  ## DEC-11's smooth weighted round-robin, the nginx algorithm: every turn each
+  ## candidate gains its weight, the largest current wins, and the winner pays the
+  ## total back. One call per request, no durable state, and a weight of 1 on
+  ## every leg degenerates to plain round-robin. `currents` is indexed by leg.
+  var total = 0
+  for index in pool:
+    total += legs[index].weight
+  if total <= 0:
+    return pool[0]
+  var chosen = pool[0]
+  var best = low(int)
+  for index in pool:
+    currents[index] += legs[index].weight
+    if currents[index] > best:
+      best = currents[index]
+      chosen = index
+  currents[chosen] -= total
+  chosen
+
 proc pickOrder*(gateway: Gateway): seq[int] =
   ## R12a: one pick at request start, before any dial, then a walk. Balancing
-  ## picks round-robin over the primaries that are available; the fallback only
-  ## enters the pick when no primary can serve (D12.1). The walk is always the
+  ## picks over the primaries that are available, weighted by DEC-11; the fallback
+  ## only enters the pick when no primary can serve (D12.1). The walk is always the
   ## configured order: the pick, then the other primaries, then the fallbacks.
   let now = epochTime()
   var primaries: seq[int]
@@ -713,12 +804,12 @@ proc pickOrder*(gateway: Gateway): seq[int] =
   if pool.len == 0:
     return @[]
 
-  var chosen = pool[0]
-  for offset in 1 .. gateway.cfg.legs.len:
-    let index = (gateway.cursor + offset) mod gateway.cfg.legs.len
-    if index in pool:
-      chosen = index
-      break
+  var currents = newSeq[int](gateway.cfg.legs.len)
+  for index in 0 ..< gateway.cfg.legs.len:
+    currents[index] = gateway.legs[index].weightCurrent
+  let chosen = pickWeighted(gateway.cfg.legs, pool, currents)
+  for index in 0 ..< gateway.cfg.legs.len:
+    gateway.legs[index].weightCurrent = currents[index]
   gateway.cursor = chosen
 
   result.add chosen
@@ -951,13 +1042,28 @@ proc isQuotaBody*(body: string): bool =
     body.contains("usage limit") or body.contains("insufficient_quota") or
     body.contains("QuotaExceeded")
 
-proc failureToken*(status: int, body: string): string =
+proc modelGoneBody*(body: string): bool =
+  ## A 404 whose body says the model does not exist on that leg. Matched on the
+  ## provider spellings we have seen (`model_not_found`, "does not exist", "no
+  ## such model") and kept narrow: a bare 404 stays a caller error, because a
+  ## wrong path or a wrong host is not a dead model.
+  body.contains("model_not_found") or body.contains("model not found") or
+    body.contains("does not exist") or body.contains("no such model") or
+    body.contains("unknown model") or body.contains("invalid model")
+
+proc failureToken*(status: int, body: string, aliasMapped = false,
+                   modelGone = false): string =
   ## §3.1 to §3.3. Empty string means "not a failure class": the response either
-  ## served the caller or is a client error returned unchanged.
+  ## served the caller or is a client error returned unchanged. `modelGone` is
+  ## passed in by the caller of this proc, because only the walk knows whether the
+  ## alias table named the model id this leg was sent: a caller's own id keeps the
+  ## 404 it earned.
   if status == 401:
     TokenAuth401
   elif status == 400 and body.contains("MissingSessionID"):
     TokenMissingSession
+  elif status == 404 and aliasMapped and modelGoneBody(body):
+    TokenModelGone
   elif status == 429 and isQuotaBody(body):
     TokenQuota429
   elif status >= 500:
@@ -1686,17 +1792,85 @@ proc refreshIfNeeded(gateway: Gateway, index: int,
 proc refreshReason(outcome: RefreshOutcome): string =
   if outcome.timedOut: TokenRefreshTimeout else: TokenRefreshFailed
 
-proc bearerFor(gateway: Gateway, index: int): string =
-  ## An oauth leg sends its live access token; a leg without the block keeps the
-  ## static api_key it always had.
+proc bearerFor(gateway: Gateway, index: int, keyIndex = 0): string =
+  ## An oauth leg sends its live access token; a pooled leg sends the entry the
+  ## rotation chose; a leg with one `api_key` is a pool of one.
   let leg = gateway.cfg.legs[index]
-  if leg.hasOauth: gateway.oauth[index].accessToken
-  elif leg.apiKey.len > 0: leg.apiKey
-  else: ""
+  if leg.hasOauth:
+    return gateway.oauth[index].accessToken
+  if leg.apiKeys.len > 0:
+    if keyIndex >= 0 and keyIndex < leg.apiKeys.len:
+      return leg.apiKeys[keyIndex]
+    return ""
+  leg.apiKey
+
+proc pickKeyIndex*(gateway: Gateway, index: int, now: float): int =
+  ## The pool entry this dial should use. -1 means every key in the pool is
+  ## cooling, so the leg cannot be dialled at all and the walk moves on without a
+  ## cooldown on the leg itself.
+  let leg = gateway.cfg.legs[index]
+  if leg.apiKeys.len == 0:
+    return 0
+  if leg.apiKeys.len == 1:
+    return 0
+  let runtime = gateway.legs[index]
+  if runtime.keyIndex >= 0 and runtime.keyIndex < leg.apiKeys.len and
+     (runtime.keyCooling.len <= runtime.keyIndex or
+      runtime.keyCooling[runtime.keyIndex] <= now):
+    return runtime.keyIndex
+  for key in 0 ..< leg.apiKeys.len:
+    if runtime.keyCooling.len <= key or runtime.keyCooling[key] <= now:
+      return key
+  -1
+
+proc coolKey*(gateway: Gateway, index, keyIndex: int, reason: string): bool =
+  ## A dead credential is not a dead leg: one pool entry is skipped for its own
+  ## cooldown and the leg stays available. Returns whether another live key is
+  ## left to try, so the caller knows to dial again instead of failing over.
+  ## A leg with a pool of one has nothing to rotate to and keeps the leg-level
+  ## cooldown it always had.
+  let leg = gateway.cfg.legs[index]
+  if leg.apiKeys.len <= 1:
+    return false
+  let cooldown =
+    if reason == TokenQuota429: CapacityCooldownS
+    else: AvailabilityCooldownS
+  let now = epochTime()
+  var runtime = addr gateway.legs[index]
+  if runtime.keyCooling.len != leg.apiKeys.len:
+    runtime.keyCooling = newSeq[float](leg.apiKeys.len)
+  if keyIndex >= 0 and keyIndex < runtime.keyCooling.len:
+    runtime.keyCooling[keyIndex] = now + cooldown
+  runtime.keyIndex = -1
+  gateway.pickKeyIndex(index, now) >= 0
+
+proc isRetryable*(reason: string): bool =
+  ## The classes where dialling the same leg again can plausibly answer: a refused
+  ## connection, a dial or header deadline, an upstream 5xx. A 401 rotates a key
+  ## instead, and a quota 429, a missing session, a dead model and a caller error
+  ## are all decided, so retrying them only spends time.
+  reason in [TokenConnRefused, TokenDialTimeout, TokenHeaderTimeout,
+             TokenUpstream5xx]
+
+proc retryPauseMs*(attempt: int, jitterSeed: int): int =
+  ## Doubling from RetryBaseMs up to RetryCeilingMs, plus up to a quarter of the
+  ## pause as jitter so a fleet of callers does not resynchronise on one leg.
+  var pause = RetryBaseMs
+  for _ in 1 .. attempt:
+    pause = pause * 2
+    if pause >= RetryCeilingMs:
+      pause = RetryCeilingMs
+      break
+  if pause > RetryCeilingMs:
+    pause = RetryCeilingMs
+  let span = pause div 4
+  if span <= 0:
+    return pause
+  pause + (abs(jitterSeed) mod (span + 1))
 
 proc attemptLeg(gateway: Gateway, request: Request, leg: Leg, bearer: string,
-                body: string,
-                stream: bool, totalDeadline: float): Future[AttemptOutcome] {.async.} =
+                body: string, stream: bool, totalDeadline: float,
+                aliasMapped = false): Future[AttemptOutcome] {.async.} =
   ## One leg, one attempt, and the caller's response written from here when the
   ## attempt produced one. The failover window ends when response headers arrive
   ## (§3b.2), so everything below that line either serves or aborts.
@@ -1712,6 +1886,11 @@ proc attemptLeg(gateway: Gateway, request: Request, leg: Leg, bearer: string,
     result.kind = akFailed
     result.reason = if dialTimedOut: TokenDialTimeout else: TokenConnRefused
     return
+
+  # §3b.2: once headers from a leg have reached the caller, this request is bound
+  # to that leg. `headersSent` is what makes the exception handler below able to
+  # tell a broken leg from a caller that went away after the answer started.
+  var headersSent = false
 
   try:
     var client = socket
@@ -1815,13 +1994,14 @@ proc attemptLeg(gateway: Gateway, request: Request, leg: Leg, bearer: string,
           else:
             break
 
-      let token = failureToken(status, errorBody)
+      let token = failureToken(status, errorBody, aliasMapped)
       if token.len > 0:
         result.kind = akFailed
         result.reason = token
         return
       # §3.3: any other 4xx is the caller's problem. Returned unchanged.
       let contentType = headerValue(headers, "content-type")
+      headersSent = true
       await request.sendFull(status,
         (if contentType.len > 0: contentType else: "application/json"), errorBody)
       result.kind = akPassthrough
@@ -1837,6 +2017,10 @@ proc attemptLeg(gateway: Gateway, request: Request, leg: Leg, bearer: string,
         ("Content-Type", outgoing),
         ("Cache-Control", "no-cache"),
         ("Transfer-Encoding", "chunked")]))
+      headersSent = true
+      # The status the caller already has; the log must not report the 502 default
+      # just because a write failed later.
+      result.status = status
       var tokensIn: Option[int]
       var tokensOut: Option[int]
       var aborted = false
@@ -1904,6 +2088,7 @@ proc attemptLeg(gateway: Gateway, request: Request, leg: Leg, bearer: string,
       return
     await request.sendFull(status,
       (if contentType.len > 0: contentType else: "application/json"), payload)
+    headersSent = true
     if aborted:
       result.kind = akAborted
       result.status = status
@@ -1916,11 +2101,16 @@ proc attemptLeg(gateway: Gateway, request: Request, leg: Leg, bearer: string,
     result.tokensIn = tokensIn
     result.tokensOut = tokensOut
   except CatchableError:
-    # An SSL or socket error before anything reached the caller is an unusable
-    # leg. The closed vocabulary has no token for it, and `conn_refused` is the
+    # A socket error after headers were written is the caller leaving mid-answer:
+    # the leg already produced the response and the write is what failed. A socket
+    # error before anything reached the caller is an unusable leg. The closed
+    # vocabulary has no other token for the second case, and `conn_refused` is the
     # honest one: the connection could not be established.
-    result.kind = akFailed
-    result.reason = TokenConnRefused
+    if headersSent:
+      result.kind = akAborted
+      result.reason = TokenCallerFault    else:
+      result.kind = akFailed
+      result.reason = TokenConnRefused
   finally:
     closeQuietly(socket)
 
@@ -1941,6 +2131,7 @@ proc handleChat(gateway: Gateway, request: Request): Future[void] {.async.} =
   var status = 502
   var route = ""
   var terminalAbort = false
+  var abortReason = ""
   var tokensIn: Option[int]
   var tokensOut: Option[int]
   var answered = false
@@ -2045,25 +2236,69 @@ proc handleChat(gateway: Gateway, request: Request): Future[void] {.async.} =
       effortClampedLog =
         if effortChoice.clamped: callerEffort & ">" & effortChoice.sent
         else: ""
-      var outcome = await gateway.attemptLeg(request, leg,
-                                             gateway.bearerFor(index), legBody,
-                                             stream, totalDeadline)
-      # A 401 from an oauth leg buys one forced refresh and one retry, then it is
-      # classified exactly as before. Never a loop.
-      if outcome.kind == akFailed and outcome.reason == TokenAuth401 and
-         leg.hasOauth:
-        let retried = await gateway.refreshIfNeeded(index, force = true)
-        if not retried.ok:
-          if probing:
-            gateway.legs[index].probeInFlight = false
-          hardStop = refreshReason(retried)
-          hardStopDetail = retried.detail
-          break
-        outcome = await gateway.attemptLeg(request, leg,
-                                           gateway.bearerFor(index), legBody,
-                                           stream, totalDeadline)
+      # P1: one leg may be dialled more than once. A dead key in the pool rotates
+      # before the leg is blamed, a retryable transport failure gets the leg's
+      # `retries` extra dials, and a 401 on an oauth leg buys one forced refresh.
+      # Every path is bounded by the pool length, the retry ceiling or a flag, so
+      # no request can loop here.
+      var keyIndex = gateway.pickKeyIndex(index, epochTime())
+      if keyIndex < 0:
+        # Every key in the pool is cooling. Nothing is dialled and the leg itself
+        # is not put on a cooldown: its credentials are, which is a different fact.
+        chain.lastReason = TokenAuth401
+        if chain.firstReason.len == 0:
+          chain.firstReason = TokenAuth401
+          chain.firstFrom = leg.name
+          chain.availability = true
+        if position + 1 < order.len:
+          gateway.recordEvent(leg.name, gateway.cfg.legs[order[position + 1]].name,
+                              TokenAuth401)
+        continue
+      var rotations = 0
+      var oauthRetried = false
+      var retriesUsed = 0
+      var outcome: AttemptOutcome
+      block legDials:
+        while true:
+          outcome = await gateway.attemptLeg(request, leg,
+                                             gateway.bearerFor(index, keyIndex),
+                                             legBody, stream, totalDeadline,
+                                             alias.isSome)
+          if outcome.kind != akFailed:
+            break legDials
+          # A 401 from an oauth leg buys one forced refresh and one more dial, then
+          # it is classified exactly as before. Never a loop.
+          if outcome.reason == TokenAuth401 and leg.hasOauth and not oauthRetried:
+            oauthRetried = true
+            let retried = await gateway.refreshIfNeeded(index, force = true)
+            if not retried.ok:
+              hardStop = refreshReason(retried)
+              hardStopDetail = retried.detail
+              break legDials
+            continue
+          # A dead key is a dead credential, not a dead leg: rotate within the pool
+          # until its live entries are spent, and only then blame the leg.
+          if outcome.reason in [TokenAuth401, TokenQuota429] and
+             leg.apiKeys.len > 1 and rotations + 1 < leg.apiKeys.len:
+            inc rotations
+            if gateway.coolKey(index, keyIndex, outcome.reason):
+              let nextKey = gateway.pickKeyIndex(index, epochTime())
+              if nextKey >= 0:
+                keyIndex = nextKey
+                continue
+            break legDials
+          # A retryable transport failure gets `retries` more dials on this leg.
+          # Default 0: a config that does not ask for retries keeps 0.6.1's rule
+          # that failover is the only retry.
+          if retriesUsed < leg.retries and isRetryable(outcome.reason):
+            inc retriesUsed
+            await sleepAsync(retryPauseMs(retriesUsed, int(epochTime() * 1000.0)))
+            continue
+          break legDials
       if probing:
         gateway.legs[index].probeInFlight = false
+      if hardStop.len > 0:
+        break
 
       case outcome.kind
       of akFailed:
@@ -2082,8 +2317,12 @@ proc handleChat(gateway: Gateway, request: Request): Future[void] {.async.} =
       of akServed, akAborted, akPassthrough, akTerminal:
         status = outcome.status
         terminalAbort = outcome.kind == akAborted
+        if terminalAbort:
+          abortReason = outcome.reason
         tokensIn = outcome.tokensIn
         tokensOut = outcome.tokensOut
+        # A caller that hung up still got a live answer from a live leg, so the
+        # leg is marked served: the abort is the caller's fault, not the leg's.
         if outcome.kind != akTerminal:
           gateway.markServed(index, int((epochTime() - started) * 1000.0))
         answered = true
@@ -2129,18 +2368,27 @@ proc handleChat(gateway: Gateway, request: Request): Future[void] {.async.} =
     gateway.tokensInTotal += tokensIn.get
   if tokensOut.isSome:
     gateway.tokensOutTotal += tokensOut.get
-  if countsTowardAvailability(chain.availability, effortStop):
+  # Galih's LOW from the 0.6.1 gate: an effort skip followed by a credential 502
+  # used to move no availability counter, because the effort stop was decided from
+  # the dial count alone. The suppression belongs to the answer the caller got, so
+  # it is keyed on the 400 and not on the skip: the 502 that a broken credential
+  # produced is an availability failure and is counted here.
+  let suppressAvailability = effortStop and status == 400
+  if countsTowardAvailability(chain.availability, suppressAvailability):
     gateway.failoverAvailability.inc
   if chain.capacity:
     gateway.failoverCapacity.inc
 
-  # §5.1: `failover_reason` is the first reason the request met, with
-  # `mid_stream_abort` as the one outcome that overrides it because it is what
-  # the caller actually saw (D9.2, D10.1). A request that never failed over keeps
-  # the empty string, which is the binding answer for this field. A hard stop is
-  # not a failover: nothing was abandoned, so `failover_from` stays empty.
+  # §5.1: `failover_reason` is the first reason the request met, with the abort
+  # that the caller actually saw as the one override (D9.2, D10.1). A caller that
+  # hung up before the answer finished is named as itself (`caller_fault`), not as
+  # `mid_stream_abort`: the leg was healthy, and a push of abandoned requests must
+  # not read as a provider going bad. A request that never failed over keeps the
+  # empty string, which is the binding answer for this field. A hard stop is not a
+  # failover: nothing was abandoned, so `failover_from` stays empty.
   let logReason =
     if hardStop.len > 0: hardStop
+    elif terminalAbort and abortReason.len > 0: abortReason
     elif terminalAbort: TokenMidStreamAbort
     else: chain.firstReason
 
@@ -2554,6 +2802,7 @@ proc configJson*(gateway: Gateway): string =
     node["base_url"] = %redactUrl(leg.baseUrl)
     node["model"] = %leg.model
     node["enabled"] = %leg.enabled
+    node["retries"] = %leg.retries
     var aliases = newJObject()
     for alias, providerId in leg.aliases:
       aliases[alias] = %providerId
@@ -2562,6 +2811,15 @@ proc configJson*(gateway: Gateway): string =
     for (headerName, _) in leg.headers:
       headers.add(%headerName)
     node["headers"] = headers
+    # A pool is reported by size and the index in use, never by value: how many
+    # keys a leg holds and which one is live is operational, a key is a secret.
+    node["keys"] = %leg.apiKeys.len
+    let liveKeys = gateway.legs[index].keyCooling
+    var coolingKeys = 0
+    for untilAt in liveKeys:
+      if untilAt > epochTime():
+        inc coolingKeys
+    node["keys_cooling"] = %coolingKeys
     var credential = newJObject()
     let hasLiveToken = leg.hasOauth and gateway.oauth[index].accessToken.len > 0
     credential["name"] = %(if leg.hasOauth: leg.name & " OAuth token"
@@ -2614,6 +2872,82 @@ proc configJson*(gateway: Gateway): string =
 proc healthzJson*(): string =
   "{\"status\":\"ok\",\"version\":" & jsonEscape(KoriVersion) &
     ",\"revision\":" & jsonEscape(KoriRevision) & "}"
+
+proc deepHealthJson*(gateway: Gateway): string =
+  ## P1: `/healthz?deep` reports the state kori already keeps, per leg. Zero dials
+  ## and zero tokens: an active probe would spend the owner's quota to answer a
+  ## question the router already knows. Liveness stays `status: ok` here as well,
+  ## because the process answering at all is the liveness fact.
+  let now = epochTime()
+  var root = newJObject()
+  root["status"] = %"ok"
+  root["version"] = %KoriVersion
+  root["revision"] = %KoriRevision
+  var legs = newJArray()
+  for index, leg in gateway.cfg.legs:
+    let runtime = gateway.legs[index]
+    var node = newJObject()
+    node["name"] = %leg.name
+    node["role"] = %($leg.role)
+    node["state"] = %legStateName(runtime, now, leg.enabled)
+    node["cooling_until"] = (if runtime.coolingUntil > now: %stampAt(runtime.coolingUntil)
+                             else: newJNull())
+    node["last_success_at"] = (if runtime.lastSuccessAt.len > 0: %runtime.lastSuccessAt
+                               else: newJNull())
+    node["last_failure_at"] = (if runtime.lastFailureAt.len > 0: %runtime.lastFailureAt
+                               else: newJNull())
+    node["last_failure_class"] = (if runtime.lastFailureClass.len > 0:
+                                    %runtime.lastFailureClass else: newJNull())
+    node["served_in_window"] = %runtime.servedInWindow
+    node["failed_in_window"] = %runtime.failedInWindow
+    legs.add(node)
+  root["legs"] = legs
+  $root
+
+proc modelsJson*(gateway: Gateway): string =
+  ## P0 item 1: the model list an OpenAI client probes before it will talk to a
+  ## gateway. Derived from the config, never from a provider: one entry per
+  ## `kori/<alias>` and one per leg id that the config names or the leg is sent.
+  ## Serving this list means a client can enumerate what this door accepts, which
+  ## is the one thing every SDK needs and kori could not answer.
+  var data = newJArray()
+  var seen = initTable[string, bool]()
+  var aliasNames: seq[string]
+
+  # Aliases first, in leg order, and deduplicated: the same name on two legs is one
+  # model to the caller, and the alias table resolves it per leg.
+  for leg in gateway.cfg.legs:
+    for alias in leg.aliases.keys:
+      let name = AliasPrefix & alias
+      if seen.hasKey(name):
+        continue
+      seen[name] = true
+      aliasNames.add name
+  for name in aliasNames:
+    var node = newJObject()
+    node["id"] = %name
+    node["object"] = %"model"
+    node["owned_by"] = %"kori"
+    data.add node
+
+  # Then the concrete ids. A leg's `model` is what that leg is sent; a leg without
+  # one is sent the caller's string, so it contributes no id of its own.
+  for leg in gateway.cfg.legs:
+    if not leg.hasModel:
+      continue
+    if seen.hasKey(leg.model):
+      continue
+    seen[leg.model] = true
+    var node = newJObject()
+    node["id"] = %leg.model
+    node["object"] = %"model"
+    node["owned_by"] = %leg.name
+    data.add node
+
+  var root = newJObject()
+  root["object"] = %"list"
+  root["data"] = data
+  $root
 
 # ------------------------------------------------------------------ handlers ---
 
@@ -2792,7 +3126,21 @@ proc routeRequest(gateway: Gateway, request: Request): Future[void] {.async.} =
     if request.reqMethod notin {HttpGet, HttpHead}:
       await respondJson(request, Http405, "{\"error\":\"method not allowed\"}")
     else:
-      await respondJson(request, Http200, healthzJson())
+      # P1: `?deep` is one variant of the health path, not a second path, and it
+      # answers from router state without dialling a leg. Presence is what asks
+      # for it: `?deep`, `?deep=1` and `?deep=true` are the same request, and only
+      # an explicit false keeps the shallow body.
+      let deep = queryValue(parseQuery(request.url.query), "deep")
+      if deep.isSome and deep.get.toLowerAscii() notin ["0", "false", "no"]:
+        await respondJson(request, Http200, gateway.deepHealthJson())
+      else:
+        await respondJson(request, Http200, healthzJson())
+  elif path == "/v1/models":
+    # P0: the model list. GET and HEAD, like every other read-only surface.
+    if request.reqMethod notin {HttpGet, HttpHead}:
+      await respondJson(request, Http405, "{\"error\":\"method not allowed\"}")
+    else:
+      await respondJson(request, Http200, gateway.modelsJson())
   elif path.startsWith("/admin/"):
     # D11 point 4: any method but GET or HEAD under /admin/ is a 405 that names
     # GET, with no upstream dial and no state change. An unknown path under

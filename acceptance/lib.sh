@@ -244,10 +244,13 @@ kill_stubs() {
   fi
 }
 
-write_config() { # write_config "name|base_url|api_key|header:value[|role[|weight[|model]]]" ...
+write_config() { # write_config "name|base_url|api_key|header:value[|role[|weight[|model[|retries[|api_keys]]]]]" ...
   # D12: `balance` (top level) and per-leg `role` and `weight` are written only when
   # a case asks for them, so A1 to A10 keep the fixture shape they were proved on and
   # A11 is the one block that carries the new keys. GW_BALANCE=true turns balancing on.
+  #
+  # A13 adds two more optional trailing fields, both of which stay absent unless a
+  # case names them: `retries` (an integer) and `api_keys` (comma-separated).
   #
   # Every leg's port is an alias: allocate it here whether or not a stub will bind
   # it, so a leg the case leaves dead points at a port that is really free.
@@ -285,6 +288,11 @@ for spec in legs:
         leg["weight"] = int(parts[5])
     if len(parts) > 6 and parts[6]:
         leg["model"] = parts[6]
+    if len(parts) > 7 and parts[7]:
+        leg["retries"] = int(parts[7])
+    if len(parts) > 8 and parts[8]:
+        leg["api_keys"] = [k for k in parts[8].split(",") if k]
+        del leg["api_key"]
     cfg["legs"].append(leg)
 json.dump(cfg, open(path, "w"), indent=2)
 PY

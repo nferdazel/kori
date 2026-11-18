@@ -10,6 +10,37 @@ templates under `ops/` describe the intended host shape and have not been run ag
 
 ## [Unreleased]
 
+### Added
+
+- `GET /v1/models`: the model list derived from this config, for the clients that probe one
+  before they will talk to a gateway. One entry per `kori/<alias>` (deduplicated across legs,
+  because one caller name is one model) plus one per leg `model` id the config names. No
+  provider is dialled and no credential is read, so it answers on a fresh process with every
+  leg dead.
+- `legs[].retries`: extra dials on the same leg before the walk moves on. Doubling pause from
+  200 ms to a 2 s ceiling plus jitter; only `conn_refused`, `dial_timeout`, `header_timeout`
+  and `upstream_5xx` are retried. Default `0`, so no existing config changes behaviour. A
+  retry is not a failover, so the log line is unchanged.
+- `legs[].api_keys`: an ordered key pool. A `401` or a quota `429` cools the key in use and
+  the next live entry is tried on the same leg before the leg is blamed. `api_key` stays
+  supported and is the pool of one. `/admin/config` reports `keys` and `keys_cooling`; no key
+  value and no key index reaches any surface.
+- `legs[].weight` above 1, with smooth weighted round-robin over the available primaries when
+  `balance` is on. Equal weights are plain round-robin. `DEC-11` supersedes `DEC-8`, which
+  refused every weight but 1.
+- `/healthz?deep`: the same liveness plus per-leg state, cooldown, last success, last failure
+  and window counters, read from router state with zero dials.
+- Two named failure classes: `model_gone` for a `404` saying the model does not exist on a
+  leg the alias table named (a caller's own id keeps its `404`), and `caller_fault` for a
+  caller that hung up after the first byte, which no longer reads as `mid_stream_abort` and
+  cools nothing.
+
+### Fixed
+
+- An effort skip followed by a credential `502` no longer reports zero availability movement.
+  The suppression belongs to the `400` that names the caller's effort, so it is keyed on the
+  answer the caller got instead of on the skip: Galih's LOW from the 0.6.1 gate.
+
 ## [0.6.1] - 2026-11-18
 
 ### Fixed

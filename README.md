@@ -35,14 +35,15 @@ host.
 A request walks the configured legs in order. A leg that fails goes on cooldown and the next leg is
 tried. A request that reaches a response is never rerouted afterwards.
 
-With `"balance": true`, the starting leg rotates round-robin across the available `primary` legs; the
-walk then covers the other primaries and finally the `fallback` legs. The default `false` keeps
-strict config order.
+With `"balance": true`, the starting leg is picked across the available `primary` legs by weight
+(smooth weighted round-robin, `DEC-11`); the walk then covers the other primaries and finally the
+`fallback` legs. The default `false` keeps strict config order, and the weight is inert then.
 
 | Condition from a leg | Class | Cooldown |
 |---|---|---|
 | `401` | `auth_401` | 60 s |
 | `400` with `MissingSessionID` | `missing_session_id` | 60 s |
+| `404` saying the model does not exist, on a leg the alias table named | `model_gone` | 60 s |
 | connection refused | `conn_refused` | 60 s |
 | dial timeout | `dial_timeout` | 60 s |
 | header timeout | `header_timeout` | 60 s |
@@ -50,11 +51,17 @@ strict config order.
 | `429` carrying a quota body | `quota_429` | 900 s |
 | any other status | not a failure; returned to the caller | none |
 
+`model_gone` is decided only when the alias table named the id this leg was sent. A caller that sent
+a provider id itself keeps its own `404`, because a wrong id a gateway never touched is the caller's
+mistake and failing over would hide it.
+
 `credential_refresh_failed` and `refresh_timeout` are the two log-only values: they name a request
 that stopped where it was instead of failing over.
 
 A response that dies after its first byte is aborted and logged as `mid_stream_abort`; it is not
-rerouted. When every leg is dead the caller gets one `502` carrying the last failure reason.
+rerouted. A caller that hangs up after the first byte is logged as `caller_fault` instead: the leg
+was healthy and the stream it produced was the one the caller stopped reading, so it cools nothing.
+When every leg is dead the caller gets one `502` carrying the last failure reason.
 
 A caller asks for a gateway alias by sending `model` as `kori/<alias>`. The name resolves per leg
 through that leg's own `aliases` table, so one alias can reach a different provider id on each leg,
@@ -127,6 +134,44 @@ Deadlines enforced by the binary, independent of any proxy in front of it:
 | idle between chunks | 120 s |
 | whole non-streaming request | 300 s |
 
+### Retry before failover
+
+Failover used to be kori's only retry, so one-second blip on a healthy provider was enough to mark
+the leg dead and start its 60 s cooldown. `legs[].retries` is how many more dials that leg gets
+before the walk moves on. The default is `0`, so a config that does not name the key behaves exactly
+as it did.
+
+| Caller-facing fact | Value |
+|---|---|
+| classes retried | `conn_refused`, `dial_timeout`, `header_timeout`, `upstream_5xx` |
+| classes never retried | `auth_401` (a key rotates instead), `quota_429`, `missing_session_id`, `model_gone`, every caller `4xx` |
+| pause | 200 ms doubling, capped at 2 s, plus up to a quarter as jitter |
+| maximum | 5 (`MaxRetriesPerLeg`) |
+
+A retry is not a failover: the request never left the leg, so `failover_from` and `failover_reason`
+stay empty in the log and no cooldown starts. Only a dial count moves.
+
+### Key pool
+
+One key per leg meant one revoked key cost the whole leg. `legs[].api_keys` is an ordered pool;
+`api_key` still works and is the pool of one, so no existing config changes.
+
+A `401` or a quota `429` cools the key in use for its own cooldown (60 s, or 900 s for quota) and
+tries the next live entry on the same leg before blaming the leg. When every entry is cooling the
+leg cannot be dialled and the walk moves on without a cooldown of its own. A pool with more than one
+entry and an `oauth` block are refused at startup, because only one of them can be the bearer.
+`/admin/config` reports `keys` and `keys_cooling`; no key value and no key index reaches any
+surface.
+
+### Balancing
+
+`balance: true` splits the pick across the available primaries instead of taking strict config order.
+`legs[].weight` (1-1000) is each leg's share, using smooth weighted round-robin, and equal weights
+are plain round-robin. A 3:1 config serves three requests on the heavy leg and one on the light one.
+A cooling leg leaves the pool, so its share is redistributed instead of halving onto nobody. With
+`balance: false` the weight is inert and the order is the config order. `DEC-11` supersedes the
+older rule that refused every weight but 1.
+
 ### Credential refresh
 
 A leg with an `oauth` block holds an access token that expires. kori refreshes it itself; a leg
@@ -183,7 +228,9 @@ No header, body or credential is ever written to the log.
 | Path | Method | Purpose |
 |---|---|---|
 | `/v1/chat/completions` | POST | the gateway door |
+| `/v1/models` | GET, HEAD | the model list derived from this config: one `kori/<alias>` per alias, plus every leg `model` id; no provider is dialled |
 | `/healthz` | GET, HEAD | `{"status":"ok","version":…,"revision":…}`; revision is the git sha the binary was built from, or `dev` |
+| `/healthz?deep` | GET, HEAD | the same liveness, plus per-leg state, cooldown, last success, last failure and window counters, read from router state with zero dials |
 | `/admin/state` | GET, HEAD | routes, window counters, failover events, recent log rows |
 | `/admin/log` | GET, HEAD | a page of the request log, newest first |
 | `/admin/config` | GET, HEAD | the loaded config with every credential redacted |
@@ -222,7 +269,7 @@ for drift in CI, so a stale embed fails the build instead of shipping an old pag
 apps/api/       Nim gateway source, Dockerfile
 apps/api/src/generated/static_files.nim   dashboard compiled into the binary
 apps/web/       dashboard source (vite, TypeScript) and the committed dist
-acceptance/     A1-A12 harness, lib.sh, stub.py, self-test
+acceptance/     A1-A13 harness, lib.sh, stub.py, self-test
 ops/            deploy, rollback and smoke scripts, Caddy, env, systemd, webhook templates
 tests/          unit tests and the dry runs ./task ops calls
 tools/          gen-static.sh
@@ -316,9 +363,11 @@ repository, in an image or in a log.
 | `legs[].base_url` | yes | kori appends `/chat/completions` to its path |
 | `legs[].api_key` | no | sent as `Authorization: Bearer …` unless `headers` already sets one, or the leg has an `oauth` block |
 | `legs[].model` | no | the model id that leg is sent, replacing the caller's `model` on that leg only; falls back to the leg name, which is reported and never sent (DEC-10) |
+| `legs[].api_keys` | no | an ordered key pool, for example `["…","…"]`; rotated on a `401` or a quota `429` so one dead key does not cost the leg (DEC-13). Cannot be combined with `oauth` |
+| `legs[].retries` | no | how many more dials this leg gets before the walk moves on, `0`-`5`, default `0` (DEC-12) |
 | `legs[].headers` | no | extra request headers, for example `x-opencode-session` |
 | `legs[].role` | no | `primary` or `fallback`, default `primary` |
-| `legs[].weight` | no | must be `1`; any other value is refused at startup |
+| `legs[].weight` | no | `1`-`1000`, default `1`; the share of the pick when `balance` is on (DEC-11) |
 | `legs[].enabled` | no | `true` or `false`, default `true`; a leg set to `false` keeps its place in the failover order but is never dialled, and `/admin/state` reads it as `skipped` |
 | `legs[].aliases` | no | an object of caller alias to this leg's provider id, for example `{"fast": "prov-a-fast"}`; the key is the alias alone, without `kori/`, and one name may map to a different id on each leg |
 | `legs[].efforts` | no | the `reasoning_effort` values this leg accepts, for example `["low", "high", "max"]`; a value outside the rank table is refused at startup. See "Thinking effort" above |
@@ -330,7 +379,7 @@ repository, in an image or in a log.
 | `legs[].oauth.access_token` | no | a seed token, used until the first refresh |
 | `legs[].oauth.expires_at` | no | epoch seconds; without it kori refreshes only after a `401` |
 | `legs[].oauth.refresh_skew_seconds` | no | refresh this long before expiry, default `60` |
-| `balance` | no | default `false`, which keeps strict leg order |
+| `balance` | no | default `false`, which keeps strict leg order; `true` splits the pick across available primaries by `weight` (DEC-11) |
 | `listen`, `log` | no | overridden by `--address`, `--port`, `--log` |
 
 For the `opencode-go` leg, `token_url` and `client_id` are the OpenCode Console's own values,
@@ -369,7 +418,7 @@ missing.
 The acceptance harness proves the router end to end against a real binary:
 
 ```sh
-KORI_BIN=./apps/api/src/kori sh acceptance/run-all.sh   # the twelve cases, A1-A12
+KORI_BIN=./apps/api/src/kori sh acceptance/run-all.sh   # the thirteen cases, A1-A13
 KORI_BIN=./apps/api/src/kori sh acceptance/selftest.sh  # proves the harness itself
 ```
 
@@ -387,6 +436,7 @@ KORI_BIN=./apps/api/src/kori sh acceptance/selftest.sh  # proves the harness its
 | a10 | the dashboard is a read-only surface over three GETs |
 | a11 | an expired credential is refreshed, and a refresh forced to fail stops the request |
 | a12 | a leg that names a model sends that id, and only that leg does (DEC-10) |
+| a13 | `/v1/models`, `retries`, a key pool, `model_gone`, weighted balancing and `/healthz?deep` (DEC-11 to DEC-14) |
 
 Cases use logical port numbers; `acceptance/lib.sh` resolves each to a free port per run, so a run
 leaves nothing behind and can be repeated immediately.

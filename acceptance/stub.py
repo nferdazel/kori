@@ -293,6 +293,13 @@ def handle(conn, addr, opts):
             send(conn, 400, "application/json", dumps(BAD_MODEL_BODY))
         elif mode == "503":
             send(conn, 503, "application/json", dumps({"error": {"message": "overloaded"}}))
+        elif mode == "503-then-ok":
+            # A13: one blip then health, so a retry can be seen to recover what
+            # failover would have burned a whole leg for.
+            if dials_so_far(opts.count_file) <= opts.after:
+                send(conn, 503, "application/json", dumps({"error": {"message": "overloaded"}}))
+            else:
+                send(conn, 200, "application/json", body_bytes(OK_BODY, opts))
         elif mode == "502":
             send(conn, 502, "text/html", b"<html>bad gateway</html>")
         elif mode == "429-quota":
