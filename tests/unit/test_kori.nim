@@ -363,6 +363,29 @@ block:
   check "effort: an unknown name has no rank", effortRank("turbo") == -1
 
 block:
+  # The stop is decided from two separate counts, never by comparing one counter
+  # with the walk length: a leg skipped for an unmapped alias must not hide the
+  # effort skip that ended the request.
+  check "effort stop: zero dials plus one effort skip is a stop",
+    effortStopWithoutDial(0, 1)
+  check "effort stop: zero dials plus no effort skip is not a stop",
+    not effortStopWithoutDial(0, 0)
+  check "effort stop: a dialled leg keeps the 502 even after an effort skip",
+    not effortStopWithoutDial(1, 1)
+  check "effort stop: a partly mapped alias still stops with no dial",
+    effortStopWithoutDial(0, 2)
+
+block:
+  # D9's window counter: the 400 that names the caller's effort dialled nothing,
+  # so it moves no availability; a skip the walk served past still counts.
+  check "availability: an effort stop does not count",
+    not countsTowardAvailability(true, true)
+  check "availability: a served-past skip still counts",
+    countsTowardAvailability(true, false)
+  check "availability: a request with no failover never counts",
+    not countsTowardAvailability(false, false)
+
+block:
   # The clamp is a textual rewrite of one key, so every other byte survives.
   let body = """{"model":"x","reasoning_effort":"max","messages":[]}"""
   let clamped = rewriteTopLevelString(body, "reasoning_effort", "high")
