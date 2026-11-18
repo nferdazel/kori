@@ -222,7 +222,7 @@ for drift in CI, so a stale embed fails the build instead of shipping an old pag
 apps/api/       Nim gateway source, Dockerfile
 apps/api/src/generated/static_files.nim   dashboard compiled into the binary
 apps/web/       dashboard source (vite, TypeScript) and the committed dist
-acceptance/     A1-A11 harness, lib.sh, stub.py, self-test
+acceptance/     A1-A12 harness, lib.sh, stub.py, self-test
 ops/            deploy, rollback and smoke scripts, Caddy, env, systemd, webhook templates
 tests/          unit tests and the dry runs ./task ops calls
 tools/          gen-static.sh
@@ -369,7 +369,7 @@ missing.
 The acceptance harness proves the router end to end against a real binary:
 
 ```sh
-KORI_BIN=./apps/api/src/kori sh acceptance/run-all.sh   # the eleven cases, A1-A11
+KORI_BIN=./apps/api/src/kori sh acceptance/run-all.sh   # the twelve cases, A1-A12
 KORI_BIN=./apps/api/src/kori sh acceptance/selftest.sh  # proves the harness itself
 ```
 
@@ -386,6 +386,7 @@ KORI_BIN=./apps/api/src/kori sh acceptance/selftest.sh  # proves the harness its
 | a9 | all legs dead is one `502` and the log keeps both ends of the chain |
 | a10 | the dashboard is a read-only surface over three GETs |
 | a11 | an expired credential is refreshed, and a refresh forced to fail stops the request |
+| a12 | a leg that names a model sends that id, and only that leg does (DEC-10) |
 
 Cases use logical port numbers; `acceptance/lib.sh` resolves each to a free port per run, so a run
 leaves nothing behind and can be repeated immediately.
