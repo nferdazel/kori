@@ -1157,6 +1157,19 @@ proc effortUnsupportedBody*(asked: string): string =
   "{\"error\":{\"type\":\"effort_unsupported\",\"message\":" &
     jsonEscape("no leg accepts reasoning_effort '" & asked & "'") & "}}"
 
+proc effortStopWithoutDial*(dials, effortSkips: int): bool =
+  ## A request the caller's own effort ended: nothing was dialled and at least
+  ## one leg was skipped for its ceiling. The two skip reasons are counted
+  ## separately, so a walk that also skipped an unmapped alias still reads as
+  ## this case instead of being measured against the walk length.
+  dials == 0 and effortSkips > 0
+
+proc countsTowardAvailability*(availability: bool, effortStop: bool): bool =
+  ## D9's window counter counts legs that could not serve. A 400 naming the
+  ## caller's effort dialled nothing, so it moves no availability; a skip the
+  ## walk then served past is counted exactly as before.
+  availability and not effortStop
+
 proc requestModel*(body: string): string =
   ## The caller's top-level `model` string, or "" when the body has none. A parse,
   ## not a rewrite: nothing here has to keep the caller's bytes.
@@ -1938,6 +1951,7 @@ proc handleChat(gateway: Gateway, request: Request): Future[void] {.async.} =
   # Empty means the caller named none, and then nothing here changes the body.
   let callerEffort = requestEffort(forwardBody)
   var effortSkips = 0
+  var dials = 0
   var effortClampedLog = ""
 
   var aliasKnown = false
@@ -2012,6 +2026,7 @@ proc handleChat(gateway: Gateway, request: Request): Future[void] {.async.} =
       if probing:
         gateway.legs[index].probeInFlight = true
       gateway.markAttempted(index)
+      inc dials
       route = leg.name
       # DEC-10: a leg that names a model gets that id, and only that leg does. An
       # alias request resolves per leg instead: a leg's static `model` does not
@@ -2085,11 +2100,15 @@ proc handleChat(gateway: Gateway, request: Request): Future[void] {.async.} =
     tokensOut = none(int)
     answered = true
 
-  if not answered and effortSkips > 0 and effortSkips == order.len and
-     hardStop.len == 0:
-    # Item 4: every leg in the walk was skipped for effort, so the value the
-    # caller asked for is the thing to name. A 400 with a body that says which
-    # value, the same shape an unknown alias gets, and no cooldown was started.
+  let effortStop = effortStopWithoutDial(dials, effortSkips)
+  if not answered and effortStop and hardStop.len == 0:
+    # Item 4: the value the caller asked for is what ended this request: no leg
+    # was dialled and at least one was skipped for its ceiling. A walk that also
+    # skipped an unmapped alias lands here too, because those skips are counted
+    # separately instead of being compared with the walk length. A 400 with a
+    # body that names the value, the same shape an unknown alias gets, and no
+    # cooldown was started. A leg that was really dialled and failed keeps the
+    # 502 below.
     route = gateway.cfg.legs[^1].name
     await request.sendErrorBody(400, effortUnsupportedBody(callerEffort))
     status = 400
@@ -2110,7 +2129,7 @@ proc handleChat(gateway: Gateway, request: Request): Future[void] {.async.} =
     gateway.tokensInTotal += tokensIn.get
   if tokensOut.isSome:
     gateway.tokensOutTotal += tokensOut.get
-  if chain.availability:
+  if countsTowardAvailability(chain.availability, effortStop):
     gateway.failoverAvailability.inc
   if chain.capacity:
     gateway.failoverCapacity.inc
