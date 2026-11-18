@@ -200,7 +200,14 @@ changes:
 | `medium` | `["low", "high", "max"]` | `low` | `"effort_clamped":"medium>low"` |
 | `low` | `["high", "max"]` | nothing, the leg is skipped | `effort_unsupported` |
 | anything | no `efforts` key | the caller's value, untouched | no clamp key |
+| anything ranked | `[]` | nothing, the leg is skipped | `effort_unsupported` |
 | nothing | any | the field stays absent | no clamp key |
+
+An empty array is not the same as a missing key. `"efforts": []` passes config load as a
+ceiling with nothing under it, so every ranked value is skipped on that leg; only the absent
+key means no ceiling at all. A leg written that way answers no ranked request, and when no
+other leg in the walk serves it the caller gets the `effort_unsupported` `400` described
+below, so the mistake shows up at request time and nowhere earlier.
 
 A clamp only ever goes down. Asking for `low` against a leg that starts at `high` is skipped
 rather than upgraded, because spending more than the caller asked for is a cost decision
@@ -211,6 +218,11 @@ which names the value.
 
 A value kori does not rank is forwarded untouched rather than guessed at, and the leg's own
 validation decides what happens to it.
+
+The ceiling is a cost and behaviour control, not a security control. Because an unranked
+value passes through as the caller sent it, a leg's `efforts` list is not a hard limiter on
+what a client can ask for: it only clamps the seven ranked values and leaves everything else
+to the leg.
 
 The committed `ops/etc/config.json.example` carries the three legs this deployment has:
 `opencode-go` and `commandcode` accept `low`, `high` and `max`; `sinarcloud` accepts `low`
