@@ -62,6 +62,38 @@ MISSING_SESSION_BODY = {
     }
 }
 
+# One System One answer, in the shape commandcode returns it: `answers` is a
+# question id keyed object, and the token counts are `input_tokens`/`output_tokens`
+# (not the OpenAI `prompt_tokens`/`completion_tokens`).
+SYSTEMONE_ANSWER_BODY = {
+    "model": "typesafe/jev",
+    "answers": {
+        "who": {
+            "type": "choice",
+            "choice": "Bagas",
+            "confidence": 0.76,
+            "probabilities": {"Bagas": 0.76, "Fikri": 0.14, "Wulan": 0.10},
+        }
+    },
+    "usage": {"input_tokens": 322, "output_tokens": 43},
+}
+
+SYSTEMONE_UNSUPPORTED_BODY = {
+    "error": {
+        "message": 'Model "typesafe/jev-latest" is not supported on this endpoint. '
+                   "Use one of: typesafe/jev, typesafe/jev-1.14.0.",
+        "type": "invalid_request_error",
+    }
+}
+
+SYSTEMONE_INVALID_BODY = {
+    "error": {
+        "message": "Invalid input: expected record, received array",
+        "type": "invalid_request_error",
+        "param": "questions.q.criteria",
+    }
+}
+
 BAD_MODEL_BODY = {
     "error": {
         "message": "model `flash` does not exist",
@@ -280,6 +312,16 @@ def handle(conn, addr, opts):
             send(conn, 200, "application/json", body_bytes(OK_BODY, opts))
         elif mode == "ok-nousage":
             send(conn, 200, "application/json", body_bytes(OK_NOUSAGE_BODY, opts))
+        elif mode == "systemone-ok":
+            # The model the caller asked for is echoed back, so a case can prove
+            # which id kori actually sent by reading the answer, not the log.
+            payload = dict(SYSTEMONE_ANSWER_BODY)
+            payload["model"] = opts.model or SYSTEMONE_ANSWER_BODY["model"]
+            send(conn, 200, "application/json", json.dumps(payload).encode())
+        elif mode == "systemone-unsupported":
+            send(conn, 400, "application/json", dumps(SYSTEMONE_UNSUPPORTED_BODY))
+        elif mode == "systemone-invalid":
+            send(conn, 400, "application/json", dumps(SYSTEMONE_INVALID_BODY))
         elif mode == "ok-then-401":
             if dials_so_far(opts.count_file) > opts.after:
                 send(conn, 401, "application/json", dumps({"error": {"message": "Unauthorized"}}))

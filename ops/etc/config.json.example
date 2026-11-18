@@ -37,5 +37,15 @@
       "api_key": "__KORI_SINARCLOUD_API_KEY__",
       "efforts": ["low", "high"]
     }
-  ]
+  ],
+  "systemone": {
+    "legs": [
+      {
+        "name": "commandcode-jev",
+        "base_url": "https://api.commandcode.ai/provider/v1",
+        "api_key": "__KORI_COMMANDCODE_API_KEY__",
+        "model": "typesafe/jev-1.14.0"
+      }
+    ]
+  }
 }

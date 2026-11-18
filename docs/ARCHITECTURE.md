@@ -49,9 +49,10 @@ caller ──POST /v1/chat/completions──► kori
 | attempts | one leg, one attempt, the retry budget (`DEC-12`), the key pool (`DEC-13`), and the outcome the walk consumes |
 | credential refresh | the token call, the single in-flight refresh per leg, the atomic write-back of a rotated credential |
 | proxy | the failover walk and the one log line per request |
+| systemone | the second door (`DEC-19`): its own ordered legs, the model-id rewrite, and a passthrough of every other byte |
 | log tail | bounded backwards scan for `/admin/log` and `recent[]` |
 | state | `/admin/state`, `/admin/config` and `/healthz?deep` JSON, with credentials redacted |
-| handlers | dispatch, the static surface, `/healthz`, `/admin/*`, `/v1/models`, `/v1/chat/completions` |
+| handlers | dispatch, the static surface, `/healthz`, `/admin/*`, `/v1/models`, `/v1/chat/completions`, `/v1/systemone` |
 | main | startup order: CLI, config, log, listener |
 
 `apps/api/src/config.nims` adds `-d:ssl` and the revision define. The revision is read from
@@ -63,9 +64,9 @@ path, content type and body for the eight files under `apps/web/dist`.
 
 ## Request lifecycle
 
-1. `dispatch` routes by path. `/healthz`, `/metrics`, `/admin/*`, `/v1/models` and
-   `/v1/chat/completions` keep priority; the static surface is last in the chain, so adding a
-   dashboard page can never shadow an API path.
+1. `dispatch` routes by path. `/healthz`, `/metrics`, `/admin/*`, `/v1/models`,
+   `/v1/chat/completions` and `/v1/systemone` keep priority; the static surface is last in the
+   chain, so adding a dashboard page can never shadow an API path.
 2. `handleChat` reads the body once, decides `stream` from it, and injects
    `stream_options.include_usage` for streaming requests that omit it.
 3. `pickOrder` returns the legs to try, skipping any leg whose cooldown has not expired, a leg
@@ -96,6 +97,21 @@ half-open probe: a second failure starts a fresh full cooldown. A pool entry coo
 same clock, and the leg itself is only cooled once every entry in the pool is cooling. A leg
 skipped for its effort ceiling or for an unmapped alias was never dialled, so it is not a
 failure and takes no cooldown.
+
+## The System One door
+
+`POST /v1/systemone` is a second door (`DEC-19`), and it shares the log, the counters and the
+classification rules but not the walk. Its upstreams come from a `systemone.legs` block, they
+are tried in config order, and the walk stops at the first answer. The caller's body is
+forwarded byte for byte with one field replaced, the top-level `model`, because the name a
+caller uses for a decision model is not the id a provider accepts. The answer is written back
+untouched, which is why this door has no streaming path and no `stream_options` injection: a
+decision is one JSON body.
+
+A provider that answers `unsupported_model`, or "is not supported on this endpoint", is a bad
+leg and the walk moves on (`model_gone`); a plain `400` from the same provider is the caller's
+own body and reaches the caller unchanged. Nothing here fails over after the first byte, for
+the same reason the chat door does not: the caller already has the answer.
 
 ## Static surface
 
@@ -156,10 +172,12 @@ a document that repeated it here would be wrong after the next deploy.
 
 ## Not built
 
-- Anything but chat. No `/v1/messages`, no Responses API, no embeddings, images, audio or batch.
-  Every leg is spoken to in the OpenAI protocol, so a native passthrough for Bedrock, Vertex or
-  Azure would be a second protocol path rather than a config change, and a client that speaks only
-  Anthropic's or OpenAI's Responses protocol cannot use this door today.
+- Anything but chat, plus the one decision door. No `/v1/messages`, no Responses API, no
+  embeddings, images, audio or batch. Every chat leg is spoken to in the OpenAI protocol, so a
+  native passthrough for Bedrock, Vertex or Azure would be a second protocol path rather than a
+  config change, and a client that speaks only Anthropic's or OpenAI's Responses protocol cannot
+  use this door today. `POST /v1/systemone` (`DEC-19`) is the exception, and it is a passthrough
+  and not a translation: it forwards one wire shape and never converts between two.
 - Cost, budget and cache. A request line carries `cost_usd` when the config prices the model that
   answered (`DEC-16`), so a month can be summed from the log; there is still no spend cap per key or
   per caller, and no exact or semantic cache.

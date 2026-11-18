@@ -1,14 +1,17 @@
 # kori
 
-An in-house LLM provider gateway: one Nim binary that exposes a single `/v1/chat/completions` door
-and routes each request across an ordered list of provider legs, failing over when a leg is dead. It
-exists to replace a LiteLLM deployment that carried a Python service and a Postgres database for a
-workload of one person.
+An in-house LLM provider gateway: one Nim binary that exposes a `/v1/chat/completions` door over an
+ordered list of provider legs, failing over when a leg is dead, plus a `POST /v1/systemone` door that
+passes a decision request through to its own legs. It exists to replace a LiteLLM deployment that
+carried a Python service and a Postgres database for a workload of one person.
 
 ## What this is
 
 - One door, ordered legs. A primary leg plus ordered fallbacks. The caller sees one endpoint and
   never learns which leg answered.
+- A second door for decisions. `POST /v1/systemone` forwards a System One body with only the model
+  id replaced, so a model that is not a chat model keeps its credential, its log line and its
+  counters inside kori (`DEC-19`).
 - Dead-route classification. A leg that answers `401`, `400 MissingSessionID`, connection refused, a
   dial or TLS timeout, a quota `429` or a `5xx` is marked dead and the next leg is tried. A client
   error that belongs to the caller (`400`, `403`, `404`, a plain `429`) is returned unchanged and
@@ -264,6 +267,7 @@ one the rest of the admin surface uses, so scraping from another host means goin
 | Path | Method | Purpose |
 |---|---|---|
 | `/v1/chat/completions` | POST | the gateway door |
+| `/v1/systemone` | POST | a decision passthrough (`DEC-19`): the caller's System One body goes upstream with only `model` replaced, answered from its own `systemone.legs` list; `404` when the config declares none |
 | `/v1/models` | GET, HEAD | the model list derived from this config: one `kori/<alias>` per alias, plus every leg `model` id; no provider is dialled |
 | `/healthz` | GET, HEAD | `{"status":"ok","version":…,"revision":…}`; revision is the git sha the binary was built from, or `dev` |
 | `/healthz?deep` | GET, HEAD | the same liveness, plus per-leg state, cooldown, last success, last failure and window counters, read from router state with zero dials |
@@ -419,6 +423,13 @@ repository, in an image or in a log.
 | `legs[].oauth.refresh_skew_seconds` | no | refresh this long before expiry, default `60` |
 | `balance` | no | default `false`, which keeps strict leg order; `true` splits the pick across available primaries by `weight` (DEC-11) |
 | `prices` | no | USD per million tokens, keyed by the model id sent upstream, for example `{"glm-5.3-flash": {"in": 0.6, "out": 2.2}}`; `"*"` is the catch-all. A model with no entry logs no `cost_usd` (DEC-16) |
+| `systemone` | no | a second door, `POST /v1/systemone` (`DEC-19`); absent means the route answers `404`. Its legs are not part of the chat walk |
+| `systemone.legs[].name` | yes, with `systemone` | the name that appears in the log and on the dashboard |
+| `systemone.legs[].base_url` | yes, with `systemone` | kori appends `/systemone` to its path, unless the path already ends there |
+| `systemone.legs[].model` | yes, with `systemone` | the provider id that replaces the caller's `model`; unlike a chat leg this is required, because the whole reason the door exists is that the caller's name is not the provider's |
+| `systemone.legs[].api_key` | no | sent as `Authorization: Bearer …` unless `headers` already sets one |
+| `systemone.legs[].headers` | no | extra request headers |
+| `systemone.legs[].enabled` | no | `true` or `false`, default `true` |
 | `log.rotate_bytes` | no | rotate the live log at this size in bytes; `0`, the default, keeps one growing file (DEC-17) |
 | `log.keep` | no | how many rotated files stay beside the live one, `1`-`20`, default `2` |
 | `listen`, `log` | no | overridden by `--address`, `--port`, `--log` |

@@ -410,3 +410,35 @@ so a counter that is incremented in two places has two places to get wrong — w
 increment sits exactly where the log line is built, and `/admin/state` reads the totals rather than
 recomputing them. The histogram is a fixed table in the binary; changing the buckets means a release,
 not a config edit.
+
+## DEC-19 — `/v1/systemone` is a second door with its own legs, not a second protocol path
+
+**Status:** accepted 2026-11-18.
+
+**Context.** Jev — the model that decides which bot answers a message in a group chat — is not a
+chat model. On commandcode it is served at `POST /provider/v1/systemone` with a body of `state`,
+`model` and `questions` keyed by question id, and it answers `answers` plus `usage.input_tokens` /
+`usage.output_tokens`. Pointing MausBot straight at the provider would work, but it moves the
+credential out of kori, takes the decision out of the request log and out of `/metrics`, and leaves
+a second place to update when another provider starts serving jev.
+
+**Decision.** `POST /v1/systemone` passes the caller's body through to an ordered list of System One
+upstreams declared in a separate `systemone.legs` block. Exactly one field is rewritten: the
+top-level `model` becomes the leg's configured id, because the caller's name for the model is not
+the provider's (MausBot sends `jev-latest`; commandcode accepts `typesafe/jev-1.14.0`). Everything
+else — `state`, `questions`, unknown fields — reaches the provider byte for byte, and the answer
+comes back untouched. The walk is config order with the same dead-route classification and the same
+60 s / 900 s cooldowns as the chat door, with one addition: a provider that answers "this model is
+not supported on this endpoint" is a bad leg, so the walk moves on instead of handing the caller a
+400 naming a model they never chose. There is no streaming, no retry, no key pool and no alias
+table: System One answers once, and a decision is one call.
+
+The block is optional. A config without it answers `404` on the route, so no existing config changes
+behaviour, and a door nobody configured does not exist.
+
+**Consequences.** One credential, one log, one set of counters for both doors, and adding a provider
+that serves jev is a config edit plus `SIGHUP`. The cost: kori now speaks a second wire shape, and
+that shape is a passthrough, not a translation — a provider that answers in a third shape cannot be
+reached by a config edit, so "add another protocol" stays a code change and is refused here on
+purpose. `systemone.legs[].model` is required, unlike a chat leg, because an empty id would forward
+a caller string the provider rejects.

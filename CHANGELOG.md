@@ -15,6 +15,16 @@ this one, is the answer to "what is live".
 
 ### Added
 
+- `POST /v1/systemone`: a second door for a decision model that is not a chat model (`DEC-19`). The
+  caller's body is forwarded byte for byte with one field replaced, the top-level `model`, so a
+  caller name such as `jev-latest` becomes the provider id the leg is configured for. The answer is
+  returned untouched. Its upstreams live in a separate `systemone.legs` block, tried in config
+  order with the same dead-route classification, the same 60 s / 900 s cooldowns and the same
+  one-line log and `/metrics` counters as the chat door. A provider that refuses the model
+  (`unsupported_model`, "not supported on this endpoint") is a bad leg, so the walk moves on; a
+  plain `400` is the caller's and reaches the caller unchanged. A config with no `systemone` block
+  answers `404` on the route, so nothing changes for an existing config. `/admin/config` reports the
+  block beside the chat legs, and `/admin/state` reports each System One leg's state and cooldown.
 - `SIGHUP` reloads the config without a restart: legs, keys, models, aliases, efforts, `prices`,
   `balance` and the log rotation policy are applied in place after the new file parses and
   validates. A file that does not is refused whole, `/admin/config` records the error under

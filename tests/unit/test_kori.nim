@@ -1057,6 +1057,90 @@ block:
   check "a moved listener keeps the old port",
     ($parseJson(gateway.configJson()){"listen"}).contains(":4011")
 
+# ------------------------------------------------------- 0.7.0 systemone ---
+
+block:
+  # DEC-19: the second door's config. Optional, its own list, and the model id is
+  # required because that id is the whole reason the door exists.
+  let path = writeConfig("systemone.json", """
+{"legs":[{"name":"leg-a","base_url":"http://127.0.0.1:1/v1","api_key":"k"}],
+ "systemone":{"legs":[
+   {"name":"jev","base_url":"https://api.commandcode.ai/provider/v1",
+    "api_key":"sk-jev","model":"typesafe/jev-1.14.0"}]}}
+""")
+  let cfg = loadConfig(path)
+  check "a systemone block is parsed", cfg.systemone.len == 1
+  check "its model is the configured id",
+    cfg.systemone[0].model == "typesafe/jev-1.14.0"
+  check "its head is the same config head, not a second protocol",
+    systemonePath(cfg.systemone[0].baseUrl) == "/provider/v1/systemone"
+  check "a base that already names the endpoint keeps it",
+    systemonePath("https://x.test/v1/systemone") == "/v1/systemone"
+  check "a bare host gets the default path",
+    systemonePath("https://x.test") == "/v1/systemone"
+
+  var noBlock = loadConfig(writeConfig("no-systemone.json", """
+{"legs":[{"name":"leg-a","base_url":"http://127.0.0.1:1/v1","api_key":"k"}]}
+"""))
+  check "a config without the block has no systemone legs",
+    noBlock.systemone.len == 0
+
+  checkRaises "a systemone leg without a model is refused", ConfigError:
+    discard loadConfig(writeConfig("systemone-no-model.json", """
+{"legs":[{"name":"leg-a","base_url":"http://127.0.0.1:1/v1","api_key":"k"}],
+ "systemone":{"legs":[{"name":"jev","base_url":"https://x.test/v1",
+                       "api_key":"k"}]}}
+"""))
+  checkRaises "an empty systemone list is refused, not silently ignored",
+    ConfigError:
+    discard loadConfig(writeConfig("systemone-empty.json", """
+{"legs":[{"name":"leg-a","base_url":"http://127.0.0.1:1/v1","api_key":"k"}],
+ "systemone":{"legs":[]}}
+"""))
+
+block:
+  # The one edit this door makes, and the usage shape it reads.
+  let caller = """{"state":"who answers?","model":"jev-latest","questions":{}}"""
+  check "the model id is replaced and nothing else is",
+    rewriteModel(caller, "typesafe/jev-1.14.0") ==
+      "{\"state\":\"who answers?\",\"model\":\"typesafe/jev-1.14.0\",\"questions\":{}}"
+  let answer = """{"model":"typesafe/jev","answers":{},"usage":{"input_tokens":322,"output_tokens":43}}"""
+  let (ins, outs) = systemoneUsage(answer)
+  check "systemone usage reads input_tokens", ins == some(322)
+  check "systemone usage reads output_tokens", outs == some(43)
+  let (noneIn, noneOut) = systemoneUsage("""{"answers":{}}""")
+  check "an answer with no usage reports null, never zero",
+    noneIn.isNone and noneOut.isNone
+  check "an unsupported model is a bad leg",
+    systemoneUnsupportedBody(
+      """{"error":{"message":"Model \"x\" is not supported on this endpoint."}}""")
+  check "a caller's invalid input is not a bad leg",
+    not systemoneUnsupportedBody(
+      """{"error":{"message":"Invalid input: expected record","param":"questions"}}""")
+
+block:
+  # The order is the config's, and a cooling leg is skipped without a dial.
+  var cfg = Config(listenHost: "127.0.0.1", listenPort: 4011,
+                   logPath: scratch / "so.jsonl")
+  cfg.legs = @[legSpec("leg-a", lrPrimary)]
+  cfg.systemone = @[
+    SystemoneLeg(name: "jev-a", baseUrl: "https://a.test/v1", model: "m",
+                 enabled: true),
+    SystemoneLeg(name: "jev-b", baseUrl: "https://b.test/v1", model: "m",
+                 enabled: false),
+    SystemoneLeg(name: "jev-c", baseUrl: "https://c.test/v1", model: "m",
+                 enabled: true)]
+  let gateway = newGateway(cfg, RequestLog(fd: -1), "127.0.0.1:4011")
+  check "the order skips the disabled leg",
+    gateway.systemoneOrder(epochTime()) == @[0, 2]
+  gateway.startSystemoneCooldown(0, TokenAuth401)
+  check "a cooling leg leaves the order",
+    gateway.systemoneOrder(epochTime()) == @[2]
+  check "the cooldown is counted for that route",
+    parseJson(gateway.configJson()){"systemone"}.len == 3
+  check "the config reports the block beside the chat legs",
+    parseJson(gateway.configJson()){"legs"}.len == 1
+
 # --------------------------------------------------------------------- report ---
 
 removeDir(scratch)

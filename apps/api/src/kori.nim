@@ -18,9 +18,14 @@
 # table (DEC-16), size-based log rotation (DEC-17) and `/metrics` in the Prometheus
 # text format (DEC-18).
 #
-# Deliberately absent, and not to be reported as done: every non-chat endpoint
-# (messages, responses, embeddings, images, audio, batch), spend caps and cache,
-# caller identity, a second replica, and compression of rotated logs.
+# Slice 8 (0.7.0): `POST /v1/systemone`, a second door that passes a System One
+# request through to its own ordered legs, unchanged except the model id
+# (DEC-19). It is not a protocol translation and not part of the chat walk.
+#
+# Deliberately absent, and not to be reported as done: every chat-shaped
+# convenience endpoint (messages, responses, embeddings, images, audio, batch),
+# protocol translation between chat and System One, spend caps and cache, caller
+# identity, a second replica, and compression of rotated logs.
 # docs/ARCHITECTURE.md, "Not built", is the list this comment must agree with.
 
 import std/[algorithm, asyncdispatch, asyncnet, exitprocs,
@@ -206,6 +211,17 @@ type
     usdIn*: float
     usdOut*: float
 
+  SystemoneLeg* = object
+    ## DEC-19. A System One endpoint is not a chat leg and never enters the chat
+    ## walk: it answers a decision, not a completion. It keeps its own ordered
+    ## list, cooldowns and counters, and the same one-line log.
+    name*: string
+    baseUrl*: string
+    apiKey*: string
+    model*: string            ## the provider id sent upstream; "" forwards the caller's
+    headers*: seq[(string, string)]
+    enabled*: bool
+
   Config* = object
     listenHost*: string
     listenPort*: int
@@ -215,6 +231,7 @@ type
     balance*: bool
     legs*: seq[Leg]
     prices*: Table[string, Price]  ## by model id, plus "*" for the fallback
+    systemone*: seq[SystemoneLeg]  ## `POST /v1/systemone` upstreams, in config order
 
   CliOptions* = object
     configPath*: string
@@ -251,6 +268,16 @@ type
     keyCooling*: seq[float]     ## epoch seconds per pool entry, 0 when live
     ## DEC-11: smooth weighted round-robin credit, never negative.
     weightCurrent*: int
+
+  SystemoneRuntime* = object
+    ## DEC-19. The same two facts the chat router keeps per leg, minus everything
+    ## that only means something to a weighted pick: a System One list is walked
+    ## in config order, so there is no weight, no cursor and no key pool.
+    attempted*: bool
+    coolingUntil*: float
+    lastFailureClass*: string
+    lastFailureAt*: string
+    lastSuccessAt*: string
 
   FailoverEvent* = object
     at*: string
@@ -298,6 +325,7 @@ type
     cursor: int
     ssl*: SslContext
     legs*: seq[LegRuntime]
+    systemone*: seq[SystemoneRuntime]
     oauth*: seq[OauthState]
     events*: seq[FailoverEvent]
     configPath*: string
@@ -710,6 +738,53 @@ proc loadConfig*(path: string): Config =
   if result.legs.len == 0:
     failConfig("config needs at least one leg")
 
+  # DEC-19. `systemone` is a second door with its own ordered legs. It is
+  # optional: a config without it serves the chat door exactly as before and
+  # answers 404 on `/v1/systemone`, so no existing config changes behaviour.
+  let systemone = root{"systemone"}
+  if systemone != nil and systemone.kind != JNull:
+    if systemone.kind != JObject:
+      failConfig("systemone must be an object")
+    let soLegs = systemone{"legs"}
+    if soLegs == nil or soLegs.kind != JArray:
+      failConfig("systemone needs a legs array")
+    for index in 0 ..< soLegs.len:
+      let item = soLegs[index]
+      let ctx = "systemone.legs[" & $index & "]"
+      if item.kind != JObject:
+        failConfig(ctx & " must be an object")
+      var leg = SystemoneLeg(enabled: true)
+      leg.name = optionalString(item, "name", ctx)
+      if leg.name.len == 0:
+        failConfig(ctx & ".name is required")
+      leg.baseUrl = optionalString(item, "base_url", ctx)
+      if leg.baseUrl.len == 0:
+        failConfig(ctx & ".base_url is required")
+      leg.apiKey = optionalString(item, "api_key", ctx)
+      # Required here, unlike a chat leg: a System One request names a model, and
+      # the whole point of this door is that kori owns which id reaches which
+      # provider. An empty id would forward a caller string that commandcode
+      # rejects with its own 400.
+      leg.model = optionalString(item, "model", ctx)
+      if leg.model.len == 0:
+        failConfig(ctx & ".model is required")
+      let headers = item{"headers"}
+      if headers != nil and headers.kind != JNull:
+        if headers.kind != JObject:
+          failConfig(ctx & ".headers must be an object")
+        for key, value in headers:
+          if value.kind != JString:
+            failConfig(ctx & ".headers." & key & " must be a string")
+          leg.headers.add((key, value.getStr()))
+      let enabledNode = item{"enabled"}
+      if enabledNode != nil and enabledNode.kind != JNull:
+        if enabledNode.kind != JBool:
+          failConfig(ctx & ".enabled must be true or false")
+        leg.enabled = enabledNode.getBool()
+      result.systemone.add leg
+    if result.systemone.len == 0:
+      failConfig("systemone.legs must not be empty when the block is present")
+
 proc applyCli*(cfg: var Config, cli: CliOptions) =
   ## CLI > config > built-in default, in that order (CONTRACT §2).
   if cli.hasAddress:
@@ -969,6 +1044,13 @@ proc metricsText*(gateway: Gateway): string =
     let cooling = if gateway.legs[index].coolingUntil > epochTime(): 1 else: 0
     text.add "kori_route_cooling{route=\"" & promEscape(leg.name) & "\"} " &
             $cooling & "\n"
+  # DEC-19: a System One leg is a route too, and a gauge that hid it would make a
+  # cooling door look healthy. Names are the config's, so an operator who reuses a
+  # name across the two doors merges two series on purpose.
+  for index, leg in gateway.cfg.systemone:
+    let cooling = if gateway.systemone[index].coolingUntil > epochTime(): 1 else: 0
+    text.add "kori_route_cooling{route=\"" & promEscape(leg.name) & "\"} " &
+            $cooling & "\n"
   text.add "# HELP kori_request_duration_ms Request latency in milliseconds.\n"
   text.add "# TYPE kori_request_duration_ms histogram\n"
   var cumulative = 0
@@ -1018,6 +1100,7 @@ proc newGateway*(cfg: Config, log: RequestLog,
                    listenAddr: listenAddr, cursor: -1,
                    ssl: newUpstreamSslContext(),
                    legs: newSeq[LegRuntime](cfg.legs.len),
+                   systemone: newSeq[SystemoneRuntime](cfg.systemone.len),
                    oauth: newSeq[OauthState](cfg.legs.len),
                    metrics: Metrics(latency: newSeq[int](LatencyBucketsMs.len + 1),
                                     requestsByRoute: initTable[string, int](),
@@ -1165,6 +1248,67 @@ proc recordEvent(gateway: Gateway, fromRoute, toRoute, reason: string) =
                                    toRoute: toRoute, reason: reason)
   while gateway.events.len > FailoverEventLimit:
     gateway.events.delete(0)
+
+# ------------------------------------------------------- systemone router ---
+
+proc systemoneOrder*(gateway: Gateway, now: float): seq[int] =
+  ## DEC-19. Config order, nothing else: this list is a fallback chain, not a
+  ## load balancer. A cooling leg is skipped without a dial exactly as a chat leg
+  ## is, and a leg the config switched off keeps its place in the order.
+  for index, leg in gateway.cfg.systemone:
+    if not leg.enabled:
+      continue
+    if gateway.systemone[index].coolingUntil > now:
+      continue
+    result.add index
+
+proc startSystemoneCooldown*(gateway: Gateway, index: int, reason: string) =
+  ## The same two cooldowns and the same reason tokens as the chat door, so one
+  ## log is readable without knowing which door a line came from.
+  let cooldown =
+    if reason == TokenQuota429: CapacityCooldownS
+    else: AvailabilityCooldownS
+  let now = epochTime()
+  var runtime = addr gateway.systemone[index]
+  runtime.attempted = true
+  runtime.coolingUntil = now + cooldown
+  runtime.lastFailureClass = reason
+  runtime.lastFailureAt = stampAt(now)
+  let name = gateway.cfg.systemone[index].name
+  gateway.metrics.cooldownStarts.mgetOrPut(name, 0).inc
+
+proc markSystemoneServed(gateway: Gateway, index: int) =
+  let now = epochTime()
+  var runtime = addr gateway.systemone[index]
+  runtime.attempted = true
+  runtime.coolingUntil = 0
+  runtime.lastSuccessAt = stampAt(now)
+
+proc systemoneUnsupportedBody*(body: string): bool =
+  ## A provider that answers "this endpoint does not take that model" is telling
+  ## kori the leg is wrong for the id, not the caller. Narrow on purpose: a plain
+  ## 400 from the same provider is the caller's body and must reach the caller.
+  body.contains("unsupported_model") or
+    body.contains("is not supported on this endpoint") or
+    body.contains("does not support")
+
+proc systemoneUsage*(body: string): (Option[int], Option[int]) =
+  ## DEC-19. System One reports `usage.input_tokens` and `usage.output_tokens`,
+  ## not the [OI] `prompt_tokens`/`completion_tokens`, so the chat reader finds
+  ## nothing here. Provider-reported only: a leg that reports nothing gets null.
+  try:
+    let node = parseJson(body)
+    if node.kind == JObject:
+      let usage = node{"usage"}
+      if usage != nil and usage.kind == JObject:
+        let tokensIn = usage{"input_tokens"}
+        let tokensOut = usage{"output_tokens"}
+        if tokensIn != nil and tokensIn.kind == JInt:
+          result[0] = some(tokensIn.getInt())
+        if tokensOut != nil and tokensOut.kind == JInt:
+          result[1] = some(tokensOut.getInt())
+  except CatchableError:
+    discard
 
 # --------------------------------------------------------------- upstream io ---
 
@@ -1328,6 +1472,20 @@ proc upstreamPath(baseUrl: string): string =
   if path.len == 0:
     path = "/v1"
   path & "/chat/completions"
+
+proc systemonePath*(baseUrl: string): string =
+  ## DEC-19. The same rule as `upstreamPath` with the other endpoint: the base
+  ## URL names where a provider lives, and kori appends the one path this door
+  ## speaks. A base that already ends in `/systemone` keeps its own path, so both
+  ## spellings in a config mean the thing the operator wrote.
+  var path = parseUri(baseUrl).path
+  while path.endsWith("/"):
+    path.setLen(path.len - 1)
+  if path.endsWith("/systemone"):
+    return path
+  if path.len == 0:
+    path = "/v1"
+  path & "/systemone"
 
 # ------------------------------------------------------------- classification ---
 
@@ -2732,6 +2890,285 @@ proc handleChat(gateway: Gateway, request: Request): Future[void] {.async.} =
     else:
       inc gateway.logLines
 
+# ------------------------------------------------------------- systemone ---
+
+proc attemptSystemone(gateway: Gateway, request: Request, leg: SystemoneLeg,
+                      body: string, totalDeadline: float): Future[AttemptOutcome] {.async.} =
+  ## DEC-19. One System One leg, one attempt, no retry and no key pool: the body
+  ## goes upstream with exactly one field changed (the model id) and whatever the
+  ## provider answers is written back untouched. A response is forwarded when it
+  ## arrives, so there is no failover window after the caller has seen a byte.
+  result.status = 502
+  let uri = parseUri(leg.baseUrl)
+  let isTls = uri.scheme == "https"
+
+  var connected: bool
+  var dialTimedOut: bool
+  var socket: AsyncSocket
+  (connected, dialTimedOut, socket) = await dial(uri)
+  if not connected:
+    result.kind = akFailed
+    result.reason = if dialTimedOut: TokenDialTimeout else: TokenConnRefused
+    return
+
+  var headersSent = false
+  try:
+    var client = socket
+    if isTls:
+      gateway.ssl.wrapConnectedSocket(client, handshakeAsClient, uri.hostname)
+
+    var head = "POST " & systemonePath(leg.baseUrl) & " HTTP/1.1\r\n"
+    head.add "Host: " & uri.hostname
+    if uri.port.len > 0:
+      head.add ":" & uri.port
+    head.add "\r\n"
+    head.add "Content-Type: application/json\r\n"
+    head.add "Content-Length: " & $body.len & "\r\n"
+    head.add "Accept: application/json\r\n"
+    head.add "Connection: close\r\n"
+    var hasAuthorization = false
+    for (name, value) in leg.headers:
+      if name.toLowerAscii() == "authorization":
+        hasAuthorization = true
+      head.add name & ": " & value & "\r\n"
+    if leg.apiKey.len > 0 and not hasAuthorization:
+      head.add "Authorization: Bearer " & leg.apiKey & "\r\n"
+    head.add "\r\n"
+
+    let handshakeDeadline =
+      if isTls: deadlineIn(TlsDeadlineMs)
+      else: deadlineIn(HeaderDeadlineNonStreamMs)
+    if not await client.awaitSend(head, handshakeDeadline):
+      result.kind = akFailed
+      result.reason = if isTls: TokenDialTimeout else: TokenConnRefused
+      return
+    if body.len > 0:
+      if not await client.awaitSend(body, totalDeadline):
+        result.kind = akFailed
+        result.reason = TokenConnRefused
+        return
+
+    let headerDeadline = deadlineIn(HeaderDeadlineNonStreamMs)
+    var raw = ""
+    var headDone = false
+    while not headDone:
+      if raw.len > MaxHeaderBytes:
+        result.kind = akFailed
+        result.reason = TokenUpstream5xx
+        return
+      let stop = raw.find("\r\n\r\n")
+      if stop >= 0:
+        headDone = true
+        break
+      let got = await awaitRecv(client, 8192, headerDeadline)
+      case got.kind
+      of rkData: raw.add got.data
+      of rkTimeout:
+        result.kind = akFailed
+        result.reason = TokenHeaderTimeout
+        return
+      of rkEof, rkTruncated, rkError:
+        result.kind = akFailed
+        result.reason = TokenConnRefused
+        return
+
+    let split = raw.find("\r\n\r\n")
+    let (status, headers) = parseHead(raw[0 ..< split])
+    let leftover = raw[split + 4 .. ^1]
+    if status == 0:
+      result.kind = akFailed
+      result.reason = TokenUpstream5xx
+      return
+
+    var reader = UpstreamReader(socket: client, buf: leftover, mode: bmEof)
+    let transferEncoding = headerValue(headers, "transfer-encoding").toLowerAscii()
+    let contentLength = headerValue(headers, "content-length")
+    if transferEncoding.contains("chunked"):
+      reader.mode = bmChunked
+    elif contentLength.len > 0:
+      try:
+        reader.mode = bmLength
+        reader.remaining = parseInt(contentLength)
+      except ValueError:
+        reader.mode = bmEof
+
+    # A decision is one small JSON answer, so the body is buffered either way:
+    # the log needs the token counts, and a caller that gets an error gets the
+    # provider's own words rather than a summary.
+    var payload = ""
+    var aborted = false
+    while true:
+      let slice = await reader.readSlice(totalDeadline)
+      case slice.kind
+      of rkData:
+        payload.add slice.data
+        if payload.len > MaxBodyBytes:
+          break
+      of rkEof:
+        break
+      of rkTruncated, rkTimeout, rkError:
+        aborted = true
+        break
+
+    let contentType = headerValue(headers, "content-type")
+
+    if not isSuccessStatus(status):
+      # The chat door's own failure classes, with one addition this door needs:
+      # a provider that says it does not take this model is a bad leg, not a bad
+      # caller, so the walk moves on instead of handing the caller a 400 that
+      # names a model they never chose.
+      var token = failureToken(status, payload)
+      if token.len == 0 and systemoneUnsupportedBody(payload):
+        token = TokenModelGone
+      if token.len > 0:
+        result.kind = akFailed
+        result.reason = token
+        return
+      headersSent = true
+      await request.sendFull(status,
+        (if contentType.len > 0: contentType else: "application/json"), payload)
+      result.kind = akPassthrough
+      result.status = status
+      return
+
+    if aborted and payload.len == 0:
+      await request.sendErrorBody(504, allLegsFailedBody("upstream_body_timeout"))
+      result.kind = akTerminal
+      result.status = 504
+      return
+
+    await request.sendFull(status,
+      (if contentType.len > 0: contentType else: "application/json"), payload)
+    headersSent = true
+    let (tokensIn, tokensOut) = systemoneUsage(payload)
+    result.tokensIn = tokensIn
+    result.tokensOut = tokensOut
+    if aborted:
+      result.kind = akAborted
+      result.status = status
+      result.reason = TokenMidStreamAbort
+      return
+    result.kind = akServed
+    result.status = status
+  except CatchableError:
+    if headersSent:
+      result.kind = akAborted
+      result.reason = TokenCallerFault
+    else:
+      result.kind = akFailed
+      result.reason = TokenConnRefused
+  finally:
+    closeQuietly(socket)
+
+proc handleSystemone(gateway: Gateway, request: Request): Future[void] {.async.} =
+  ## DEC-19. `POST /v1/systemone`: a passthrough for a decision request. The one
+  ## edit is the top-level `model`, replaced with the leg's configured id; every
+  ## other byte the caller sent reaches the provider. No streaming (System One is
+  ## one JSON answer), no retry, no key pool, no second protocol path.
+  let started = epochTime()
+  let totalDeadline = deadlineIn(TotalNonStreamMs)
+  var body = request.body
+
+  var status = 502
+  var route = ""
+  var terminalAbort = false
+  var abortReason = ""
+  var tokensIn: Option[int]
+  var tokensOut: Option[int]
+  var answered = false
+  var servedModel = ""
+  var firstFrom = ""
+  var firstReason = ""
+
+  let order = gateway.systemoneOrder(epochTime())
+  if order.len == 0:
+    # Every configured System One leg is cooling: no dial at all, same as chat.
+    route = gateway.cfg.systemone[^1].name
+    await request.sendErrorBody(502, allLegsFailedBody("all_legs_cooling"))
+    answered = true
+
+  if not answered and body.strip().len == 0:
+    route = gateway.cfg.systemone[0].name
+    await request.sendErrorBody(400,
+      "{\"error\":{\"type\":\"bad_request\",\"message\":\"body\"}}")
+    status = 400
+    answered = true
+
+  if not answered:
+    for position, index in order:
+      let leg = gateway.cfg.systemone[index]
+      route = leg.name
+      gateway.systemone[index].attempted = true
+      servedModel = leg.model
+      let legBody = rewriteModel(body, leg.model)
+      let outcome = await gateway.attemptSystemone(request, leg, legBody,
+                                                  totalDeadline)
+      if outcome.kind == akFailed:
+        gateway.startSystemoneCooldown(index, outcome.reason)
+        if firstReason.len == 0:
+          firstReason = outcome.reason
+          firstFrom = leg.name
+        if position + 1 < order.len:
+          gateway.recordEvent(leg.name,
+                              gateway.cfg.systemone[order[position + 1]].name,
+                              outcome.reason)
+        continue
+      status = outcome.status
+      terminalAbort = outcome.kind == akAborted
+      if terminalAbort:
+        abortReason = outcome.reason
+      tokensIn = outcome.tokensIn
+      tokensOut = outcome.tokensOut
+      if outcome.kind != akTerminal:
+        gateway.markSystemoneServed(index)
+      answered = true
+      break
+
+  if not answered:
+    let message = if firstReason.len > 0: firstReason else: "all_legs_failed"
+    await request.sendErrorBody(502, allLegsFailedBody(message))
+    status = 502
+    tokensIn = none(int)
+    tokensOut = none(int)
+
+  # The same completion the chat door uses, so this door's decisions land in the
+  # same log and the same counters. No alias and no effort apply here, and
+  # `stream` is always false: System One answers once.
+  gateway.requests.inc
+  if tokensIn.isSome:
+    gateway.tokensInTotal += tokensIn.get
+  if tokensOut.isSome:
+    gateway.tokensOutTotal += tokensOut.get
+
+  let logReason =
+    if terminalAbort and abortReason.len > 0: abortReason
+    elif terminalAbort: TokenMidStreamAbort
+    else: firstReason
+
+  let latencyMs = int((epochTime() - started) * 1000.0)
+  let costUsd =
+    if gateway.cfg.prices.len == 0: none(float)
+    else: requestCost(gateway.cfg, servedModel, tokensIn, tokensOut)
+  gateway.metrics.recordMetrics(route, status, latencyMs, logReason)
+  if costUsd.isSome:
+    gateway.costUsdTotal += costUsd.get
+    inc gateway.costUsdKnown
+  if gateway.log.appendLine(requestLogLine(
+      ts = nowStamp(),
+      route = route,
+      status = status,
+      latencyMs = latencyMs,
+      tokensIn = tokensIn,
+      tokensOut = tokensOut,
+      failoverFrom = firstFrom,
+      failoverReason = logReason,
+      stream = false,
+      costUsd = costUsd)):
+    if gateway.log.justRotated:
+      gateway.logLines = 1
+    else:
+      inc gateway.logLines
+
 # ---------------------------------------------------------------- log tail ---
 
 const
@@ -3065,6 +3502,29 @@ proc stateJson*(gateway: Gateway): string =
     routes.add(route)
   root["routes"] = routes
 
+  # DEC-19. The second door's legs are reported apart from `routes`, because they
+  # are not part of the chat failover chain and a dashboard that merged the two
+  # would draw a walk that does not exist.
+  if gateway.cfg.systemone.len > 0:
+    var soLegs = newJArray()
+    for index, leg in gateway.cfg.systemone:
+      let runtime = gateway.systemone[index]
+      var node = newJObject()
+      node["name"] = %leg.name
+      node["model"] = %leg.model
+      node["state"] = %(if not leg.enabled: "skipped"
+                       elif runtime.coolingUntil > now: "cooling"
+                       elif runtime.attempted: "ok"
+                       else: "unknown")
+      node["cooling_until"] = (if runtime.coolingUntil > now:
+                                 %stampAt(runtime.coolingUntil) else: newJNull())
+      node["last_failure_class"] = (if runtime.lastFailureClass.len > 0:
+                                      %runtime.lastFailureClass else: newJNull())
+      node["last_success_at"] = (if runtime.lastSuccessAt.len > 0:
+                                   %runtime.lastSuccessAt else: newJNull())
+      soLegs.add node
+    root["systemone"] = soLegs
+
   var windowNode = newJObject()
   windowNode["from"] = %gateway.startedAt
   windowNode["to"] = %nowStamp()
@@ -3213,6 +3673,32 @@ proc configJson*(gateway: Gateway): string =
                      else: newJNull())
   root["reload"] = reload
 
+  # DEC-19. Reported beside the chat legs, never inside them: a System One leg is
+  # not part of that walk, and a dashboard that merged the two lists would draw a
+  # failover chain that does not exist. The credential is reported the same way,
+  # as state and a file reference, never a value.
+  if gateway.cfg.systemone.len > 0:
+    var soLegs = newJArray()
+    for index, leg in gateway.cfg.systemone:
+      var node = newJObject()
+      node["order"] = %(index + 1)
+      node["name"] = %leg.name
+      node["base_url"] = %redactUrl(leg.baseUrl)
+      node["model"] = %leg.model
+      node["enabled"] = %leg.enabled
+      var headers = newJArray()
+      for (headerName, _) in leg.headers:
+        headers.add(%headerName)
+      node["headers"] = headers
+      var credential = newJObject()
+      credential["name"] = %(leg.name & " API key")
+      credential["state"] = %(if leg.apiKey.len > 0: "set" else: "missing")
+      credential["source"] = %"file"
+      credential["ref"] = %gateway.configPath
+      node["credential"] = credential
+      soLegs.add(node)
+    root["systemone"] = soLegs
+
   $root
 
 proc healthzJson*(): string =
@@ -3249,6 +3735,7 @@ proc deepHealthJson*(gateway: Gateway): string =
     legs.add(node)
   root["legs"] = legs
   $root
+
 
 proc modelsJson*(gateway: Gateway): string =
   ## P0 item 1: the model list an OpenAI client probes before it will talk to a
@@ -3520,6 +4007,16 @@ proc routeRequest(gateway: Gateway, request: Request): Future[void] {.async.} =
       await respondJson(request, Http405, "{\"error\":\"method not allowed\"}")
     else:
       await gateway.handleChat(request)
+  elif path == "/v1/systemone":
+    # DEC-19. A second door with its own upstreams. A config that declares no
+    # `systemone` block has no such route, and 404 is the honest answer: the
+    # binary did not gain an endpoint because a caller asked for one.
+    if gateway.cfg.systemone.len == 0:
+      await respondJson(request, Http404, notFoundBody())
+    elif request.reqMethod != HttpPost:
+      await respondJson(request, Http405, "{\"error\":\"method not allowed\"}")
+    else:
+      await gateway.handleSystemone(request)
   else:
     # Last in the chain on purpose: /healthz, /admin/* and /v1/* keep their
     # priority, so the D11 envelope is untouched by the static surface.
@@ -3597,6 +4094,8 @@ proc reloadConfig*(gateway: Gateway): bool =
   var oldLegs = gateway.cfg.legs
   var oldRuntime = gateway.legs
   var oldOauth = gateway.oauth
+  var oldSystemone = gateway.cfg.systemone
+  var oldSoRuntime = gateway.systemone
   var runtime = newSeq[LegRuntime](fresh.legs.len)
   var oauth = newSeq[OauthState](fresh.legs.len)
   for index, leg in fresh.legs:
@@ -3621,6 +4120,17 @@ proc reloadConfig*(gateway: Gateway): bool =
   gateway.cfg = fresh
   gateway.legs = runtime
   gateway.oauth = oauth
+  # DEC-19: a System One leg's state follows its name across a reload for the
+  # same reason a chat leg's does. A leg that disappeared loses its cooldown; a
+  # leg that was added starts fresh.
+  var freshSoRuntime = newSeq[SystemoneRuntime](fresh.systemone.len)
+  for index, leg in fresh.systemone:
+    for oldIndex, oldLeg in oldSystemone:
+      if oldLeg.name != leg.name:
+        continue
+      freshSoRuntime[index] = oldSoRuntime[oldIndex]
+      break
+  gateway.systemone = freshSoRuntime
   gateway.credentialRefs = credentialRefs(path, fresh.legs.len)
   inc gateway.reloads
   gateway.lastReloadAt = nowStamp()
