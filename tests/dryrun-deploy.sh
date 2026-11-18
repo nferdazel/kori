@@ -265,9 +265,11 @@ printf 'Valid configuration\n'
 exit 0
 STUB
 
-# flock is not on macOS; the script only needs -n 9 to succeed.
+# flock is not on macOS; here it only needs to succeed, but it records how it was called: the
+# deploy must ask it to wait (-w), not to skip (-n), or a push that lands mid-deploy is dropped.
 cat >"$BIN/flock" <<'STUB'
 #!/usr/bin/env bash
+[ -n "${PODMAN_STATE:-}" ] && printf 'flock %s\n' "$*" >>"$PODMAN_STATE/flock_calls.log"
 exit 0
 STUB
 
@@ -313,7 +315,7 @@ export KORI_HEALTH_GATE_SECONDS=4
 reset_state() {
   : >"$STATE/tags"
   : >"$STATE/calls.log"
-  rm -f "$STATE/rolled_back" "$STATE/pull_count" "$STATE/caddy_restarts"
+  rm -f "$STATE/rolled_back" "$STATE/pull_count" "$STATE/caddy_restarts" "$STATE/flock_calls.log"
   rm -f "$APP_DIR/.deployed_rev" "$APP_DIR/logs/deploy.log" "$APP_DIR/logs/smoke.log"
   # smoke.sh requires an append-only request log with a JSON last line. The gateway writes it in
   # production; here the harness owns it, so every scenario starts from the same one line.
@@ -816,16 +818,17 @@ grep -q 'the :prev image is not healthy either' "$APP_DIR/logs/deploy.log" && pa
 [ -f "$APP_DIR/.deployed_rev" ] && fail ".deployed_rev written after double failure" \
   || pass "no .deployed_rev after double failure"
 
-# ── scenario 12: another deploy holds the lock -> refuse, touch nothing ────
+# ── scenario 12: another deploy holds the lock -> wait, then refuse ────────
 reset_state
 cat >"$BIN/flock" <<'STUB'
 #!/usr/bin/env bash
+# -w <seconds> <fd>: the wait expires, the lock is still held
 exit 1
 STUB
 chmod +x "$BIN/flock"
 rc="$(run refs/heads/main)"
 [ "$rc" != "0" ] && pass "busy lock exits non-zero ($rc)" || fail "busy lock exited 0"
-grep -q 'Deploy already in progress' "$APP_DIR/logs/deploy.log" && pass "busy lock says so" \
+grep -q 'lock still held' "$APP_DIR/logs/deploy.log" && pass "busy lock says so" \
   || fail "busy lock message missing"
 [ ! -s "$STATE/calls.log" ] && pass "busy lock ran no podman/systemctl" \
   || fail "busy lock still ran: $(tr '\n' ' ' <"$STATE/calls.log")"
@@ -834,6 +837,7 @@ grep -q 'Deploy already in progress' "$APP_DIR/logs/deploy.log" && pass "busy lo
 reset_state
 cat >"$BIN/flock" <<'STUB'
 #!/usr/bin/env bash
+[ -n "${PODMAN_STATE:-}" ] && printf 'flock %s\n' "$*" >>"$PODMAN_STATE/flock_calls.log"
 exit 0
 STUB
 chmod +x "$BIN/flock"
@@ -870,6 +874,77 @@ unset FAKE_SYSTEMCTL_RENDER
 builds="$(grep -c 'podman build' "$DEPLOY" || true)"
 [ "$builds" = "0" ] && pass "deploy script contains no 'podman build'" \
   || fail "deploy script still builds on the host ($builds match(es))"
+
+# ── scenario 16: the lock waits, so a queued push still deploys ────────────
+reset_state
+happy_image
+export FAKE_CURL=ok
+rc="$(run refs/heads/main)"
+[ "$rc" = "0" ] && pass "queued deploy exits 0" || fail "queued deploy exited $rc"
+grep -qE '^flock -w [0-9]+ 9$' "$STATE/flock_calls.log" 2>/dev/null \
+  && pass "lock taken with -w (waits), not -n (skips)" \
+  || fail "lock not taken with a bounded wait: $(cat "$STATE/flock_calls.log" 2>/dev/null)"
+FIRST_REV="$(cat "$APP_DIR/.deployed_rev")"
+# A second push lands while the first deploy holds the lock. Its run must deploy that commit, not
+# drop it: this is the 2026-11-18 drift (098e29b on the host, f76887a on main) reproduced.
+git -C "$WORK" -c user.email=arif@kori.local -c user.name=Arif commit --quiet --allow-empty -m "second push"
+git -C "$WORK" push --quiet origin HEAD:main
+happy_image
+rc="$(run refs/heads/main)"
+[ "$rc" = "0" ] && pass "follow-up push deploys ($rc)" || fail "follow-up push exited $rc"
+[ "$(cat "$APP_DIR/.deployed_rev")" = "$(head_sha)" ] \
+  && pass "host revision catches up to main after the queue" \
+  || fail "host still behind main: $(cat "$APP_DIR/.deployed_rev") vs $(head_sha)"
+[ "$FIRST_REV" != "$(head_sha)" ] && pass "the two runs deployed different commits" \
+  || fail "harness did not move main between the runs"
+
+# ── scenario 17: the self-update re-exec keeps the lock, does not re-take it ─
+# The script copies itself and re-execs when the repo copy differs. That exec must inherit the
+# held lock: re-acquiring would close fd 9, drop it for a moment, and a queued run could take it
+# while this one waits its whole timeout. Proof: the run publishes a new script copy and flock is
+# still called exactly once.
+reset_state
+happy_image
+export FAKE_CURL=ok
+printf '\n# harness: force the self-update path\n' >>"$WORK/ops/scripts/deploy-vps.sh"
+# A non-ops path too, or the run stops at the ops-only branch before it ever pulls an image and
+# there is no .deployed_rev to compare.
+printf '# harness: image-bearing change\n' >>"$WORK/apps/api/src/kori.nim"
+git -C "$WORK" add -A
+git -C "$WORK" -c user.email=arif@kori.local -c user.name=Arif commit --quiet -m "tweak deploy script"
+git -C "$WORK" push --quiet origin HEAD:main
+happy_image
+rc="$(run refs/heads/main)"
+[ "$rc" = "0" ] && pass "self-update run exits 0 ($rc)" || fail "self-update run exited $rc: $(tail -3 "$ROOT/out.txt")"
+grep -q 're-executing the updated deploy-vps.sh' "$APP_DIR/logs/deploy.log" \
+  && pass "the run did take the self-update path" || fail "self-update never happened"
+flock_calls="$(grep -c '^flock ' "$STATE/flock_calls.log" 2>/dev/null || true)"
+[ "$flock_calls" = "1" ] && pass "lock taken once across the re-exec, not dropped and retaken" \
+  || fail "flock called $flock_calls time(s) across the re-exec"
+[ "$(cat "$APP_DIR/.deployed_rev")" = "$(head_sha)" ] && pass "self-update run deployed its commit" \
+  || fail "self-update run did not deploy: $(cat "$APP_DIR/.deployed_rev") vs $(head_sha)"
+
+# ── scenario 18: a queued run that finds its commit already live does nothing ─
+# Three pushes during one deploy means three queued handlers. The first one deploys the newest
+# commit; the others re-read main and find the same revision. Retagging :local into :prev and
+# restarting for identical bytes would burn the rollback slot, so they must stop.
+reset_state
+happy_image
+export FAKE_CURL=ok
+rc="$(run refs/heads/main)"
+[ "$rc" = "0" ] && pass "first run deploys ($rc)" || fail "first run exited $rc"
+deployed="$(cat "$APP_DIR/.deployed_rev")"
+: >"$STATE/calls.log"
+rc="$(run refs/heads/main)"
+[ "$rc" = "0" ] && pass "duplicate revision exits 0 ($rc)" || fail "duplicate revision exited $rc"
+grep -q 'already running' "$APP_DIR/logs/deploy.log" && pass "duplicate revision says so" \
+  || fail "duplicate revision message missing: $(tail -2 "$APP_DIR/logs/deploy.log")"
+grep -q '^podman pull' "$STATE/calls.log" && fail "duplicate revision pulled an image" \
+  || pass "duplicate revision pulled nothing"
+[ "$(restarts)" = "0" ] && pass "duplicate revision restarted nothing" \
+  || fail "duplicate revision restarted the service"
+[ "$(cat "$APP_DIR/.deployed_rev")" = "$deployed" ] && pass "duplicate revision kept .deployed_rev" \
+  || fail "duplicate revision moved .deployed_rev"
 
 printf '\n%s\n' "artifacts: $ROOT"
 if [ "$FAILS" -eq 0 ]; then

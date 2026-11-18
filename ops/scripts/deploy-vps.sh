@@ -81,10 +81,29 @@ log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" | tee -a "$LOG"; 
 die() { log "ERROR: $*"; exit 1; }
 
 # ── 2. Concurrency lock ──────────────────────────────────────────────────────
-exec 9>"/tmp/deploy-${SERVICE}.lock"
-if ! flock -n 9; then
-  log "Deploy already in progress. Exiting."
-  exit 1
+# Waits, it does not skip. With `-n` a push that landed while another deploy was pulling was
+# dropped and never retried by the webhook, so main and the running revision drifted apart
+# silently (2026-11-18, 098e29b vs f76887a). Queued runs are harmless because the git sync
+# below re-reads origin/main after the lock is taken: the second one deploys the newest commit,
+# and the first has already done the earlier one.
+# The wait is bounded by the deploy itself, so a wedged deploy still fails this run and still
+# raises the alert instead of piling handlers up forever. 30 min covers the worst case a single
+# run can take: 15 min waiting for CI to publish the image, plus cosign retries and the two
+# health gates. A wedged deploy is the only way this expires.
+LOCK_WAIT_SECONDS="${KORI_LOCK_WAIT_SECONDS:-1800}"
+# The self-update below re-execs this same process. `exec 9>...` in the re-executed script would
+# replace the open file description and release the lock for a moment; a queued run could take it
+# and this one would then wait its whole timeout for nothing. The marker is set only after the
+# lock is held, and the fd check makes it true rather than trusted: an inherited marker with no
+# open fd 9 is not a held lock.
+if [ -z "${KORI_LOCK_HELD:-}" ] || [ ! -e /dev/fd/9 ]; then
+  exec 9>"/tmp/deploy-${SERVICE}.lock"
+  if ! flock -w "$LOCK_WAIT_SECONDS" 9; then
+    log "Deploy lock still held after ${LOCK_WAIT_SECONDS}s. Exiting."
+    exit 1
+  fi
+  KORI_LOCK_HELD=1
+  export KORI_LOCK_HELD
 fi
 
 [ -f "$ENV_FILE" ] || die "env file missing: $ENV_FILE (mode 600, holds the edge token and nothing else)"
@@ -314,6 +333,19 @@ if [ "$OPS_ONLY" = "1" ]; then
     log "WARNING: no previous unit to restore — the installed unit stays, needs a human"
   fi
   exit 1
+fi
+
+# ── 4c. Already at this revision ─────────────────────────────────────────────
+# The lock waits now instead of skipping, so two or three handlers can queue behind one deploy.
+# Each one re-reads origin/main and takes the newest commit, which means an earlier run in the
+# queue may already have deployed exactly this revision. Retagging :local into :prev and
+# restarting the service for identical bytes is a wasted restart and a :prev that no longer
+# differs, so this run stops here. A failed deploy never writes .deployed_rev, so this can only
+# fire when the previous run actually finished. KORI_FORCE_DEPLOY=1 exists for the one case this
+# reads wrong: an operator re-running the same revision on purpose to recover the host.
+if [ "${KORI_FORCE_DEPLOY:-0}" != "1" ] && [ -n "$PREV_DEPLOYED" ] && [ "$PREV_DEPLOYED" = "$REV" ]; then
+  log "==> already running $SHORT (.deployed_rev matches this commit); nothing to deploy"
+  exit 0
 fi
 
 # CI publishes this tag only after the gate job is green, and the webhook reaches this host
