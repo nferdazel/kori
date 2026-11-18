@@ -2,7 +2,7 @@
 # grades byte-wise, CLI flag forms and precedence, and config defaults. No socket
 # is opened here; the harness starts the real binary.
 
-import std/[json, options, os, sequtils, strutils, tables, times]
+import std/[json, options, os, posix, sequtils, strutils, tables, times]
 
 import "../../apps/api/src/kori"
 import "../../apps/api/src/generated/static_files"
@@ -683,7 +683,7 @@ check "the root path is no-store too, because it is a page",
 block:
   let table = staticFileTable()
   for path in ["/index.html", "/requests.html", "/routes.html", "/config.html",
-               "/assets/main-3LGz82B_.css", "/assets/main-3kqSlnGk.js",
+               "/assets/main-3LGz82B_.css", "/assets/main-Dh4ZqD4z.js",
                "/fonts/inter-latin-var.woff2", "/fonts/jetbrains-mono-latin-var.woff2"]:
     check "the embedded table carries " & path, table.hasKey(path)
   check "every embedded page is html",
@@ -937,6 +937,125 @@ block:
     failureToken(404, """{"error":{"message":"not found"}}""", true) == ""
   check "caller_fault is its own name, not mid_stream_abort",
     TokenCallerFault == "caller_fault" and TokenCallerFault != TokenMidStreamAbort
+
+
+# ---------------------------------------------------------------- 0.7.0 surface ---
+
+block:
+  # cost_usd: price x the provider's counts, and nothing at all when unpriced.
+  var cfg = Config()
+  cfg.prices["priced"] = Price(usdIn: 1.0, usdOut: 2.0)
+  cfg.prices["*"] = Price(usdIn: 0.0, usdOut: 0.0)
+  check "a priced model yields the stated cost",
+    requestCost(cfg, "priced", some(1_000_000), some(500_000)) == some(2.0)
+  check "a cost is absent without tokens",
+    requestCost(cfg, "priced", none(int), none(int)).isNone
+  check "one direction is enough",
+    requestCost(cfg, "priced", some(2_000_000), none(int)) == some(2.0)
+  check "an unpriced model is priced by the catch-all",
+    requestCost(cfg, "other", some(1_000_000), none(int)) == some(0.0)
+  var bare = Config()
+  check "with no catch-all an unknown model is unpriced",
+    requestCost(bare, "other", some(1_000_000), none(int)).isNone
+  check "six decimals, fixed form", jsonUsd6(0.000154) == "0.000154"
+
+block:
+  let line = requestLogLine("2026-11-18T10:00:00+07:00", "leg-a", 200, 12,
+                            some(11), some(7), "", "", false,
+                            costUsd = some(0.000025))
+  let node = parseJson(line)
+  check "cost_usd is the last key", node{"cost_usd"} != nil
+  check "cost_usd keeps six decimals", line.endsWith("\"cost_usd\":0.000025}")
+  check "no cost key without a price",
+    parseJson(requestLogLine("2026-11-18T10:00:00+07:00", "leg-a", 200, 12,
+                             some(11), some(7), "", "", false)){"cost_usd"} == nil
+  check "a cost row projects cost_usd",
+    buildLogRow(node){"cost_usd"} != nil
+  check "a row without a cost does not invent one",
+    buildLogRow(parseJson(requestLogLine("2026-11-18T10:00:00+07:00", "a", 200, 1,
+                                        none(int), none(int), "", "", false))){
+      "cost_usd"} == nil
+
+block:
+  # The exposition: labels escaped, +Inf present, counters where the request path
+  # leaves them.
+  var cfg = Config(listenHost: "127.0.0.1", listenPort: 4011,
+                   logPath: scratch / "metrics.jsonl")
+  cfg.legs = @[legSpec("leg-a", lrPrimary)]
+  let gateway = newGateway(cfg, RequestLog(fd: -1), "127.0.0.1:4011")
+  gateway.metrics.recordMetrics("leg-a", 200, 40, "auth_401")
+  gateway.metrics.recordMetrics("leg-a", 502, 90_000, "")
+  let text = gateway.metricsText()
+  check "metrics counts the route", text.contains("kori_requests_total{route=\"leg-a\"} 2")
+  check "metrics counts the reason", text.contains("kori_failovers_total{reason=\"auth_401\"} 1")
+  check "metrics has no empty reason series", not text.contains("reason=\"\"")
+  check "metrics has the +Inf bucket", text.contains("le=\"+Inf\"} 2")
+  check "metrics counts the status classes",
+    text.contains("kori_responses_total{class=\"2xx\"} 1") and
+      text.contains("kori_responses_total{class=\"5xx\"} 1")
+  check "metrics reports the cooling gauge",
+    text.contains("kori_route_cooling{route=\"leg-a\"} 0")
+  check "metrics escapes a label", promEscape("a\"b") == "a\\\"b"
+
+block:
+  # Rotation: the live file moves to .1, keep is honoured, and every live line is
+  # whole JSON.
+  let path = scratch / "rotate.jsonl"
+  removeFile(path)
+  var log = openRequestLog(path, rotateBytes = 400, keep = 2)
+  var n = 0
+  while n < 20:
+    discard log.appendLine(requestLogLine("2026-11-18T10:00:0" & $(n mod 10) &
+                                          "+07:00", "leg-a", 200, n,
+                                          some(n), some(n), "", "", false))
+    inc n
+  discard posix.close(log.fd)
+  check "rotation created the first rotated file", fileExists(path & ".1")
+  check "keep=2 caps the rotated files",
+    not fileExists(path & ".3") and not fileExists(path & ".4")
+  check "the live file is under the rotation limit", getFileSize(path) <= 400
+  var whole = true
+  for line in readFile(path).splitLines():
+    if line.len > 0:
+      try: discard parseJson(line)
+      except CatchableError: whole = false
+  check "every live line is still JSON", whole
+
+block:
+  # Reload: a broken file changes nothing, a good one swaps the legs in place.
+  let path = writeConfig("reload.json", """
+{"listen":{"host":"127.0.0.1","port":4011},"log":{"path":"/tmp/reload.jsonl"},
+ "legs":[{"name":"leg-a","base_url":"http://127.0.0.1:1/v1","api_key":"k"}]}
+""")
+  var cfg = loadConfig(path)
+  let cli = CliOptions(configPath: path)
+  applyCli(cfg, cli)
+  let gateway = newGateway(cfg, RequestLog(fd: -1), "127.0.0.1:4011")
+  gateway.configPath = path
+  gateway.cli = cli
+  writeFile(path, """{"legs": [ this is not json""")
+  check "a broken reload is refused", gateway.reloadConfig() == false
+  check "a broken reload names its reason", gateway.lastReloadError.len > 0
+  check "a refused reload leaves the legs alone",
+    parseJson(gateway.stateJson()){"routes"}.len == 1
+  check "a refused reload is not counted", gateway.reloads == 0
+  writeFile(path, """
+{"listen":{"host":"127.0.0.1","port":4011},"log":{"path":"/tmp/reload.jsonl"},
+ "legs":[{"name":"leg-a","base_url":"http://127.0.0.1:1/v1","api_key":"k"},
+         {"name":"leg-b","base_url":"http://127.0.0.1:2/v1","api_key":"k"}]}
+""")
+  check "a good reload is applied", gateway.reloadConfig()
+  check "a good reload swaps the legs",
+    parseJson(gateway.stateJson()){"routes"}.len == 2
+  check "a good reload is counted", gateway.reloads == 1
+  check "a good reload clears the error", gateway.lastReloadError.len == 0
+  writeFile(path, """
+{"listen":{"host":"127.0.0.1","port":4999},"log":{"path":"/tmp/reload.jsonl"},
+ "legs":[{"name":"leg-a","base_url":"http://127.0.0.1:1/v1","api_key":"k"}]}
+""")
+  check "a moved listener is refused", gateway.reloadConfig() == false
+  check "a moved listener keeps the old port",
+    ($parseJson(gateway.configJson()){"listen"}).contains(":4011")
 
 # --------------------------------------------------------------------- report ---
 

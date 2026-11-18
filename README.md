@@ -28,7 +28,7 @@ is memory only.
 
 ## Status
 
-Version `VERSION` at the root, currently 0.6.2, and tags are annotated `vX.Y.Z`.
+Version `VERSION` at the root, currently 0.7.0, and tags are annotated `vX.Y.Z`.
 
 Built and tested locally, and deployed on qouver1 behind the Caddy edge since 2026-11-18. The host
 records the revision it runs in `.deployed_rev`; this file names the version it was cut at, not
@@ -205,11 +205,11 @@ where the config is mounted read-only, kori warns and serves the refreshed crede
 
 ### Request log
 
-One line per request, appended with a single write, never rewritten and never rotated. Nine keys, in
-this order, plus two conditional ones at the end:
+One line per request, appended with a single write, never rewritten. Nine keys, in this order,
+plus three conditional ones at the end:
 
 ```json
-{"ts":"2026-11-16T13:20:04+07:00","route":"commandcode","status":200,"latency_ms":812,"tokens_in":128,"tokens_out":64,"failover_from":"opencode-go","failover_reason":"auth_401","stream":false,"alias":"kori/fast"}
+{"ts":"2026-11-16T13:20:04+07:00","route":"commandcode","status":200,"latency_ms":812,"tokens_in":128,"tokens_out":64,"failover_from":"opencode-go","failover_reason":"auth_401","stream":false,"alias":"kori/fast","cost_usd":0.000154}
 ```
 
 | Key | Meaning |
@@ -224,8 +224,40 @@ this order, plus two conditional ones at the end:
 | `stream` | whether the caller asked for a stream |
 | `alias` | the caller's `kori/<alias>` exactly as sent; present only on a request that named one, and clipped at a rune boundary to at most 261 bytes (`MaxAliasBytes` plus the `kori/` prefix) |
 | `effort_clamped` | `<asked>><sent>` when the answering leg's ceiling pulled the effort down, for example `max>high`; absent when no clamp happened, so a request that never clamped still carries the nine keys above |
+| `cost_usd` | the cost of this request from the answering leg's `prices` entry, six decimals; absent when the model is not priced or the provider reported no tokens, because "not priced" is not `$0.00` |
 
 No header, body or credential is ever written to the log.
+
+Rotation is off by default. Setting `log.rotate_bytes` makes kori move the live file aside at that
+size and start a fresh one; `log.keep` (default `2`, maximum `20`) is how many rotated files stay
+beside it. A rotation happens between two requests, is one rename, and never splits a line or drops
+one. The rotated files are plain text: kori does not compress them, so no compression library and no
+child process enters the binary.
+
+### Reloading without a restart
+
+`SIGHUP` re-reads the config file and applies it in place: legs, keys, models, aliases, efforts,
+`prices`, `balance` and the log rotation policy. A restart would cut the streams in flight, and a
+provider key that expired at 03:00 should not need one.
+
+The new file is parsed and validated first. Anything that fails, fails whole: a broken file, a bad
+weight, or a moved `listen` address is refused with one line on stderr, `/admin/config` records it
+under `reload.error`, and the process keeps serving the config it already proved. Cooldowns, latency
+history and pooled-key state follow a leg by name, so a leg that is still configured keeps its
+history and a leg that was added starts fresh, exactly as a restart would have started it.
+
+```sh
+kill -HUP "$(pgrep -f 'kori --config')"
+```
+
+### Metrics
+
+`GET /metrics` answers the Prometheus text format (`text/plain; version=0.0.4`): request counts by
+route, counts by status class, failover counts by the reason the walk recorded, cooldowns started per
+route, a live `kori_route_cooling` gauge, a latency histogram in milliseconds, the window's
+`cost_usd`, the reload count and a `kori_info` build marker. Everything is tallied by the request
+path; nothing dials a provider and no scrape touches the log file. The listener is the same loopback
+one the rest of the admin surface uses, so scraping from another host means going through the edge.
 
 ### HTTP surface
 
@@ -235,6 +267,7 @@ No header, body or credential is ever written to the log.
 | `/v1/models` | GET, HEAD | the model list derived from this config: one `kori/<alias>` per alias, plus every leg `model` id; no provider is dialled |
 | `/healthz` | GET, HEAD | `{"status":"ok","version":…,"revision":…}`; revision is the git sha the binary was built from, or `dev` |
 | `/healthz?deep` | GET, HEAD | the same liveness, plus per-leg state, cooldown, last success, last failure and window counters, read from router state with zero dials |
+| `/metrics` | GET, HEAD | Prometheus text exposition: requests, failover reasons, cooldowns, latency histogram, cost, reloads |
 | `/admin/state` | GET, HEAD | routes, window counters, failover events, recent log rows |
 | `/admin/log` | GET, HEAD | a page of the request log, newest first |
 | `/admin/config` | GET, HEAD | the loaded config with every credential redacted |
@@ -329,8 +362,9 @@ repository, in an image or in a log.
 ```json
 {
   "listen": { "host": "127.0.0.1", "port": 8787 },
-  "log":    { "path": "/var/log/kori/requests.jsonl" },
+  "log":    { "path": "/var/log/kori/requests.jsonl", "rotate_bytes": 67108864, "keep": 2 },
   "balance": false,
+  "prices": { "deepseek-v4.1-flash": { "in": 0.27, "out": 1.1 } },
   "legs": [
     {
       "name": "opencode-go",
@@ -384,6 +418,9 @@ repository, in an image or in a log.
 | `legs[].oauth.expires_at` | no | epoch seconds; without it kori refreshes only after a `401` |
 | `legs[].oauth.refresh_skew_seconds` | no | refresh this long before expiry, default `60` |
 | `balance` | no | default `false`, which keeps strict leg order; `true` splits the pick across available primaries by `weight` (DEC-11) |
+| `prices` | no | USD per million tokens, keyed by the model id sent upstream, for example `{"glm-5.3-flash": {"in": 0.6, "out": 2.2}}`; `"*"` is the catch-all. A model with no entry logs no `cost_usd` (DEC-16) |
+| `log.rotate_bytes` | no | rotate the live log at this size in bytes; `0`, the default, keeps one growing file (DEC-17) |
+| `log.keep` | no | how many rotated files stay beside the live one, `1`-`20`, default `2` |
 | `listen`, `log` | no | overridden by `--address`, `--port`, `--log` |
 
 For the `opencode-go` leg, `token_url` and `client_id` are the OpenCode Console's own values,

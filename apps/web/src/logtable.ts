@@ -75,6 +75,12 @@ export function buildLogRow(row: LogRow, expandable: boolean): BuiltRow {
     ["failover_reason", '"' + reason + '"'],
     ["stream", row.stream ? "true" : "false"],
   ];
+  // The optional keys are listed only when the line carried them, the same rule
+  // the binary writes them by: a request with no alias has no alias row.
+  if (row.alias !== undefined) pairs.push(["alias", '"' + row.alias + '"']);
+  if (row.effort_clamped !== undefined)
+    pairs.push(["effort_clamped", '"' + row.effort_clamped + '"']);
+  if (row.cost_usd !== undefined) pairs.push(["cost_usd", "$" + row.cost_usd.toFixed(6)]);
   for (const [k, v] of pairs) {
     const pair = el("span", "pair");
     pair.appendChild(el("span", "kv", k));

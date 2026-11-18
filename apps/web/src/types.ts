@@ -45,6 +45,10 @@ export interface LogRow {
   failover_from: string;
   failover_reason: string;
   stream: boolean;
+  // Conditional in the wire row: present only when the request earned it.
+  alias?: string;
+  effort_clamped?: string;
+  cost_usd?: number;
 }
 
 export interface GatewayInfo {

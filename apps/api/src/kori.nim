@@ -14,10 +14,14 @@
 # `oauth` block. A refresh that fails stops the request; it never fails over and
 # never sends a stale bearer.
 #
+# Slice 7 (0.7.0): SIGHUP config reload (DEC-15), `cost_usd` from a config price
+# table (DEC-16), size-based log rotation (DEC-17) and `/metrics` in the Prometheus
+# text format (DEC-18).
+#
 # Deliberately absent, and not to be reported as done: every non-chat endpoint
-# (messages, responses, embeddings, images, audio, batch), cost and budget, cache,
-# caller identity, metrics, and a second replica. docs/ARCHITECTURE.md, "Not built",
-# is the list this comment must agree with.
+# (messages, responses, embeddings, images, audio, batch), spend caps and cache,
+# caller identity, a second replica, and compression of rotated logs.
+# docs/ARCHITECTURE.md, "Not built", is the list this comment must agree with.
 
 import std/[algorithm, asyncdispatch, asyncnet, exitprocs,
             httpcore, json, net, options, os, posix, strutils, tables, times, uri]
@@ -136,6 +140,16 @@ const
   ## has to survive whole, or its row stops matching its own `?alias=` filter.
   MaxAliasLogBytes* = MaxAliasBytes + AliasPrefix.len
 
+  ## Retention (0.7.0). Rotation is opt-in through `log.rotate_bytes`, because
+  ## "append-only" is the promise this file makes to whoever reads it after an
+  ## incident: a gateway that silently renames the log it was told to keep is a
+  ## worse instrument than one that grows. 0 turns it off, which is the default.
+  DefaultLogKeep* = 2
+  MaxLogKeep* = 20
+
+  ## Latency buckets for /metrics, in milliseconds, plus the implicit +Inf.
+  LatencyBucketsMs* = [50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, 30_000]
+
   ## Effort ranks, smallest to largest. A leg lists the values it accepts; a
   ## request above the leg's ceiling is clamped DOWN to the highest value the leg
   ## still accepts, and never up, because spending more than the caller asked for
@@ -185,12 +199,22 @@ type
     efforts*: seq[string]      ## the reasoning_effort values this leg accepts
     hasEfforts*: bool          ## `efforts` came from the config, so the ceiling applies
 
+  Price* = object
+    ## USD per million tokens, both directions. A model with no entry costs
+    ## nothing to record: the log leaves `cost_usd` out rather than printing 0,
+    ## because "not priced" and "free" are different facts.
+    usdIn*: float
+    usdOut*: float
+
   Config* = object
     listenHost*: string
     listenPort*: int
     logPath*: string
+    logRotateBytes*: int64   ## 0 keeps the single append-only file, which is the default
+    logKeep*: int            ## rotated files kept beside the live one
     balance*: bool
     legs*: seq[Leg]
+    prices*: Table[string, Price]  ## by model id, plus "*" for the fallback
 
   CliOptions* = object
     configPath*: string
@@ -204,6 +228,11 @@ type
 
   RequestLog* = object
     fd*: cint
+    path*: string
+    rotateBytes*: int64
+    keep*: int
+    bytes*: int64            ## what this process has written to the live file
+    justRotated*: bool       ## set for the append that opened a fresh file
 
   LegRuntime* = object
     attempted*: bool
@@ -228,6 +257,19 @@ type
     fromRoute*: string
     toRoute*: string
     reason*: string
+
+  Metrics* = object
+    ## Counters /metrics prints. Everything here is already decided elsewhere in
+    ## the request path, so this is a tally, never a second source of truth: no
+    ## leg state, no cooldown time, nothing that /admin/state also owns.
+    requestsByRoute*: Table[string, int]
+    failoversByReason*: Table[string, int]
+    cooldownsByRoute*: Table[string, int]
+    cooldownStarts*: Table[string, int]
+    statusClasses*: Table[string, int]
+    latency*: seq[int]           ## bucket counts, LatencyBucketsMs.len + 1 for +Inf
+    latencySumMs*: float
+    latencyCount*: int
 
   RefreshOutcome* = object
     ok*: bool
@@ -263,6 +305,13 @@ type
     credentialRefs*: seq[string]
     logLines*: int
     staticFiles: Table[string, StaticFile]
+    metrics*: Metrics
+    costUsdTotal*: float         ## sum of cost_usd over the window, dollars
+    costUsdKnown*: int           ## how many requests carried a priced answer
+    reloads*: int                ## SIGHUP reloads that were applied
+    lastReloadAt*: string
+    lastReloadError*: string
+    cli*: CliOptions             ## kept so a reload applies the same precedence
 
   RecvKind = enum
     rkData, rkEof, rkTruncated, rkTimeout, rkError
@@ -446,6 +495,51 @@ proc loadConfig*(path: string): Config =
     if logNode.kind != JObject:
       failConfig("log must be an object")
     result.logPath = optionalString(logNode, "path", "log")
+    # Retention is off unless asked for: an append-only log that renames itself
+    # without being told is worse evidence than one that grows.
+    let rotate = logNode{"rotate_bytes"}
+    if rotate != nil and rotate.kind != JNull:
+      if rotate.kind != JInt:
+        failConfig("log.rotate_bytes must be an integer")
+      if rotate.getInt() < 0:
+        failConfig("log.rotate_bytes must not be negative")
+      result.logRotateBytes = int64(rotate.getInt())
+    result.logKeep = DefaultLogKeep
+    let keep = logNode{"keep"}
+    if keep != nil and keep.kind != JNull:
+      if keep.kind != JInt:
+        failConfig("log.keep must be an integer")
+      if keep.getInt() < 1 or keep.getInt() > MaxLogKeep:
+        failConfig("log.keep must be 1-" & $MaxLogKeep)
+      result.logKeep = keep.getInt()
+
+  # Prices are money, so they are data in the config and never a constant in the
+  # binary. USD per million tokens, both directions, keyed by the model id that is
+  # actually sent upstream; `*` is the catch-all for a model with no entry.
+  let prices = root{"prices"}
+  if prices != nil and prices.kind != JNull:
+    if prices.kind != JObject:
+      failConfig("prices must be an object")
+    for model, spec in prices:
+      if model.len == 0:
+        failConfig("prices has an empty model id")
+      if spec.kind != JObject:
+        failConfig("prices." & model & " must be an object")
+      var price = Price()
+      for direction in ["in", "out"]:
+        let value = spec{direction}
+        if value == nil or value.kind == JNull:
+          continue
+        var amount: float
+        case value.kind
+        of JInt: amount = value.getInt().float
+        of JFloat: amount = value.getFloat()
+        else:
+          failConfig("prices." & model & "." & direction & " must be a number")
+        if amount < 0:
+          failConfig("prices." & model & "." & direction & " must not be negative")
+        if direction == "in": price.usdIn = amount else: price.usdOut = amount
+      result.prices[model] = price
 
   let balance = root{"balance"}
   if balance != nil and balance.kind != JNull:
@@ -655,18 +749,32 @@ proc jsonEscape*(value: string): string =
 proc jsonIntOrNull(value: Option[int]): string =
   if value.isSome: $value.get else: "null"
 
+proc jsonUsd6*(value: float): string =
+  ## Six decimals of a dollar is a tenth of a cent: below that a log line is
+  ## noise, not money. Fixed form so two lines for the same request differ only
+  ## when the numbers do.
+  formatFloat(value, ffDecimal, 6)
+
+proc jsonFloat6*(value: float): JsonNode =
+  ## The same six-decimal number as `jsonUsd6`, as a JSON number rather than a
+  ## string, so a dashboard can sum it without parsing text.
+  parseJson(formatFloat(value, ffDecimal, 6))
+
 proc requestLogLine*(ts, route: string, status, latencyMs: int,
                      tokensIn, tokensOut: Option[int],
                      failoverFrom, failoverReason: string,
-                     stream: bool, alias = "", effortClamped = ""): string =
+                     stream: bool, alias = "", effortClamped = "",
+                     costUsd = none(float)): string =
   ## The nine keys of SPEC §5.1 in that order, plus `alias` as a tenth when the
   ## caller named a gateway alias, plus `effort_clamped` as an eleventh when the
-  ## leg's ceiling pulled the requested effort down. Both extra keys are
-  ## conditional and come last: a request that named no alias and never clamped
-  ## carries exactly the nine. Redaction is structural (R17): no header, no body
-  ## and no credential is a parameter here, so there is nothing for a later pass
-  ## to strip. "no alias" and "an empty alias" are different facts, and only the
-  ## first one reaches this proc; the same holds for a clamp that never happened.
+  ## leg's ceiling pulled the requested effort down, plus `cost_usd` as a twelfth
+  ## when the config prices the model that served. All three extra keys are
+  ## conditional and come last: a request that named no alias, never clamped and
+  ## ran on an unpriced model carries exactly the nine. Redaction is structural
+  ## (R17): no header, no body and no credential is a parameter here, so there is
+  ## nothing for a later pass to strip. "no alias" and "an empty alias" are
+  ## different facts, and only the first one reaches this proc; the same holds for
+  ## a clamp that never happened and for a model the config does not price.
   result = "{\"ts\":" & jsonEscape(ts) &
     ",\"route\":" & jsonEscape(route) &
     ",\"status\":" & $status &
@@ -680,22 +788,81 @@ proc requestLogLine*(ts, route: string, status, latencyMs: int,
     result.add ",\"alias\":" & jsonEscape(alias)
   if effortClamped.len > 0:
     result.add ",\"effort_clamped\":" & jsonEscape(effortClamped)
+  if costUsd.isSome:
+    result.add ",\"cost_usd\":" & jsonUsd6(costUsd.get)
   result.add "}"
 
-proc openRequestLog*(path: string): RequestLog =
+proc openRequestLog*(path: string, rotateBytes: int64 = 0,
+                     keep = DefaultLogKeep): RequestLog =
   ## Opened once, for the process lifetime: O_WRONLY|O_CREAT|O_APPEND, mode 0640.
   let fd = posix.open(path.cstring, O_WRONLY or O_CREAT or O_APPEND,
                       Mode(LogFileMode))
   if fd < 0:
     failConfig("cannot open log '" & path & "': errno " & $errno)
   result.fd = fd
+  result.path = path
+  result.rotateBytes = rotateBytes
+  result.keep = keep
+  try:
+    result.bytes = getFileSize(path)
+  except CatchableError:
+    result.bytes = 0
   logFdToClose = fd
 
-proc appendLine(log: RequestLog, line: string): bool =
+proc rotateLog*(log: var RequestLog): bool =
+  ## Close, shift `<path>.<n>` one place up, move the live file to `.1`, reopen.
+  ## A failed shift is reported and the old fd is kept, so a rotation that could
+  ## not happen loses no request line; the file simply keeps growing.
+  let path = log.path
+  discard posix.close(log.fd)
+  logFdToClose = -1
+  try:
+    # Oldest first, so the file about to be overwritten is gone before any move.
+    let oldest = path & "." & $log.keep
+    if fileExists(oldest):
+      removeFile(oldest)
+    var index = log.keep - 1
+    while index >= 1:
+      let source = path & "." & $index
+      if fileExists(source):
+        moveFile(source, path & "." & $(index + 1))
+      dec index
+    if fileExists(path):
+      moveFile(path, path & ".1")
+  except CatchableError as error:
+    stderr.writeLine("kori: log rotation failed: " & error.msg &
+                     " (continuing in the current file)")
+    let fd = posix.open(path.cstring, O_WRONLY or O_CREAT or O_APPEND,
+                        Mode(LogFileMode))
+    if fd >= 0:
+      log.fd = fd
+      logFdToClose = fd
+    return false
+  let fd = posix.open(path.cstring, O_WRONLY or O_CREAT or O_APPEND,
+                      Mode(LogFileMode))
+  if fd < 0:
+    stderr.writeLine("kori: cannot reopen log after rotation: errno " & $errno)
+    log.fd = -1
+    return false
+  log.fd = fd
+  logFdToClose = fd
+  log.bytes = 0
+  log.justRotated = true
+  true
+
+proc appendLine*(log: var RequestLog, line: string): bool =
   ## One write(2) carrying the whole line including its newline (CONTRACT §3). A
   ## short write is left short rather than spliced: a partial line is honest, two
   ## interleaved requests are not.
   let data = line & "\n"
+  log.justRotated = false
+  # Rotation is checked against the size this process has accounted for, so a
+  # request never has to stat the file. The check runs before the write, so a
+  # rotation never splits a line.
+  if log.rotateBytes > 0 and log.bytes > 0 and
+     log.bytes + int64(data.len) > log.rotateBytes:
+    if log.rotateLog():
+      log.bytes = 0
   var written = posix.write(log.fd, unsafeAddr data[0], data.len)
   if written < 0 and errno == EINTR:
     written = posix.write(log.fd, unsafeAddr data[0], data.len)
@@ -703,7 +870,128 @@ proc appendLine(log: RequestLog, line: string): bool =
     stderr.writeLine("kori: short log write: " & $written & " of " &
                      $data.len & " bytes")
     return false
+  log.bytes += int64(written)
   true
+
+# ------------------------------------------------------------------- pricing ---
+
+proc priceFor*(cfg: Config, model: string): Option[Price] =
+  ## The model that answered, then the catch-all. A model the config does not
+  ## price has no cost, which is a different fact from a cost of zero.
+  if cfg.prices.hasKey(model):
+    return some(cfg.prices[model])
+  if cfg.prices.hasKey("*"):
+    return some(cfg.prices["*"])
+  none(Price)
+
+proc requestCost*(cfg: Config, model: string, tokensIn,
+                  tokensOut: Option[int]): Option[float] =
+  ## USD for one request, from the provider's own counts only. A leg that
+  ## reported no tokens yields no cost: an estimate invented here would end up in
+  ## a monthly total nobody can reconcile.
+  let price = priceFor(cfg, model)
+  if price.isNone:
+    return none(float)
+  var total = 0.0
+  var known = false
+  if tokensIn.isSome:
+    total += tokensIn.get.float * price.get.usdIn / 1_000_000.0
+    known = true
+  if tokensOut.isSome:
+    total += tokensOut.get.float * price.get.usdOut / 1_000_000.0
+    known = true
+  if not known:
+    return none(float)
+  some(total)
+
+# ------------------------------------------------------------------- metrics ---
+
+proc promEscape*(value: string): string =
+  ## The exposition format's own escaping for a label value: backslash, quote and
+  ## newline. A route name comes from the config, but the config is not trusted to
+  ## keep a text format parseable.
+  for ch in value:
+    case ch
+    of '\\': result.add "\\\\"
+    of '"': result.add "\\\""
+    of '\n': result.add "\\n"
+    else: result.add ch
+
+proc bucketIndex(latencyMs: int): int =
+  ## The first bucket whose ceiling covers this sample; the last slot is +Inf.
+  for index, ceiling in LatencyBucketsMs:
+    if latencyMs <= ceiling:
+      return index
+  LatencyBucketsMs.len
+
+proc recordMetrics*(metrics: var Metrics, route: string, status: int,
+                    latencyMs: int, failoverReason: string) =
+  metrics.requestsByRoute.mgetOrPut(route, 0).inc
+  let class = $((status div 100)) & "xx"
+  metrics.statusClasses.mgetOrPut(class, 0).inc
+  metrics.latency[bucketIndex(latencyMs)].inc
+  metrics.latencySumMs += latencyMs.float
+  metrics.latencyCount.inc
+  # `failover_reason` is empty on a request that never failed over, and that
+  # emptiness is not a reason: only a named reason becomes a series.
+  if failoverReason.len > 0:
+    metrics.failoversByReason.mgetOrPut(failoverReason, 0).inc
+
+proc metricsText*(gateway: Gateway): string =
+  ## Prometheus text exposition, type `prometheus`. Plain text and no library:
+  ## the numbers are already tallied by the request path, so this proc only
+  ## renders them. Labels are escaped as the format requires.
+  var text = ""
+  text.add "# HELP kori_requests_total Requests answered, by route.\n"
+  text.add "# TYPE kori_requests_total counter\n"
+  for route in gateway.metrics.requestsByRoute.keys:
+    text.add "kori_requests_total{route=\"" & promEscape(route) & "\"} " &
+            $gateway.metrics.requestsByRoute[route] & "\n"
+  text.add "# HELP kori_responses_total Requests answered, by status class.\n"
+  text.add "# TYPE kori_responses_total counter\n"
+  for class in ["2xx", "4xx", "5xx"]:
+    if gateway.metrics.statusClasses.hasKey(class):
+      text.add "kori_responses_total{class=\"" & class & "\"} " &
+              $gateway.metrics.statusClasses[class] & "\n"
+  text.add "# HELP kori_failovers_total Failovers, by the reason the walk recorded.\n"
+  text.add "# TYPE kori_failovers_total counter\n"
+  for reason in gateway.metrics.failoversByReason.keys:
+    text.add "kori_failovers_total{reason=\"" & promEscape(reason) & "\"} " &
+            $gateway.metrics.failoversByReason[reason] & "\n"
+  text.add "# HELP kori_route_cooldowns_total Cooldowns started on a route.\n"
+  text.add "# TYPE kori_route_cooldowns_total counter\n"
+  for route in gateway.metrics.cooldownStarts.keys:
+    text.add "kori_route_cooldowns_total{route=\"" & promEscape(route) & "\"} " &
+            $gateway.metrics.cooldownStarts[route] & "\n"
+  text.add "# HELP kori_route_cooling Whether a route is cooling right now (1) or not (0).\n"
+  text.add "# TYPE kori_route_cooling gauge\n"
+  for index, leg in gateway.cfg.legs:
+    let cooling = if gateway.legs[index].coolingUntil > epochTime(): 1 else: 0
+    text.add "kori_route_cooling{route=\"" & promEscape(leg.name) & "\"} " &
+            $cooling & "\n"
+  text.add "# HELP kori_request_duration_ms Request latency in milliseconds.\n"
+  text.add "# TYPE kori_request_duration_ms histogram\n"
+  var cumulative = 0
+  for index, ceiling in LatencyBucketsMs:
+    cumulative += gateway.metrics.latency[index]
+    text.add "kori_request_duration_ms_bucket{le=\"" & $ceiling & "\"} " &
+            $cumulative & "\n"
+  cumulative += gateway.metrics.latency[LatencyBucketsMs.len]
+  text.add "kori_request_duration_ms_bucket{le=\"+Inf\"} " & $cumulative & "\n"
+  text.add "kori_request_duration_ms_sum " & formatFloat(gateway.metrics.latencySumMs,
+                                                        ffDecimal, 3) & "\n"
+  text.add "kori_request_duration_ms_count " & $gateway.metrics.latencyCount & "\n"
+  text.add "# HELP kori_cost_usd_total Cost of priced requests in this window, USD.\n"
+  text.add "# TYPE kori_cost_usd_total counter\n"
+  text.add "kori_cost_usd_total " & formatFloat(gateway.costUsdTotal, ffDecimal, 6) & "\n"
+  text.add "# HELP kori_reloads_total Config reloads applied from SIGHUP.\n"
+  text.add "# TYPE kori_reloads_total counter\n"
+  text.add "kori_reloads_total " & $gateway.reloads & "\n"
+  text.add "# HELP kori_info Build information, always 1.\n"
+  text.add "# TYPE kori_info gauge\n"
+  text.add "kori_info{version=\"" & promEscape(KoriVersion) & "\",revision=\"" &
+          promEscape(KoriRevision) & "\"} 1\n"
+  text
 
 # --------------------------------------------------------------------- time ---
 
@@ -731,6 +1019,11 @@ proc newGateway*(cfg: Config, log: RequestLog,
                    ssl: newUpstreamSslContext(),
                    legs: newSeq[LegRuntime](cfg.legs.len),
                    oauth: newSeq[OauthState](cfg.legs.len),
+                   metrics: Metrics(latency: newSeq[int](LatencyBucketsMs.len + 1),
+                                    requestsByRoute: initTable[string, int](),
+                                    failoversByReason: initTable[string, int](),
+                                    cooldownStarts: initTable[string, int](),
+                                    statusClasses: initTable[string, int]()),
                    staticFiles: staticFileTable())
   # The seeded credential is the starting point, not the truth: a refresh replaces
   # it in memory and, when the file is writable, on disk.
@@ -838,6 +1131,8 @@ proc startCooldown*(gateway: Gateway, index: int, reason: string) =
   runtime.lastFailureClass = reason
   runtime.lastFailureAt = stampAt(now)
   runtime.failedInWindow.inc
+  let name = gateway.cfg.legs[index].name
+  gateway.metrics.cooldownStarts.mgetOrPut(name, 0).inc
 
 proc markServed*(gateway: Gateway, index: int, latencyMs: int) =
   let now = epochTime()
@@ -2127,7 +2422,8 @@ proc handleChat(gateway: Gateway, request: Request): Future[void] {.async.} =
 
   # Item 2: a `kori/<alias>` model is a gateway name resolved per leg, so one
   # caller name can reach providers that do not share model ids.
-  let alias = aliasOf(requestModel(callerBody))
+  let callerModel = requestModel(callerBody)
+  let alias = aliasOf(callerModel)
 
   var chain = Chain()
   var status = 502
@@ -2146,6 +2442,9 @@ proc handleChat(gateway: Gateway, request: Request): Future[void] {.async.} =
   var effortSkips = 0
   var dials = 0
   var effortClampedLog = ""
+  # Item (cost): the id the answering leg was actually sent, so the price lookup
+  # uses the provider's model and not the caller's alias.
+  var servedModel = ""
 
   var aliasKnown = false
   if alias.isSome and not aliasTooLong(alias.get):
@@ -2228,6 +2527,10 @@ proc handleChat(gateway: Gateway, request: Request): Future[void] {.async.} =
         if alias.isSome: rewriteModel(forwardBody, leg.aliases[alias.get])
         elif leg.hasModel: rewriteModel(forwardBody, leg.model)
         else: forwardBody
+      servedModel =
+        if alias.isSome: leg.aliases[alias.get]
+        elif leg.hasModel: leg.model
+        else: callerModel
       # Item 4: a clamped value is rewritten in place, textually, so every other
       # byte the caller sent still reaches the leg. A clamp is recorded against
       # the leg that answers, so a clamp on a leg that then failed is replaced by
@@ -2395,6 +2698,15 @@ proc handleChat(gateway: Gateway, request: Request): Future[void] {.async.} =
     else: chain.firstReason
 
   let latencyMs = int((epochTime() - started) * 1000.0)
+  # The price lookup uses the id the answering leg was sent, then the config's
+  # catch-all. An answer with no token count is left unpriced, never estimated.
+  let costUsd =
+    if gateway.cfg.prices.len == 0: none(float)
+    else: requestCost(gateway.cfg, servedModel, tokensIn, tokensOut)
+  gateway.metrics.recordMetrics(route, status, latencyMs, logReason)
+  if costUsd.isSome:
+    gateway.costUsdTotal += costUsd.get
+    inc gateway.costUsdKnown
   if gateway.log.appendLine(requestLogLine(
       ts = nowStamp(),
       route = route,
@@ -2410,8 +2722,15 @@ proc handleChat(gateway: Gateway, request: Request): Future[void] {.async.} =
       alias = (if alias.isSome: aliasLogValue(alias.get) else: ""),
       # Empty unless the answering leg pulled the effort down, so a request that
       # never clamped keeps the nine keys it had before this feature.
-      effortClamped = effortClampedLog)):
-    inc gateway.logLines
+      effortClamped = effortClampedLog,
+      # Absent on a model the config does not price: "not priced" is not "$0.00".
+      costUsd = costUsd)):
+    # After a rotation the live file starts at zero, so the total the page reports
+    # is the one for the file it is actually reading.
+    if gateway.log.justRotated:
+      gateway.logLines = 1
+    else:
+      inc gateway.logLines
 
 # ---------------------------------------------------------------- log tail ---
 
@@ -2420,13 +2739,15 @@ const
   LogScanBudget = 5000
   LogTailBlock = 8192
 
-## The row projection. `alias` and `effort_clamped` are last and are only there
-## when the line carries them: a request that named a provider id and never
-## clamped has neither key, and the page shows that absence rather than inventing
-## an empty string.
+## The row projection. `alias`, `effort_clamped` and `cost_usd` are last and are
+## only there when the line carries them: a request that named a provider id,
+## never clamped and ran on an unpriced model has none of the three, and the page
+## shows that absence rather than inventing an empty string or a zero.
 const LogRowKeys = ["ts", "route", "status", "latency_ms", "tokens_in",
                     "tokens_out", "failover_from", "failover_reason", "stream",
-                    "alias", "effort_clamped"]
+                    "alias", "effort_clamped", "cost_usd"]
+
+const OptionalLogKeys* = ["alias", "effort_clamped", "cost_usd"]
 
 type
   LogFilter* = object
@@ -2489,18 +2810,18 @@ proc parseRfc3339*(value: string): Option[float] =
     result = none(float)
 
 proc buildLogRow*(node: JsonNode): JsonNode =
-  ## Exactly the eleven keys of SPEC §5.1, in that order. `alias` and
-  ## `effort_clamped` are conditional and come last: they are there only when the
-  ## line carries them. Anything else a line carries is dropped, so the page
-  ## cannot widen the row by accident.
+  ## Exactly the twelve keys of SPEC §5.1, in that order. `alias`,
+  ## `effort_clamped` and `cost_usd` are conditional and come last: they are there
+  ## only when the line carries them. Anything else a line carries is dropped, so
+  ## the page cannot widen the row by accident.
   result = newJObject()
   for key in LogRowKeys:
     let value = node{key}
     if value == nil:
-      # `alias` and `effort_clamped` are the two keys a line may legitimately
-      # lack; every other key is written on every line, so a null there means the
-      # line itself is damaged.
-      if key == "alias" or key == "effort_clamped":
+      # `alias`, `effort_clamped` and `cost_usd` are the three keys a line may
+      # legitimately lack; every other key is written on every line, so a null
+      # there means the line itself is damaged.
+      if key in OptionalLogKeys:
         continue
       result[key] = newJNull()
     else:
@@ -2752,6 +3073,9 @@ proc stateJson*(gateway: Gateway): string =
   windowNode["failover_capacity"] = %gateway.failoverCapacity
   windowNode["tokens_in"] = %gateway.tokensInTotal
   windowNode["tokens_out"] = %gateway.tokensOutTotal
+  # The same total /metrics prints, so a dashboard and a scraper cannot disagree.
+  windowNode["cost_usd"] = %jsonFloat6(gateway.costUsdTotal)
+  windowNode["cost_known_requests"] = %gateway.costUsdKnown
   root["window"] = windowNode
 
   var events = newJArray()
@@ -2867,7 +3191,27 @@ proc configJson*(gateway: Gateway): string =
   logNode["path"] = %gateway.cfg.logPath
   logNode["append_only"] = %true
   logNode["redacted"] = %true
+  # `append_only` stays true under rotation: every write is still one append to
+  # the file it targets. Rotation renames a finished file, it never rewrites one.
+  logNode["rotate_bytes"] = %int64(gateway.cfg.logRotateBytes)
+  logNode["keep"] = %gateway.cfg.logKeep
   root["log"] = logNode
+
+  var prices = newJObject()
+  for model, price in gateway.cfg.prices:
+    var entry = newJObject()
+    entry["in"] = %jsonFloat6(price.usdIn)
+    entry["out"] = %jsonFloat6(price.usdOut)
+    prices[model] = entry
+  root["prices"] = prices
+
+  var reload = newJObject()
+  reload["count"] = %gateway.reloads
+  reload["at"] = (if gateway.lastReloadAt.len > 0: %gateway.lastReloadAt
+                  else: newJNull())
+  reload["error"] = (if gateway.lastReloadError.len > 0: %gateway.lastReloadError
+                     else: newJNull())
+  root["reload"] = reload
 
   $root
 
@@ -3143,6 +3487,19 @@ proc routeRequest(gateway: Gateway, request: Request): Future[void] {.async.} =
       await respondJson(request, Http405, "{\"error\":\"method not allowed\"}")
     else:
       await respondJson(request, Http200, gateway.modelsJson())
+  elif path == "/metrics":
+    # Prometheus scrapes a GET and nothing else. Text format, `prometheus` type
+    # version 0.0.4, which every scraper in use reads.
+    if request.reqMethod notin {HttpGet, HttpHead}:
+      await respondJson(request, Http405, "{\"error\":\"method not allowed\"}")
+    else:
+      let body = gateway.metricsText()
+      let headers = @[("Content-Type", "text/plain; version=0.0.4; charset=utf-8"),
+                      ("Cache-Control", "no-store"),
+                      ("Content-Length", $body.len)]
+      # A HEAD gets the same headers and no body, like every other read surface.
+      let payload = if request.reqMethod == HttpHead: "" else: body
+      await request.client.send(buildHead(200, headers) & payload)
   elif path.startsWith("/admin/"):
     # D11 point 4: any method but GET or HEAD under /admin/ is a 405 that names
     # GET, with no upstream dial and no state change. An unknown path under
@@ -3180,20 +3537,112 @@ proc dispatch*(gateway: Gateway, request: Request): Future[void] {.async.} =
 # ----------------------------------------------------------------- shutdown ---
 
 var stopSignalNumber {.volatile.}: cint = 0
+var reloadRequested {.volatile.}: bool = false
 
 proc onStopSignal(signalNumber: cint) {.noconv.} =
   ## Signal context: one store, no allocation, no lock, no logging.
   stopSignalNumber = signalNumber
 
+proc onReloadSignal(signalNumber: cint) {.noconv.} =
+  ## SIGHUP only raises a flag. The parse happens on the event loop, where an
+  ## allocation is allowed and a failure can be reported without touching the
+  ## running router.
+  reloadRequested = true
+
+proc reloadConfig*(gateway: Gateway): bool =
+  ## Read the same config path again and apply it in place. A config that does not
+  ## parse, does not validate, or that moves the listener is refused whole: the
+  ## process keeps serving the config it already proved. Rotation state, cooldowns
+  ## and live OAuth tokens survive by leg name where the leg still exists.
+  let path = gateway.configPath
+  if path.len == 0:
+    return false
+  var fresh: Config
+  try:
+    fresh = loadConfig(path)
+    applyCli(fresh, gateway.cli)
+  except ConfigError as error:
+    gateway.lastReloadError = error.msg
+    stderr.writeLine("kori: SIGHUP reload refused, still serving the old config: " &
+                     error.msg)
+    return false
+  # A listener cannot move under a running server, and pretending otherwise would
+  # leave /admin/config reporting an address nothing is bound to.
+  if fresh.listenHost != gateway.cfg.listenHost or
+     fresh.listenPort != gateway.cfg.listenPort:
+    gateway.lastReloadError = "listen address or port changed; restart to move the listener"
+    stderr.writeLine("kori: SIGHUP reload refused, still serving the old config: " &
+                     gateway.lastReloadError)
+    return false
+  if fresh.logPath != gateway.cfg.logPath:
+    var reopened: RequestLog
+    try:
+      reopened = openRequestLog(fresh.logPath, fresh.logRotateBytes, fresh.logKeep)
+    except ConfigError as error:
+      gateway.lastReloadError = error.msg
+      stderr.writeLine("kori: SIGHUP reload refused, still serving the old config: " &
+                       error.msg)
+      return false
+    discard posix.close(gateway.log.fd)
+    gateway.log = reopened
+    gateway.logLines = countLines(fresh.logPath)
+  else:
+    # Same file: keep the fd and its byte counter, take the new policy.
+    gateway.log.rotateBytes = fresh.logRotateBytes
+    gateway.log.keep = fresh.logKeep
+
+  # Router state follows a leg by name. A leg that disappeared loses its state,
+  # which is correct: nothing will dial it again. A leg that was added starts
+  # fresh, which is the same state a restart would have given it.
+  var oldLegs = gateway.cfg.legs
+  var oldRuntime = gateway.legs
+  var oldOauth = gateway.oauth
+  var runtime = newSeq[LegRuntime](fresh.legs.len)
+  var oauth = newSeq[OauthState](fresh.legs.len)
+  for index, leg in fresh.legs:
+    for oldIndex, oldLeg in oldLegs:
+      if oldLeg.name != leg.name:
+        continue
+      runtime[index] = oldRuntime[oldIndex]
+      # The config may have rotated the seed token on disk; a token this process
+      # refreshed is newer than the file only when the file still carries the old
+      # one, so the in-memory value wins when it is not expired.
+      let freshSeed = leg.oauth.accessToken
+      let lived = oldOauth[oldIndex]
+      if leg.hasOauth and lived.accessToken.len > 0 and
+         lived.accessToken != freshSeed and
+         (lived.expiresAt <= 0 or lived.expiresAt > epochTime()):
+        oauth[index] = lived
+      elif leg.hasOauth:
+        oauth[index].accessToken = leg.oauth.accessToken
+        oauth[index].refreshToken = leg.oauth.refreshToken
+        oauth[index].expiresAt = leg.oauth.expiresAt
+      break
+  gateway.cfg = fresh
+  gateway.legs = runtime
+  gateway.oauth = oauth
+  gateway.credentialRefs = credentialRefs(path, fresh.legs.len)
+  inc gateway.reloads
+  gateway.lastReloadAt = nowStamp()
+  gateway.lastReloadError = ""
+  # One line on stderr, because a reload that leaves no trace is indistinguishable
+  # from a reload that did not happen.
+  stderr.writeLine("kori: SIGHUP reload applied, " & $fresh.legs.len &
+                   " leg(s), reload #" & $gateway.reloads)
+  true
+
 proc installStopHandlers*() =
   ## SIGTERM is what `podman stop` and systemd send; SIGINT is what a terminal
   ## sends. Both take the same path, so a stop in development proves the stop in
-  ## the container.
+  ## the container. SIGHUP is the reload, and it is a flag the loop reads, never
+  ## work done in the handler.
   discard posix.signal(SIGTERM, onStopSignal)
   discard posix.signal(SIGINT, onStopSignal)
+  discard posix.signal(SIGHUP, onReloadSignal)
 
 proc stopSignalName*(signalNumber: cint): string =
   case int(signalNumber)
+  of 1: "SIGHUP"
   of 2: "SIGINT"
   of 15: "SIGTERM"
   else: "signal " & $int(signalNumber)
@@ -3256,7 +3705,7 @@ proc main() =
 
   var requestLog: RequestLog
   try:
-    requestLog = openRequestLog(cfg.logPath)
+    requestLog = openRequestLog(cfg.logPath, cfg.logRotateBytes, cfg.logKeep)
   except ConfigError as error:
     stderr.writeLine("kori: " & error.msg)
     quit(2)
@@ -3265,6 +3714,7 @@ proc main() =
   let gateway = newGateway(cfg, requestLog,
                            cfg.listenHost & ":" & $cfg.listenPort)
   gateway.configPath = cli.configPath
+  gateway.cli = cli
   gateway.credentialRefs = credentialRefs(cli.configPath, cfg.legs.len)
   gateway.logLines = countLines(cfg.logPath)
   try:
@@ -3290,6 +3740,14 @@ proc main() =
       except CatchableError:
         discard)
   while not serving.finished and stopSignalNumber == 0:
+    # A reload swaps the leg list, and a request mid-walk holds indices into the
+    # list it started with. The swap therefore waits for the last request to
+    # finish; the flag stays raised and this loop retries every poll. A stream
+    # running for minutes delays the reload, which is the honest trade: no
+    # in-flight request is ever cut or pointed at another leg's state.
+    if reloadRequested and gateway.inFlight == 0:
+      reloadRequested = false
+      discard gateway.reloadConfig()
     waitFor sleepAsync(ShutdownPollMs)
   if stopSignalNumber == 0:
     # The listener died on its own; surface it exactly as waitFor used to.

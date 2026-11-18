@@ -57,9 +57,9 @@ ai.qouver.com {
 	@no_bearer not header Authorization "Bearer __KORI_EDGE_TOKEN__"
 	respond @no_bearer "unauthorized" 401
 
-	# The dashboard is loopback-only by decision (EDGE §3.7). Refused at the edge so a mistake
-	# inside the binary cannot expose it.
-	@admin path /admin /admin/*
+	# The dashboard and the scrape surface are loopback-only by decision (EDGE §3.7). Refused at
+	# the edge so a mistake inside the binary cannot expose them.
+	@admin path /admin /admin/* /metrics
 	respond @admin "not found" 404
 
 	# Rate limit per real client IP. Needs the caddy-ratelimit module, which is NOT in a stock

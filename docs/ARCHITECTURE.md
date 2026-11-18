@@ -38,8 +38,8 @@ caller ──POST /v1/chat/completions──► kori
 | Section | Holds |
 |---|---|
 | CLI flags | flag parsing, precedence over config, exit `2` on bad input |
-| config | JSON loading, leg defaults, and every refusal: a pool that cannot also be the bearer, an unranked effort, a `weight` outside 1-1000, a `retries` outside 0-5 |
-| log writer | the eleven-key line (nine keys always, `alias` and `effort_clamped` only when the request earned them), the single append, the descriptor held for the process |
+| config | JSON loading, leg defaults, prices, the log rotation policy, and every refusal: a pool that cannot also be the bearer, an unranked effort, a `weight` outside 1-1000, a `retries` outside 0-5, a negative price |
+| log writer | the twelve-key line (nine keys always, `alias`, `effort_clamped` and `cost_usd` only when the request earned them), the single append, size rotation with `keep`, the descriptor held for the process |
 | time | RFC 3339 stamps used by the log and the admin GETs |
 | router | leg availability, pick order, smooth weighted round-robin (`DEC-11`), leg and key cooldowns, served/attempted counters, the latency ring |
 | upstream IO | raw socket dial, TLS wrap, the deadline-bounded send and receive |
@@ -63,9 +63,9 @@ path, content type and body for the eight files under `apps/web/dist`.
 
 ## Request lifecycle
 
-1. `dispatch` routes by path. `/healthz`, `/admin/*`, `/v1/models` and `/v1/chat/completions`
-   keep priority; the static surface is last in the chain, so adding a dashboard page can never
-   shadow an API path.
+1. `dispatch` routes by path. `/healthz`, `/metrics`, `/admin/*`, `/v1/models` and
+   `/v1/chat/completions` keep priority; the static surface is last in the chain, so adding a
+   dashboard page can never shadow an API path.
 2. `handleChat` reads the body once, decides `stream` from it, and injects
    `stream_options.include_usage` for streaming requests that omit it.
 3. `pickOrder` returns the legs to try, skipping any leg whose cooldown has not expired, a leg
@@ -87,7 +87,8 @@ path, content type and body for the eight files under `apps/web/dist`.
    stop.
 6. Whatever happened, one log line is written before the handler returns. `failover_reason`
    is the first reason met, except for a mid-stream abort, which overrides it because it is
-   what the caller actually saw.
+   what the caller actually saw. The same completion feeds the `/metrics` counters, so a scrape
+   and the log cannot disagree about how many requests a route answered.
 
 Cooldowns are 60 s for availability failures and 900 s for a quota `429`. A leg whose
 cooldown has expired is eligible again, and the first request that picks it acts as the
@@ -123,7 +124,13 @@ call or a token.
 
 `/admin/config` reports the config path and a `<path>:<line>` reference per leg credential, never
 the value. The key pool is reported as a size and a cooling count, and an `oauth` leg as a state
-plus its expiry, so the same page can answer "which credential is dead" without carrying one.
+plus its expiry, so the same page can answer "which credential is dead" without carrying one. It
+also reports the log rotation policy, the price table and the last reload (`count`, `at`,
+`error`), which is the artifact a `SIGHUP` leaves behind.
+
+A `SIGHUP` re-reads the config away from the request path and swaps it in only after it parses,
+validates and keeps the same listener. Router state is carried across by leg name, so a reload is
+not a restart: cooldowns and live OAuth tokens survive, and a stream in flight is not cut.
 
 ## Acceptance harness
 
@@ -153,17 +160,17 @@ a document that repeated it here would be wrong after the next deploy.
   Every leg is spoken to in the OpenAI protocol, so a native passthrough for Bedrock, Vertex or
   Azure would be a second protocol path rather than a config change, and a client that speaks only
   Anthropic's or OpenAI's Responses protocol cannot use this door today.
-- Cost, budget and cache. Token counts are logged, nothing prices them. There is no spend cap per
-  key or per caller, and no exact or semantic cache.
+- Cost, budget and cache. A request line carries `cost_usd` when the config prices the model that
+  answered (`DEC-16`), so a month can be summed from the log; there is still no spend cap per key or
+  per caller, and no exact or semantic cache.
 - Caller identity. The only credential in front of kori is the one bearer the edge holds, so any
   per-caller limit, quota or audit trail would have to be built at the edge or not at all.
-- Metrics and HA. `/healthz?deep` and the dashboard are for a person; there is no Prometheus or
-  OTLP endpoint, and router state is one process in memory, so there is no second replica and no
-  cluster.
-- Config changes need a file edit and a restart. The admin surface is read-only on purpose, so
-  there is no way to disable a leg from a browser mid-incident.
-- Log retention. The file grows and nothing rotates or prunes it; that is the host's job and it
-  has no default here.
+- HA. Router state is one process in memory, so there is no second replica and no cluster. `/metrics`
+  is the scrape surface (`DEC-18`); nothing in the request path is shared between processes.
+- Log compression. Rotation bounds the file (`DEC-17`), but a rotated file stays plain text: gzip
+  inside the binary would mean a compression library in a build whose point is having none.
+- Editing a leg from a browser. `SIGHUP` applies a hand-edited file (`DEC-15`); the admin surface is
+  still read-only, and it stays that way on purpose.
 - The credential write-back inside a container is best effort: a read-only mounted config is
   served from memory with a warning, so a rotated token survives a restart only if the mount is
   writable.

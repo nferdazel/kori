@@ -321,3 +321,92 @@ provider will actually accept, so a config that names a model the provider has d
 listing it until the operator fixes the config. That is visible in `/healthz?deep` the first
 time the leg answers `404 model_not_found`, which is classified as `model_gone` and fails
 over rather than being returned as a caller error.
+
+## DEC-15 — A reload is a SIGHUP, and a file that does not validate is refused whole
+
+**Status:** accepted 2026-11-18.
+
+**Context.** Every config change — a rotated provider key, a new fallback, a disabled leg — needed a
+restart, and a restart closes the listener while a stream may be half-written. On a gateway that
+serves long completions, that is a request cut in half for a file edit.
+
+**Decision.** `SIGHUP` re-reads the same config path. The new file is parsed and validated before
+anything is applied; if it does not parse, does not validate, or moves `listen`, it is refused with
+one stderr line, `/admin/config` records `reload.error`, and the process keeps serving the config it
+already proved. On success legs, keys, models, aliases, efforts, `prices`, `balance` and the log
+rotation policy are swapped in, router state follows a leg by name, and `reload.count` moves.
+`listen` cannot change under a running process: it cannot rebind, so a moved listener is refused
+whole rather than half-applied. A changed `log.path` is reopened, because the descriptor is the only
+state a new path would invalidate. The swap itself waits for the in-flight request count to reach
+zero, because a request mid-walk holds indices into the leg list it started with; a long stream
+therefore delays a reload instead of being cut by one.
+
+**Consequences.** A key can be rotated in a minute without a stream dropped, and a typo in the file
+is a no-op instead of an outage. The cost: two sources of truth exist for a moment — the file on disk
+and the config in memory — and `/admin/config` reports the memory, which is why `reload.at` and
+`reload.error` are on the same payload. SIGHUP is not free of meaning (a container behind systemd
+sends it on some stop paths), so the handler only raises a flag the event loop reads; it never does
+work in signal context.
+
+## DEC-16 — `cost_usd` is the config's price times the provider's own token counts
+
+**Status:** accepted 2026-11-18.
+
+**Context.** The log carried tokens and no money, so "what did this month cost" needed a spreadsheet
+and a guess about which model answered on which leg. Prices change, and a price baked into a binary
+is a price that lies until the next release.
+
+**Decision.** `prices` is a top-level config object: model id to `{"in": usd_per_mtok, "out":
+usd_per_mtok}`, with `"*"` as the catch-all. The lookup key is the id the answering leg was
+actually sent — the leg's own `model`, or its alias mapping — because that is the model the
+provider billed. The request line gains `cost_usd` as a twelfth, conditional key: six decimals,
+present only when the model is priced and the provider reported at least one token direction.
+`/admin/state` sums the same numbers into `window.cost_usd`, and `/metrics` prints it as
+`kori_cost_usd_total`.
+
+**Consequences.** A month is summing one JSON key, with no state and no database. The cost: a
+provider that reports no usage yields no cost line, and a config that prices nothing yields no
+`cost_usd` at all — both are visible absences rather than a zero that would quietly understate the
+bill. A leg that reports tokens for a model the config does not price is also unpriced; the
+catch-all entry exists so an operator can decide that once.
+
+## DEC-17 — Rotation is size-based, opt-in, and plain text
+
+**Status:** accepted 2026-11-18.
+
+**Context.** The append-only log grew forever. Retention was listed as unhandled in the first
+release, and an unbounded file on a 25 GB VPS is a disk incident waiting for the busiest week.
+
+**Decision.** `log.rotate_bytes` turns rotation on; `log.keep` (default 2, maximum 20) says how many
+rotated files stay beside the live one. At the threshold the process closes the descriptor, shifts
+`<path>.N` one place up, renames the live file to `.1` and reopens. The check runs before the write,
+so a line is never split. Rotation is off by default, because "append-only" is the promise this file
+makes to whoever reads it after an incident. Rotated files are not compressed: gzip inside the
+binary means a compression library in a build whose selling point is having no dependencies, and
+spawning `gzip` on a request path is worse than a few more megabytes.
+
+**Consequences.** Disk is bounded by `rotate_bytes * (keep + 1)` and a rotation never costs a
+request. The cost: a busy day can push older lines out faster than a weekly read would like, and a
+rotated file costs its full size until the operator compresses it out of band.
+
+## DEC-18 — `/metrics` is plain text, tallied twice, and lives on the loopback listener
+
+**Status:** accepted 2026-11-18.
+
+**Context.** `/healthz?deep` answers a person. A scrape needs counters that survive a poll interval
+and a format a scraper understands, and the whole point of this binary is not adding a library to
+get one.
+
+**Decision.** `GET /metrics` renders the Prometheus text format by hand: request counts by route,
+status classes, failover reasons, cooldowns started, a cooling gauge, a millisecond histogram with
+`LatencyBucketsMs` plus `+Inf`, the window's `cost_usd`, reload count and a `kori_info` marker. The
+counters are incremented on the completion path that already writes the log line, so a scrape and
+the log cannot disagree. The endpoint is on the same listener as the rest of the surface, so it is
+loopback-only like `/admin/*` and reaching it from elsewhere is the edge's business.
+
+**Consequences.** A Prometheus can scrape it with no exporter and no reverse proxy, and the numbers
+are the ones the request path already decided. The cost: this is a second consumer of the same data,
+so a counter that is incremented in two places has two places to get wrong — which is why the
+increment sits exactly where the log line is built, and `/admin/state` reads the totals rather than
+recomputing them. The histogram is a fixed table in the binary; changing the buckets means a release,
+not a config edit.

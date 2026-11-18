@@ -11,12 +11,32 @@ this one, is the answer to "what is live".
 
 ## [Unreleased]
 
+### Added
+
+- `SIGHUP` reloads the config without a restart: legs, keys, models, aliases, efforts, `prices`,
+  `balance` and the log rotation policy are applied in place after the new file parses and
+  validates. A file that does not is refused whole, `/admin/config` records the error under
+  `reload`, and the process keeps serving what it had. Cooldowns, latency history and live OAuth
+  tokens follow a leg by name, so a reload is not a restart and a stream in flight is not cut
+  (`DEC-15`).
+- `prices` turns tokens into money: USD per million tokens per model id, with `"*"` as the
+  catch-all. The request line gains `cost_usd` as a twelfth, conditional key when the answering
+  leg's model is priced and the provider reported tokens; `/admin/state` sums it into
+  `window.cost_usd` and `/metrics` prints `kori_cost_usd_total` (`DEC-16`).
+- Log retention: `log.rotate_bytes` rotates the live file at that size, `log.keep` (default 2)
+  says how many rotated files stay. Rotation is checked before the write, so a line is never
+  split, and it is off unless configured (`DEC-17`).
+- `GET /metrics`: Prometheus text exposition with per-route request counts, status classes,
+  failover reasons, cooldowns started, a live cooling gauge, a latency histogram in milliseconds,
+  the window's cost, the reload count and a `kori_info` build marker. No library and no second
+  source of truth: the counters increment where the log line is written (`DEC-18`).
+
 ### Documentation
 
 - The docs stop describing shipped work as absent. `docs/ARCHITECTURE.md` no longer lists
   credential refresh as unbuilt, its module table names every section the binary has, and its "Not
-  built" list is the real one (non-chat endpoints, cost, cache, caller identity, metrics, HA,
-  retention). `README.md` moves to 0.6.2, mentions retry, the key pool and `/v1/models`, and its
+  built" list is the real one (non-chat endpoints, cost caps, cache, caller identity, HA, log
+  compression). `README.md` moves to 0.6.2, mentions retry, the key pool and `/v1/models`, and its
   deploy paragraph no longer claims nothing runs on a host.
 
 ## [0.6.2] - 2026-11-18
