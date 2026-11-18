@@ -180,7 +180,9 @@ printf 'systemctl %s\n' "$*" >>"$S/calls.log"
 # down while the old container keeps serving. A stub that answers nothing reads as a failed
 # render, which is why every scenario here used to look like one.
 if [ "${1:-}" = "--user" ] && [ "${2:-}" = "show" ]; then
-  printf '%s\n' "${FAKE_SYSTEMCTL_RENDER:-loaded}"
+  # No default on purpose: a scenario that expects the unit to render says so. Answering
+  # "loaded" when nobody asked made an unset variable read as a passing gate.
+  printf '%s\n' "${FAKE_SYSTEMCTL_RENDER-}"
   exit 0
 fi
 # FAKE_SYSTEMCTL_CADDY: only caddy refuses to restart, so the edge path is what is under test
@@ -318,7 +320,11 @@ reset_state() {
   mkdir -p "$APP_DIR/logs"
   printf '{"ts":"2026-11-16T07:00:00Z","route":"leg-a","status":200,"latency_ms":42,"stream":false,"tokens_in":11,"tokens_out":7,"failover_from":"","failover_reason":"","model":"flash"}\n' \
     >"$APP_DIR/logs/requests.jsonl"
-  unset FAKE_MANIFEST FAKE_REPO_DIGESTS FAKE_CADDY FAKE_SYSTEMCTL_RENDER
+  unset FAKE_MANIFEST FAKE_REPO_DIGESTS FAKE_CADDY
+  # Set, not defaulted in the stub: the baseline every scenario starts from is a unit that
+  # renders, and a scenario that wants the failure says so. Leaving it unset must read as a
+  # failed render (the fail-closed direction), never as a passing gate.
+  export FAKE_SYSTEMCTL_RENDER=loaded
 }
 
 run() { bash "$DEPLOY" kori "$@" >"$ROOT/out.txt" 2>&1; echo $?; }
