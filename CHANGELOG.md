@@ -10,6 +10,41 @@ templates under `ops/` describe the intended host shape and have not been run ag
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-11-18
+
+### Fixed
+
+- A request the caller's own effort ended could be reported as a server failure. The `400`
+  naming the unsupported value only fired when every leg in the walk was skipped for effort,
+  so an alias mapped on some legs only, or a walk where another leg skipped as an unmapped
+  alias, fell through to `502 all_legs_failed` carrying `alias_unmapped` while the log line
+  said `effort_unsupported`. The stop is now decided from the dial count: no leg dialled and
+  at least one leg skipped for its ceiling. A leg that was really dialled and failed keeps
+  the `502`.
+- That `400` no longer moves `window.failover_availability`. It dialled nothing, so it is not
+  an availability failure; a skip the walk then served past still counts exactly as before.
+
+### Changed
+
+- README's thinking-effort section documents `"efforts": []` as a ceiling with nothing under
+  it, which is not the same as the absent key, states that the ceiling is a cost and
+  behaviour control rather than a security control, and records sinarcloud's measured
+  provider ceiling: `none`, `low`, `medium`, `high`, `max` and the unranked `turbo` all
+  answered `200` from the host, so `["low", "high"]` there is our own cost choice.
+
+### Maintenance
+
+- The `systemctl show` stub in `tests/dryrun-deploy.sh` answers an empty render when
+  `FAKE_SYSTEMCTL_RENDER` is unset instead of defaulting to `loaded`, so an unset variable
+  reads as a failed gate; each scenario sets `loaded` in its own baseline.
+- `.gitignore`'s `config.nims` pattern is anchored to the repo root, so the tracked
+  `apps/api/src/config.nims` is no longer covered by it.
+- `apps/web/pnpm-workspace.yaml` parks GHSA-fc5q-39xc-vjpf (picomatch, high, no patched
+  release, reachable only through vite's dev dependency chain) so `pnpm audit
+  --audit-level=high` stops exiting `1` and the dist drift check in the Web job runs again.
+  Parking a HIGH advisory is a security decision, so this one needs Galih's clearance before
+  it reaches `main`.
+
 ## [0.6.0] - 2026-11-17
 
 ### Added
