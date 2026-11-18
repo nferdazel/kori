@@ -11,9 +11,6 @@ repository:
 
 That channel is private between you and the maintainer, and it is the fastest route.
 
-**Owner-filled contact:** `[OWNER-FILLED: maintainer security email]` — used only when
-GitHub reporting is unavailable to you.
-
 Include what you did, what happened, the revision from `GET /healthz` (the `revision`
 field), and the smallest request or config that reproduces it. Do not include live
 credentials; redact them, and say that you redacted them.

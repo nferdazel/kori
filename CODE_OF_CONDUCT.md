@@ -51,11 +51,13 @@ individual is officially representing the project in public spaces.
 ## Reporting
 
 Report abusive, harassing or otherwise unacceptable behaviour to the maintainer through
-the private channel named in [SECURITY.md](SECURITY.md), or through GitHub's private
-reporting on this repository. All complaints will be reviewed and investigated promptly and
+GitHub's private vulnerability reporting on this repository, which reaches the maintainer
+without a public thread. All complaints will be reviewed and investigated promptly and
 fairly, and the maintainer will respect the privacy and security of the reporter.
 
-**Owner-filled enforcement contact:** `[OWNER-FILLED: code of conduct contact]`
+There is no public enforcement email address, and this file never carries a placeholder in
+its place: if GitHub reporting is unavailable to you, open an issue that says only that you
+want a private channel, with no details of the incident in it.
 
 ## Enforcement guidelines
 
