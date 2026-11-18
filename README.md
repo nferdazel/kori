@@ -417,9 +417,9 @@ scope are in [`SECURITY.md`](SECURITY.md).
 
 ## Contributing
 
-Send an issue or a patch to the maintainer; there is no fork-and-PR ceremony for a single-maintainer
-repository. What a change must pass is `./task check`, and the contract job in CI is the gate that
-matters most: it compares the deploy scripts against the golden rules every repository here shares.
+Send an issue or a patch to the maintainer. What a change has to pass, and what never belongs in a
+diff, are in [`CONTRIBUTING.md`](CONTRIBUTING.md); the acceptance harness is the gate that matters
+most, because it proves routing against a real binary.
 
 ## License
 
