@@ -18,9 +18,20 @@ this one, is the answer to "what is live".
   opencode-go leg, while a leg's price is looked up by the id that leg actually sends
   (`DEC-16`). A config regenerated from the template therefore logged no `cost_usd` on the
   commandcode and sinarcloud legs and none at all for a System One decision. The template now
-  carries both sets: the opencode-go ids as before, plus `deepseek/deepseek-v4.1-flash` and
+  prices the ids the two chained legs send: `deepseek/deepseek-v4.1-flash` and
   `deepseek/deepseek-v4-1-flash` at 0.30/1.20, `z-ai/glm-5.3-flash` at 0.15/0.50 and
-  `typesafe/jev-1.14.0` at 0.042/0.0 — the prices the host ran on 2026-11-18.
+  `typesafe/jev-1.14.0` at 0.042/0.0 — the prices the host ran on 2026-11-18 — and keeps the two
+  caller-name entries above, for a config that still chains the old leg.
+
+### Changed
+
+- `ops/etc/config.json.example` now chains the two legs qouver1 actually runs: `commandcode` as
+  primary and `sinarcloud` as fallback, each with the `model` id it is sent (`deepseek/deepseek-v4.1-flash`
+  and `deepseek/deepseek-v4-1-flash`). The `opencode-go` leg is gone from the template, because a config
+  regenerated from it produced a three-leg chain the host does not run and needed three OpenCode OAuth
+  values nothing would use. `ops/scripts/kori-config.sh` now requires a value only when the template
+  carries its placeholder, so the two-leg template needs the two `api_key` values alone; adding the leg
+  back to the template makes the OpenCode values required again.
 
 ## [0.7.0] - 2026-11-18
 

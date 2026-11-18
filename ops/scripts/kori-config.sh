@@ -21,11 +21,15 @@
 #   kori-config.sh < values.env            # same, values on stdin
 #
 # Values file format, one per line, '#' comments and blank lines ignored:
+#   KORI_COMMANDCODE_API_KEY=...
+#   KORI_SINARCLOUD_API_KEY=...
+#
+# A value is required only when the template still carries its placeholder, so a template that
+# chains the two static-key legs does not demand the three OpenCode OAuth values. Adding an
+# opencode-go leg back to the template makes them required again:
 #   KORI_OPENCODE_REFRESH_TOKEN=...
 #   KORI_OPENCODE_ACCESS_TOKEN=...
 #   KORI_OPENCODE_SESSION=...
-#   KORI_COMMANDCODE_API_KEY=...
-#   KORI_SINARCLOUD_API_KEY=...
 #
 # The binary used for validation is $KORI_BIN when set, else apps/api/src/kori in this checkout
 # (what ./task nim builds). Without a binary the script refuses to write: an unparsed config is
@@ -81,10 +85,10 @@ if [ -n "$VALUES_FILE" ]; then
     *) die "values file is $values_mode, group or other can reach it: chmod 600 $VALUES_FILE" ;;
   esac
 elif [ -t 0 ]; then
-  die "no values: pass --values FILE or pipe the five keys on stdin"
+  die "no values: pass --values FILE or pipe the keys on stdin"
 fi
 
-# ── read the five values ─────────────────────────────────────────────────────
+# ── read the values ─────────────────────────────────────────────────────────
 UNSET=$'\001'
 v_refresh="$UNSET"
 v_access="$UNSET"
@@ -128,6 +132,10 @@ for key in KORI_OPENCODE_REFRESH_TOKEN KORI_OPENCODE_ACCESS_TOKEN KORI_OPENCODE_
     KORI_COMMANDCODE_API_KEY) value="$v_commandcode" ;;
     KORI_SINARCLOUD_API_KEY) value="$v_sinarcloud" ;;
   esac
+  # Only a value the template actually substitutes is required: a template with no opencode-go
+  # leg has nothing to fill from the three OpenCode values, so demanding them would block the run
+  # on a credential no leg would use.
+  grep -qF -- "__${key}__" "$TEMPLATE" || continue
   [ "$value" != "$UNSET" ] || die "values file is missing $key"
   [ -n "$value" ] || die "$key is empty"
   case "$value" in

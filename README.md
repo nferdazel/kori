@@ -119,16 +119,17 @@ The ceiling is a cost and behaviour control, not a security control. Because an 
 through as the caller sent it, a leg's `efforts` list is not a hard limiter on what a client can ask
 for: it only clamps the seven ranked values and leaves everything else to the leg.
 
-The committed `ops/etc/config.json.example` carries the three legs this deployment has: `opencode-go`
-and `commandcode` accept `low`, `high` and `max`; `sinarcloud` accepts `low` and `high` only. That
+The committed `ops/etc/config.json.example` carries the two legs this deployment runs:
+`commandcode` as primary and `sinarcloud` as the one fallback, each with the `model` id it is sent.
+`commandcode` accepts `low`, `high` and `max`; `sinarcloud` accepts `low` and `high` only. That
 sinarcloud list is our own cost choice, not a provider limit: probed from the host on 2026-11-18,
 `none`, `low`, `medium`, `high`, `max` and the unranked `turbo` all answered `200`, and `max` spent
 fewer reasoning tokens than `high` did. The legs are listed that way so a `medium` request is still
 clamped down and the log says so. `medium` is left out of every leg on purpose until a probe says a leg
 accepts it, so a caller asking `medium` is clamped down and the log says so. `glm-5.3-flash` is an
-alias on two legs only: `opencode-go` maps it to `glm-5.3-flash` and `commandcode` to
-`z-ai/glm-5.3-flash`. sinarcloud has no glm alias, because it does not serve that model; without the
-alias the leg is skipped instead of being dialled into a `400`.
+alias on the `commandcode` leg only, mapped to `z-ai/glm-5.3-flash`. sinarcloud has no glm alias,
+because it does not serve that model; without the alias the leg is skipped instead of being dialled
+into a `400`.
 
 Deadlines enforced by the binary, independent of any proxy in front of it:
 
@@ -368,29 +369,19 @@ repository, in an image or in a log.
   "listen": { "host": "127.0.0.1", "port": 8787 },
   "log":    { "path": "/var/log/kori/requests.jsonl", "rotate_bytes": 67108864, "keep": 2 },
   "balance": false,
-  "prices": { "deepseek-v4.1-flash": { "in": 0.27, "out": 1.1 } },
+  "prices": { "deepseek/deepseek-v4.1-flash": { "in": 0.3, "out": 1.2 } },
   "legs": [
-    {
-      "name": "opencode-go",
-      "base_url": "https://opencode.ai/inference/go/openai/v1",
-      "model": "deepseek-v4.1-flash",
-      "headers": { "x-opencode-session": "…" },
-      "role": "primary",
-      "oauth": {
-        "token_url": "https://opencode.ai/console/auth/oauth/token",
-        "client_id": "https://opencode.ai/oauth/opencode/client.json",
-        "refresh_token": "…"
-      }
-    },
     {
       "name": "commandcode",
       "base_url": "https://api.commandcode.ai/provider/v1",
+      "model": "deepseek/deepseek-v4.1-flash",
       "api_key": "…",
-      "role": "fallback"
+      "role": "primary"
     },
     {
       "name": "sinarcloud",
       "base_url": "https://ai.sinarcloud.com/v1",
+      "model": "deepseek/deepseek-v4-1-flash",
       "api_key": "…",
       "role": "fallback"
     }
@@ -434,14 +425,16 @@ repository, in an image or in a log.
 | `log.keep` | no | how many rotated files stay beside the live one, `1`-`20`, default `2` |
 | `listen`, `log` | no | overridden by `--address`, `--port`, `--log` |
 
-For the `opencode-go` leg, `token_url` and `client_id` are the OpenCode Console's own values,
-published in its OAuth discovery document at
+For the `opencode-go` leg, which the committed template no longer chains, `token_url` and `client_id`
+are the OpenCode Console's own values, published in its OAuth discovery document at
 `https://opencode.ai/console/.well-known/oauth-authorization-server` and in
 `https://opencode.ai/oauth/opencode/client.json`; the client is public and authenticates with
 `token_endpoint_auth_method` `none`, so no client secret is sent. `refresh_token` is the only secret
 in the block: it comes from the OpenCode credential store on the machine that owns the account
 (`opencode auth export`), never from the repository, and the refreshed values are written back into
-the running config file with mode `0600`.
+the running config file with mode `0600`. `ops/scripts/kori-config.sh` asks for the three OpenCode
+values only when the template carries their placeholders, so a two-leg template needs the two
+`api_key` values and nothing else.
 
 The `commandcode` and `sinarcloud` legs take a static `api_key` and nothing else: neither key expires,
 so neither leg has an `oauth` block and kori never refreshes them.

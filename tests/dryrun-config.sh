@@ -53,8 +53,8 @@ while [ "$#" -gt 0 ]; do
     *) shift ;;
   esac
 done
-if ! grep -q '"refresh_token"' "$cfg" 2>/dev/null; then
-  printf 'kori: legs[0].oauth.refresh_token is required\n' >&2
+if ! grep -q '"base_url"' "$cfg" 2>/dev/null; then
+  printf 'kori: legs[0].base_url is required\n' >&2
   exit 2
 fi
 printf 'kori 0.0.0 (stub) listening on 127.0.0.1:%s, log %s\n' "$port" "$log" >&2
@@ -96,12 +96,12 @@ rc=$?
 [ "$(file_mode "$OUT")" = "600" ] && pass "config.json is 0600" || fail "config.json mode is $(file_mode "$OUT")"
 grep -q '__KORI_' "$OUT" && fail "a placeholder survived into the config" \
   || pass "no template placeholder left in the config"
-for pair in "$SENTINEL_RT" "$SENTINEL_AT" "$SENTINEL_SES" "$SENTINEL_CC" "$SENTINEL_SC"; do
+for pair in "$SENTINEL_CC" "$SENTINEL_SC"; do
   grep -qF "$pair" "$OUT" && pass "value present: ${pair%%-SENTINEL*}" \
     || fail "value missing: ${pair%%-SENTINEL*}"
 done
 # "present somewhere in the file" is not enough: a value wired into the wrong field still passes
-# that check, and the opencode token sitting in sinarcloud's api_key hands it to a third party.
+# that check, and the commandcode key sitting in sinarcloud's api_key hands it to a third party.
 assert_field() { # assert_field <json field> <value> <label>
   grep -qF "\"$1\": \"$2\"" "$OUT" && pass "value in its field: $3" \
     || fail "value not in field \"$1\": $3"
@@ -114,14 +114,30 @@ leg_key() { # leg_key <leg name> -> that leg's api_key value
     /"api_key":/ && n == want { v = $0; sub(/.*"api_key": "/, "", v); sub(/".*/, "", v); print v }
   ' "$OUT"
 }
-assert_field refresh_token "$SENTINEL_RT" "opencode refresh_token"
-assert_field access_token "$SENTINEL_AT" "opencode access_token"
-assert_field x-opencode-session "$SENTINEL_SES" "opencode session header"
+assert_field model "deepseek/deepseek-v4.1-flash" "commandcode model"
+assert_field model "deepseek/deepseek-v4-1-flash" "sinarcloud model"
 [ "$(leg_key commandcode)" = "$SENTINEL_CC" ] && pass "commandcode leg holds its own api_key" \
   || fail "commandcode leg holds '$(leg_key commandcode)'"
 [ "$(leg_key sinarcloud)" = "$SENTINEL_SC" ] && pass "sinarcloud leg holds its own api_key" \
   || fail "sinarcloud leg holds '$(leg_key sinarcloud)'"
 grep -q '"legs"' "$OUT" && pass "the config still has the legs array" || fail "legs array missing"
+# The committed template chains two legs, and the first one is the primary. A template that
+# still opened with opencode-go would regenerate the three-leg config the host does not run.
+first_leg="$(awk '/"name":/ { n = $0; sub(/.*"name": "/, "", n); sub(/".*/, "", n); print n; exit }' "$OUT")"
+[ "$first_leg" = "commandcode" ] && pass "the first leg is commandcode" \
+  || fail "the first leg is '$first_leg'"
+grep -q 'opencode-go' "$OUT" && fail "an opencode-go leg is still chained" \
+  || pass "no opencode-go leg in the generated config"
+role_of() { # role_of <leg name> -> that leg's role
+  awk -v want="$1" '
+    /"name":/ { n = $0; sub(/.*"name": "/, "", n); sub(/".*/, "", n) }
+    /"role":/ && n == want { v = $0; sub(/.*"role": "/, "", v); sub(/".*/, "", v); print v }
+  ' "$OUT"
+}
+[ "$(role_of commandcode)" = "primary" ] && pass "commandcode is the primary" \
+  || fail "commandcode role is '$(role_of commandcode)'"
+[ "$(role_of sinarcloud)" = "fallback" ] && pass "sinarcloud is the fallback" \
+  || fail "sinarcloud role is '$(role_of sinarcloud)'"
 
 # ── scenario 2: a second run refuses to overwrite ──────────────────────────
 cp "$OUT" "$ROOT/first-copy.json"
@@ -166,7 +182,7 @@ grep -q 'KORI_SINARCLOUD_API_KEY is empty' "$ROOT/stderr" && pass "the error say
   || fail "the error does not say the key is empty"
 
 # ── scenario 6: a pasted placeholder is refused ────────────────────────────
-sed -e "s/^KORI_OPENCODE_SESSION=.*/KORI_OPENCODE_SESSION=__KORI_OPENCODE_SESSION__/" "$VALUES" \
+sed -e "s/^KORI_COMMANDCODE_API_KEY=.*/KORI_COMMANDCODE_API_KEY=__KORI_COMMANDCODE_API_KEY__/" "$VALUES" \
   >"$ROOT/values-placeholder.env"
 chmod 600 "$ROOT/values-placeholder.env"
 bash "$FILL" --values "$ROOT/values-placeholder.env" --out "$OUT2" 2>"$ROOT/stderr"
@@ -221,7 +237,7 @@ else
 fi
 
 # ── scenario 11: a rejected config leaves nothing behind ───────────────────
-grep -v 'refresh_token' "$TEMPLATE" >"$ROOT/broken-template.json"
+grep -v '"base_url"' "$TEMPLATE" >"$ROOT/broken-template.json"
 OUT4="$ROOT/etc4/config.json"
 mkdir -p "$ROOT/etc4"
 bash "$FILL" --values "$VALUES" --out "$OUT4" --template "$ROOT/broken-template.json" \
@@ -287,9 +303,9 @@ if [ -n "$REAL_BIN" ] && [ -x "$REAL_BIN" ]; then
   KORI_BIN="$REAL_BIN" bash "$FILL" --values "$VALUES" --out "$ROOT/etc5/never.json" \
     --template "$ROOT/broken-template.json" 2>"$ROOT/stderr"
   rc=$?
-  [ "$rc" != "0" ] && pass "the real parser rejects a config missing refresh_token ($rc)" \
-    || fail "the real parser accepted a config missing refresh_token"
-  grep -q 'refresh_token is required' "$ROOT/stderr" \
+  [ "$rc" != "0" ] && pass "the real parser rejects a config missing base_url ($rc)" \
+    || fail "the real parser accepted a config missing base_url"
+  grep -q 'base_url is required' "$ROOT/stderr" \
     && pass "the parser's own message reaches the caller" \
     || fail "the parser's message did not reach the caller: $(cat "$ROOT/stderr")"
 else
