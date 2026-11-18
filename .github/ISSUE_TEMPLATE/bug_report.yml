@@ -1,0 +1,36 @@
+name: Bug report
+description: kori routes a request wrongly, or the binary misbehaves.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not report a security problem here. See SECURITY.md for the private channel.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you sent, what kori answered, and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: The request log line
+      description: The affected line from the JSONL log, with any credential and prompt content removed.
+    validations:
+      required: true
+  - type: input
+    id: revision
+    attributes:
+      label: Revision
+      description: The `revision` field from `/healthz`, or the commit you built from.
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: The leg configuration
+      description: The `legs` block with `api_key`, `refresh_token` and `headers` replaced by `REDACTED`.
+    validations:
+      required: true

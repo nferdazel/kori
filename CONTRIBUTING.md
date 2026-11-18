@@ -1,100 +1,54 @@
-# Contributing to kori
+# Contributing
 
-kori is a small repo with a strict gate. The rules below are the ones CI enforces, so a
-local run and a red build mean the same thing.
+kori is an in-house LLM gateway with a single maintainer: one Nim binary that exposes
+`/v1/chat/completions` and walks an ordered list of provider legs.
 
-## Before anything is called done
+## Before you send anything
 
-Run these from the repo root and read the result:
+- Open an issue first for anything that changes routing, the log schema or the admin surface. Those
+  three are the contract the acceptance harness proves, and a patch that moves them silently is
+  worse than no patch.
+- One concern per pull request. A routing change and a dashboard change in one diff cannot be
+  reviewed together.
+- Commit messages follow Conventional Commits (`feat:`, `fix:`, `docs:`, `chore:`).
 
-```sh
-./task ops     # shellcheck plus the deploy/smoke/preflight dry runs
-./task nim     # nim check, nimble test, embed drift, release build, acceptance self-test
-./task check   # both of the above plus the dashboard build
-```
+## Build and test
 
-`./task nim` builds the binary and runs the acceptance self-test, 92 checks:
+| Step | Command | Notes |
+|---|---|---|
+| Build | `./task nim` | `nim check`, `nimble test`, the static-embed drift check, the release build, then the acceptance self-test |
+| Ops scripts | `./task ops` | shellcheck plus the deploy, smoke and preflight dry runs; no podman, no network |
+| Dashboard | `./task web` | vite build in `apps/web`, then fail if the committed `dist` is stale |
+| Everything | `./task check` | all of the above in CI order |
 
-```sh
-KORI_BIN=./apps/api/src/kori sh acceptance/selftest.sh
-```
-
-The ten-case suite (A1 to A10) is a separate command, and it is what the Nim job in CI
-runs after the release build:
+The acceptance harness is the gate that matters most:
 
 ```sh
 KORI_BIN=./apps/api/src/kori sh acceptance/run-all.sh
 ```
 
-House contract check, from the repo root:
+It proves failover, cooldown, the deadlines, the quota class, mid-stream abort, tool-call passthrough,
+a cold start, the all-dead `502`, the read-only dashboard and credential refresh against a real
+binary. A change to routing or logging is not done until it has a case there, or an existing case
+still passes for the right reason.
 
-```sh
-./ops/scripts/contract-check.sh .
-```
+CI also runs `./ops/scripts/contract-check.sh .`, the golden CI/CD rules every repository here shares,
+and a gitleaks job. Every job carries `timeout-minutes: 15` and caches its toolchain; a new job keeps
+both.
 
-Pass the repo as the argument. Without an argument the script scans every git repo under
-`~/Projects` and reports their violations as well.
+## Branch and pull request
 
-## Security gate
+- Branch from `main` and name it after the concern (`fix/cooldown-after-401`).
+- Paste the commands you ran and their result in the description. "Tests pass" is not evidence.
+- Fill in the pull request template, including the four-line handoff at the bottom.
 
-This repository is public. A leaked token is public the moment it is pushed.
+## What not to send
 
-Before every commit, push and pull request:
+- A real credential, a `refresh_token`, a session header, or a config file with one in it. The
+  repository is public, so a leak is public the moment it is pushed. `config.json` never belongs here;
+  the example file is `ops/etc/config.json.example`.
+- Prompt or response bodies copied out of a real request. The log deliberately carries none.
+- A dependency, unless the description says why the standard library cannot do the job.
+- Build output, unless it is the committed dashboard embed that `./task web` checks for drift.
 
-- Run `gitleaks git --redact --no-banner .` over the history, not just the diff.
-- Scan the dependencies you touched: `pnpm audit --audit-level=high` for `apps/web`, and
-  `nimble` dependency review for the binary.
-- Check the diff for `.env` files, connection strings, tokens, keys and credentials. The
-  real environment file lives on the host only; `ops/env/*.env.example` is a template.
-- Never commit `kori.json`. It holds every provider credential.
-
-CI runs the same scan in the `Security` job over the full history.
-
-## Commits
-
-- One local commit per slice. A slice is one change with one reason, not a day of work.
-- Conventional Commits: `feat(api): …`, `fix(ops): …`, `docs: …`, `ci(nim): …`,
-  `test(acceptance): …`. Scope is the directory or component touched.
-- English commit messages, English identifiers, English comments. Prose in `docs/` may be
-  Indonesian; anything a user or an outside reader sees stays English.
-- Do not push without the lead's go. A push to `main` publishes the image and fires the
-  deploy path.
-
-## Code
-
-- Match the style around you. Smallest change that solves the problem.
-- No new dependency unless it removes more complexity than it adds.
-- The request log line has ten keys in a fixed order; the last one, `alias`, is present only
-  when the caller asked for a `kori/<alias>`. Adding a key is a spec change, not a local edit.
-- The dashboard is committed as `apps/web/dist`, and the embedded module
-  `apps/api/src/generated/static_files.nim` is committed too. If you change one, regenerate
-  the other with `tools/gen-static.sh`. CI fails on drift.
-- Do not edit `apps/api/src/generated/static_files.nim` by hand.
-
-## Documentation
-
-- Document a command only after you have run it.
-- A wrong doc is worse than no doc. Delete a stale one in the same change that makes it
-  stale.
-- Mark anything unverified as unverified.
-
-## Handoff
-
-Every handoff is four lines, no prose around them:
-
-```
-STATE:     which step this is
-ARTIFACT:  commit sha, file paths, report path
-DONE WHEN: the checks that were run, with their numbers
-OPEN:      what is not verified and who holds it
-```
-
-## Pull requests
-
-Fill in the template. A pull request that cannot name the checks it ran is not ready for
-review.
-
-## License
-
-By contributing you agree that your contribution is licensed under the MIT license in
-[LICENSE](LICENSE).
+Security reports do not go in an issue: see [`SECURITY.md`](SECURITY.md).
