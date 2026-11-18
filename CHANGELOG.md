@@ -110,7 +110,7 @@ templates under `ops/` describe the intended host shape and have not been run ag
 - The `KORI_REVISION` build-arg guard tested only that the value was non-empty, so an argument
   of spaces passed it. `config.nims` then found nothing usable in the value, the build fell
   through to git, `.git` is not in the build context, and the image reported `dev` again with
-  no error — the symptom 0.5.1 was meant to close. The guard now requires a git sha shape
+  no error. That was the symptom 0.5.1 was meant to close. The guard now requires a git sha shape
   (lowercase hex, 7 to 40 characters) and fails the build otherwise.
 - The revision reaches the startup line and `/healthz` verbatim, and nothing checked what it
   contained, so a newline or a control character in the build-arg could forge a log line. The
