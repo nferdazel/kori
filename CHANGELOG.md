@@ -10,6 +10,8 @@ templates under `ops/` describe the intended host shape and have not been run ag
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-11-18
+
 ### Added
 
 - `GET /v1/models`: the model list derived from this config, for the clients that probe one
