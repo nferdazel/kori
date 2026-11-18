@@ -11,6 +11,17 @@ this one, is the answer to "what is live".
 
 ## [Unreleased]
 
+### Fixed
+
+- `ops/etc/config.json.example` priced the wrong ids. It carried `deepseek-v4.1-flash` at
+  0.27/1.10 and `glm-5.3-flash` at 0.60/2.20, which are the caller names of the 0.6.x
+  opencode-go leg, while a leg's price is looked up by the id that leg actually sends
+  (`DEC-16`). A config regenerated from the template therefore logged no `cost_usd` on the
+  commandcode and sinarcloud legs and none at all for a System One decision. The template now
+  carries both sets: the opencode-go ids as before, plus `deepseek/deepseek-v4.1-flash` and
+  `deepseek/deepseek-v4-1-flash` at 0.30/1.20, `z-ai/glm-5.3-flash` at 0.15/0.50 and
+  `typesafe/jev-1.14.0` at 0.042/0.0 — the prices the host ran on 2026-11-18.
+
 ## [0.7.0] - 2026-11-18
 
 ### Added

@@ -422,7 +422,7 @@ repository, in an image or in a log.
 | `legs[].oauth.expires_at` | no | epoch seconds; without it kori refreshes only after a `401` |
 | `legs[].oauth.refresh_skew_seconds` | no | refresh this long before expiry, default `60` |
 | `balance` | no | default `false`, which keeps strict leg order; `true` splits the pick across available primaries by `weight` (DEC-11) |
-| `prices` | no | USD per million tokens, keyed by the model id sent upstream, for example `{"glm-5.3-flash": {"in": 0.6, "out": 2.2}}`; `"*"` is the catch-all. A model with no entry logs no `cost_usd` (DEC-16) |
+| `prices` | no | USD per million tokens, keyed by the model id sent upstream, for example `{"z-ai/glm-5.3-flash": {"in": 0.15, "out": 0.5}}`; `"*"` is the catch-all. A caller alias is not the key: the id the leg sends is. A model with no entry logs no `cost_usd` (DEC-16) |
 | `systemone` | no | a second door, `POST /v1/systemone` (`DEC-19`); absent means the route answers `404`. Its legs are not part of the chat walk |
 | `systemone.legs[].name` | yes, with `systemone` | the name that appears in the log and on the dashboard |
 | `systemone.legs[].base_url` | yes, with `systemone` | kori appends `/systemone` to its path, unless the path already ends there |

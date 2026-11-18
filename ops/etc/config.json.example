@@ -4,7 +4,11 @@
   "balance": false,
   "prices": {
     "deepseek-v4.1-flash": { "in": 0.27, "out": 1.10 },
-    "glm-5.3-flash": { "in": 0.60, "out": 2.20 }
+    "glm-5.3-flash": { "in": 0.60, "out": 2.20 },
+    "deepseek/deepseek-v4.1-flash": { "in": 0.30, "out": 1.20 },
+    "deepseek/deepseek-v4-1-flash": { "in": 0.30, "out": 1.20 },
+    "z-ai/glm-5.3-flash": { "in": 0.15, "out": 0.50 },
+    "typesafe/jev-1.14.0": { "in": 0.042, "out": 0.0 }
   },
   "legs": [
     {
