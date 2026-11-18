@@ -14,8 +14,10 @@
 # `oauth` block. A refresh that fails stops the request; it never fails over and
 # never sends a stale bearer.
 #
-# Deliberately absent, and not to be reported as done: balancing beyond weight 1.
-# See REPORT.md for the open list.
+# Deliberately absent, and not to be reported as done: every non-chat endpoint
+# (messages, responses, embeddings, images, audio, batch), cost and budget, cache,
+# caller identity, metrics, and a second replica. docs/ARCHITECTURE.md, "Not built",
+# is the list this comment must agree with.
 
 import std/[algorithm, asyncdispatch, asyncnet, exitprocs,
             httpcore, json, net, options, os, posix, strutils, tables, times, uri]

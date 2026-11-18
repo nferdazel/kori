@@ -5,10 +5,19 @@ All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-Nothing in this file has been deployed. kori runs from a locally built binary; the deploy
-templates under `ops/` describe the intended host shape and have not been run against one.
+0.6.0 was the first release deployed to qouver1, on 2026-11-18, behind the Caddy edge that `ops/`
+describes. The host records the revision it actually runs in `.deployed_rev`, and that file, not
+this one, is the answer to "what is live".
 
 ## [Unreleased]
+
+### Documentation
+
+- The docs stop describing shipped work as absent. `docs/ARCHITECTURE.md` no longer lists
+  credential refresh as unbuilt, its module table names every section the binary has, and its "Not
+  built" list is the real one (non-chat endpoints, cost, cache, caller identity, metrics, HA,
+  retention). `README.md` moves to 0.6.2, mentions retry, the key pool and `/v1/models`, and its
+  deploy paragraph no longer claims nothing runs on a host.
 
 ## [0.6.2] - 2026-11-18
 

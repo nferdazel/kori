@@ -14,6 +14,10 @@ workload of one person.
   error that belongs to the caller (`400`, `403`, `404`, a plain `429`) is returned unchanged and
   nothing fails over.
 - Cooldown. A dead leg is skipped without a dial until its cooldown expires.
+- Retry, then fail over. `legs[].retries` absorbs a transport blip on the same leg before the walk
+  moves on, and `legs[].api_keys` rotates a dead key before it blames the leg.
+- A model list. `GET /v1/models` is derived from the config, so an OpenAI-shaped client can
+  enumerate what this door accepts without a provider being dialled.
 - One log line per request. Append-only JSONL carrying route, status, latency, token counts, the
   failover reason and, when the caller asked for a `kori/<alias>`, that alias.
 - A read-only dashboard compiled into the binary, served from memory.
@@ -24,11 +28,11 @@ is memory only.
 
 ## Status
 
-Version `VERSION` at the root, currently 0.6.1, and tags are annotated `vX.Y.Z`.
+Version `VERSION` at the root, currently 0.6.2, and tags are annotated `vX.Y.Z`.
 
-Built, tested and used from a locally built binary. Not deployed anywhere yet: `ops/` holds templates
-for a rootless podman deploy behind a Caddy edge, and no deploy script in it has been run against a
-host.
+Built and tested locally, and deployed on qouver1 behind the Caddy edge since 2026-11-18. The host
+records the revision it runs in `.deployed_rev`; this file names the version it was cut at, not
+what that host is running right now.
 
 ## Architecture
 
@@ -448,10 +452,11 @@ door to publishing the image.
 
 ## Deployment
 
-`ops/` holds templates for a rootless podman deploy behind a Caddy edge: the deploy, rollback and
-smoke scripts, the Caddy block, the env example, systemd units and the webhook template. kori is not
-deployed anywhere yet, so those files describe the intended shape; read them as a contract, not as a
-record of a running host.
+`ops/` holds the deploy contract for a rootless podman deploy behind a Caddy edge: the deploy,
+rollback and smoke scripts, the Caddy block, the env example, systemd units and the webhook
+template. qouver1 runs this shape. The host-side pieces (webhook install, clone, env file, config
+file, Caddy import) live on that host and belong to the deploy owner, so read `ops/` as the
+contract those files implement rather than as a snapshot of the running machine.
 
 ## Documentation
 

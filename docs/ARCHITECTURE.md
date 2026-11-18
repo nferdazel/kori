@@ -18,7 +18,7 @@ was replaced on shape, not on features.
 
 ```
 caller ──POST /v1/chat/completions──► kori
-                                       │  pick order (config order, or round-robin)
+                                       │  pick order (config order, or weighted round-robin)
                                        ├──► leg A (primary)      ── ok ──► caller
                                        │        │ fail
                                        │        └─ classify, cooldown
@@ -38,19 +38,20 @@ caller ──POST /v1/chat/completions──► kori
 | Section | Holds |
 |---|---|
 | CLI flags | flag parsing, precedence over config, exit `2` on bad input |
-| config | JSON loading, leg defaults, the one refusal (`weight` other than 1) |
-| log writer | the ten-key line, the single append, the descriptor held for the process |
+| config | JSON loading, leg defaults, and every refusal: a pool that cannot also be the bearer, an unranked effort, a `weight` outside 1-1000, a `retries` outside 0-5 |
+| log writer | the eleven-key line (nine keys always, `alias` and `effort_clamped` only when the request earned them), the single append, the descriptor held for the process |
 | time | RFC 3339 stamps used by the log and the admin GETs |
-| router | leg availability, pick order, cooldown, served/attempted counters, the latency ring |
+| router | leg availability, pick order, smooth weighted round-robin (`DEC-11`), leg and key cooldowns, served/attempted counters, the latency ring |
 | upstream IO | raw socket dial, TLS wrap, the deadline-bounded send and receive |
-| classification | status plus body to a failure token, and the quota-body test |
-| request body | `stream` detection, `stream_options.include_usage` injection |
+| classification | status plus body to a failure token, `model_gone` and `caller_fault` included, and the quota-body test |
+| request body | `stream` detection, `stream_options.include_usage` injection, the per-leg effort ceiling |
 | caller response | streaming and non-streaming write-back, abort on mid-stream death |
-| attempts | one leg, one attempt, and the outcome the walk consumes |
+| attempts | one leg, one attempt, the retry budget (`DEC-12`), the key pool (`DEC-13`), and the outcome the walk consumes |
+| credential refresh | the token call, the single in-flight refresh per leg, the atomic write-back of a rotated credential |
 | proxy | the failover walk and the one log line per request |
 | log tail | bounded backwards scan for `/admin/log` and `recent[]` |
-| state | `/admin/state` and `/admin/config` JSON, with credentials redacted |
-| handlers | dispatch, the static surface, `/healthz`, `/admin/*`, `/v1/*` |
+| state | `/admin/state`, `/admin/config` and `/healthz?deep` JSON, with credentials redacted |
+| handlers | dispatch, the static surface, `/healthz`, `/admin/*`, `/v1/models`, `/v1/chat/completions` |
 | main | startup order: CLI, config, log, listener |
 
 `apps/api/src/config.nims` adds `-d:ssl` and the revision define. The revision is read from
@@ -62,27 +63,38 @@ path, content type and body for the eight files under `apps/web/dist`.
 
 ## Request lifecycle
 
-1. `dispatch` routes by path. `/healthz`, `/admin/*` and `/v1/chat/completions` keep
-   priority; the static surface is last in the chain, so adding a dashboard page can never
+1. `dispatch` routes by path. `/healthz`, `/admin/*`, `/v1/models` and `/v1/chat/completions`
+   keep priority; the static surface is last in the chain, so adding a dashboard page can never
    shadow an API path.
 2. `handleChat` reads the body once, decides `stream` from it, and injects
    `stream_options.include_usage` for streaming requests that omit it.
-3. `pickOrder` returns the legs to try, skipping any leg whose cooldown has not expired.
-   With `balance` false the order is the config order; with `balance` true the starting
-   primary rotates round-robin and the walk then covers the other primaries and the
-   fallbacks.
-4. `attemptLeg` dials one leg, writes the upstream request, and reads the response. The
-   failover window ends when response headers arrive: below that line an attempt either
-   serves the caller or aborts.
+3. `pickOrder` returns the legs to try, skipping any leg whose cooldown has not expired, a leg
+   the config disabled, and a leg that cannot serve the request's effort. With `balance` false
+   the order is the config order; with `balance` true the first leg is chosen by smooth weighted
+   round-robin across the available primaries (`DEC-11`), and the walk then covers the other
+   primaries and finally the fallbacks.
+4. `attemptLeg` dials one leg, writes the upstream request, and reads the response. A pooled
+   credential is chosen here: an entry on its own cooldown is skipped, and a `401` or a quota
+   `429` cools only the key that failed before the leg is blamed (`DEC-13`). The transport
+   classes get up to `legs[].retries` more dials on the same leg behind a doubling pause
+   (`DEC-12`), which is why a retry leaves `failover_from` empty: the request never left the
+   leg. The failover window ends when response headers arrive: below that line an attempt
+   either serves the caller or aborts.
 5. A failed attempt is classified, put on cooldown, and recorded as a failover event if
-   another leg remains. The walk continues.
+   another leg remains. The walk continues. A failed credential refresh is the exception: the
+   caller gets `502 credential_refresh_failed` (or `refresh_timeout`) and nothing else is
+   dialled, because the request never reached a provider and a stale bearer is worse than a
+   stop.
 6. Whatever happened, one log line is written before the handler returns. `failover_reason`
    is the first reason met, except for a mid-stream abort, which overrides it because it is
    what the caller actually saw.
 
 Cooldowns are 60 s for availability failures and 900 s for a quota `429`. A leg whose
 cooldown has expired is eligible again, and the first request that picks it acts as the
-half-open probe: a second failure starts a fresh full cooldown.
+half-open probe: a second failure starts a fresh full cooldown. A pool entry cools on the
+same clock, and the leg itself is only cooled once every entry in the pool is cooling. A leg
+skipped for its effort ceiling or for an unmapped alias was never dialled, so it is not a
+failure and takes no cooldown.
 
 ## Static surface
 
@@ -102,13 +114,16 @@ committed, and CI fails if either is out of step with the other.
 
 ## State
 
-Router state lives in memory: per-leg cooling deadline, counters, last failure class and a
-latency ring. Nothing is rebuilt from the log on restart, and there is no database by
-design. The log is the durable record of what happened; `/admin/log` and `recent[]` read it
-backwards with a bounded scan budget, never whole.
+Router state lives in memory: per-leg cooling deadline, per-key cooling deadline, counters, last
+failure class, last success, and a latency ring. Nothing is rebuilt from the log on restart, and
+there is no database by design. The log is the durable record of what happened; `/admin/log` and
+`recent[]` read it backwards with a bounded scan budget, never whole. `/healthz?deep` is the same
+state projected per leg, and it dials nothing, so asking what is broken cannot cost a provider
+call or a token.
 
-`/admin/config` reports the config path and a `<path>:<line>` reference per leg credential,
-never the value.
+`/admin/config` reports the config path and a `<path>:<line>` reference per leg credential, never
+the value. The key pool is reported as a size and a cooling count, and an `oauth` leg as a state
+plus its expiry, so the same page can answer "which credential is dead" without carrying one.
 
 ## Acceptance harness
 
@@ -124,16 +139,31 @@ network, which is why it can run in the `Nim` job before the release build.
 
 ## Ops templates
 
-`ops/` mirrors the intended host shape one to one: `deploy-vps.sh`, `rollback.sh`,
-`smoke.sh`, `preflight.sh`, `contract-check.sh`, a Caddy site template, an env template, a
-Quadlet unit and a webhook definition. They are templates. No deploy has been run against a
-host, and the host-side pieces (hook install, clone, env file, config file, Caddy import
-line) are owned by the deploy owner, not by this repository.
+`ops/` mirrors the host shape one to one: `deploy-vps.sh`, `rollback.sh`, `smoke.sh`,
+`preflight.sh`, `contract-check.sh`, a Caddy site template, an env template, a Quadlet unit and a
+webhook definition. They are the contract the deploy runs to, not a taping of one host: the
+host-side pieces (hook install, clone, env file, config file, Caddy import line) live on the host
+and are owned by the deploy owner, not by this repository. qouver1 has run kori behind the Caddy
+edge since 2026-11-18; which revision is on it right now is recorded there in `.deployed_rev`, and
+a document that repeated it here would be wrong after the next deploy.
 
 ## Not built
 
-- Credential refresh (SPEC §4). The OpenCode credential is an OAuth access token with an
-  expiry; the binary reads it from the config and does not refresh it. A request served with
-  an expired token fails as `auth_401` and falls over, which is not the loud stop the spec
-  asks for.
-- Any deploy. See the changelog.
+- Anything but chat. No `/v1/messages`, no Responses API, no embeddings, images, audio or batch.
+  Every leg is spoken to in the OpenAI protocol, so a native passthrough for Bedrock, Vertex or
+  Azure would be a second protocol path rather than a config change, and a client that speaks only
+  Anthropic's or OpenAI's Responses protocol cannot use this door today.
+- Cost, budget and cache. Token counts are logged, nothing prices them. There is no spend cap per
+  key or per caller, and no exact or semantic cache.
+- Caller identity. The only credential in front of kori is the one bearer the edge holds, so any
+  per-caller limit, quota or audit trail would have to be built at the edge or not at all.
+- Metrics and HA. `/healthz?deep` and the dashboard are for a person; there is no Prometheus or
+  OTLP endpoint, and router state is one process in memory, so there is no second replica and no
+  cluster.
+- Config changes need a file edit and a restart. The admin surface is read-only on purpose, so
+  there is no way to disable a leg from a browser mid-incident.
+- Log retention. The file grows and nothing rotates or prunes it; that is the host's job and it
+  has no default here.
+- The credential write-back inside a container is best effort: a read-only mounted config is
+  served from memory with a warning, so a rotated token survives a restart only if the mount is
+  writable.
