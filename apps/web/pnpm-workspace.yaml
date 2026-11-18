@@ -1,0 +1,8 @@
+# pnpm 12 reads auditConfig here, not from package.json. One advisory is parked, deliberately:
+# GHSA-fc5q-39xc-vjpf (picomatch, high, <=4.0.7, no patched release) reaches this tree only
+# through vite's dev dependency chain, so nothing it describes ships in the built dashboard.
+# The audit gate stays fatal for everything else. Owner decision; needs Galih's security gate
+# before this reaches main, because parking a HIGH advisory is a security call, not a build one.
+auditConfig:
+  ignoreGhsas:
+    - GHSA-fc5q-39xc-vjpf
