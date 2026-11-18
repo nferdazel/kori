@@ -212,9 +212,11 @@ below, so the mistake shows up at request time and nowhere earlier.
 A clamp only ever goes down. Asking for `low` against a leg that starts at `high` is skipped
 rather than upgraded, because spending more than the caller asked for is a cost decision
 nobody made. A skipped leg is not put on cooldown and does not count as a failure: the walk
-moves to the next leg exactly as it does for an unmapped alias. When every leg in the walk
-skips for this reason, the caller gets one `400` whose body type is `effort_unsupported` and
-which names the value.
+moves to the next leg exactly as it does for an unmapped alias. When the walk ends with no
+leg dialled and at least one leg skipped for this reason, the caller gets one `400` whose
+body type is `effort_unsupported` and which names the value. That holds even when other
+legs in the same walk were skipped for a different reason, such as an unmapped alias; a
+leg that was really dialled and failed keeps the `502` instead.
 
 A value kori does not rank is forwarded untouched rather than guessed at, and the leg's own
 validation decides what happens to it.
@@ -226,7 +228,10 @@ to the leg.
 
 The committed `ops/etc/config.json.example` carries the three legs this deployment has:
 `opencode-go` and `commandcode` accept `low`, `high` and `max`; `sinarcloud` accepts `low`
-and `high` only. sinarcloud's real ceiling is not measured yet (the owner says high), and
+and `high` only. That sinarcloud list is our own cost choice, not a provider limit: probed
+from the host on 2026-11-18, `none`, `low`, `medium`, `high`, `max` and the unranked `turbo`
+all answered `200`, and `max` spent fewer reasoning tokens than `high` did. The legs are
+listed that way so a `medium` request is still clamped down and the log says so.
 `medium` is left out of every leg on purpose until a probe says a leg accepts it, so a
 caller asking `medium` is clamped down and the log says so. `glm-5.3-flash` is an alias on
 two legs only: `opencode-go` maps it to `glm-5.3-flash` and `commandcode` to
