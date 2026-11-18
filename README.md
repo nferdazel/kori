@@ -200,21 +200,38 @@ changes:
 | `medium` | `["low", "high", "max"]` | `low` | `"effort_clamped":"medium>low"` |
 | `low` | `["high", "max"]` | nothing, the leg is skipped | `effort_unsupported` |
 | anything | no `efforts` key | the caller's value, untouched | no clamp key |
+| anything ranked | `[]` | nothing, the leg is skipped | `effort_unsupported` |
 | nothing | any | the field stays absent | no clamp key |
+
+An empty array is not the same as a missing key. `"efforts": []` passes config load as a
+ceiling with nothing under it, so every ranked value is skipped on that leg; only the absent
+key means no ceiling at all. A leg written that way answers no ranked request, and when no
+other leg in the walk serves it the caller gets the `effort_unsupported` `400` described
+below, so the mistake shows up at request time and nowhere earlier.
 
 A clamp only ever goes down. Asking for `low` against a leg that starts at `high` is skipped
 rather than upgraded, because spending more than the caller asked for is a cost decision
 nobody made. A skipped leg is not put on cooldown and does not count as a failure: the walk
-moves to the next leg exactly as it does for an unmapped alias. When every leg in the walk
-skips for this reason, the caller gets one `400` whose body type is `effort_unsupported` and
-which names the value.
+moves to the next leg exactly as it does for an unmapped alias. When the walk ends with no
+leg dialled and at least one leg skipped for this reason, the caller gets one `400` whose
+body type is `effort_unsupported` and which names the value. That holds even when other
+legs in the same walk were skipped for a different reason, such as an unmapped alias; a
+leg that was really dialled and failed keeps the `502` instead.
 
 A value kori does not rank is forwarded untouched rather than guessed at, and the leg's own
 validation decides what happens to it.
 
+The ceiling is a cost and behaviour control, not a security control. Because an unranked
+value passes through as the caller sent it, a leg's `efforts` list is not a hard limiter on
+what a client can ask for: it only clamps the seven ranked values and leaves everything else
+to the leg.
+
 The committed `ops/etc/config.json.example` carries the three legs this deployment has:
 `opencode-go` and `commandcode` accept `low`, `high` and `max`; `sinarcloud` accepts `low`
-and `high` only. sinarcloud's real ceiling is not measured yet (the owner says high), and
+and `high` only. That sinarcloud list is our own cost choice, not a provider limit: probed
+from the host on 2026-11-18, `none`, `low`, `medium`, `high`, `max` and the unranked `turbo`
+all answered `200`, and `max` spent fewer reasoning tokens than `high` did. The legs are
+listed that way so a `medium` request is still clamped down and the log says so.
 `medium` is left out of every leg on purpose until a probe says a leg accepts it, so a
 caller asking `medium` is clamped down and the log says so. `glm-5.3-flash` is an alias on
 two legs only: `opencode-go` maps it to `glm-5.3-flash` and `commandcode` to
