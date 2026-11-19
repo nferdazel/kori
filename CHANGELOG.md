@@ -11,12 +11,13 @@ this one, is the answer to "what is live".
 
 ## [Unreleased]
 
+## [0.8.2] - 2026-11-20
+
 ### Changed
 
 - CI/CD v2.0: one local gate (`./task gate`, `./task gate-full`), one release mechanism
   (`./task release`, no push without `--push`), the golden contract job renamed to `preflight`
   and required by every expensive job.
-
 
 ## [0.8.1] - 2026-11-19
 
