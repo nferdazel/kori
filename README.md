@@ -23,7 +23,8 @@ carried a Python service and a Postgres database for a workload of one person.
   enumerate what this door accepts without a provider being dialled.
 - One log line per request. Append-only JSONL carrying route, status, latency, token counts, the
   failover reason and, when the caller asked for a `kori/<alias>`, that alias.
-- A read-only dashboard compiled into the binary, served from memory.
+- A read-only dashboard compiled into the binary, served from memory, behind one shared admin token
+  (`DEC-20`).
 
 What it is not: it is not a router with persistence or a control plane. kori has no Python, no
 database and no migrations. Its only durable output is an append-only request log, and router state
@@ -262,25 +263,34 @@ route, a live `kori_route_cooling` gauge, a latency histogram in milliseconds, t
 `cost_usd`, the reload count and a `kori_info` build marker. Everything is tallied by the request
 path; nothing dials a provider and no scrape touches the log file. The listener is the same loopback
 one the rest of the admin surface uses, so scraping from another host means going through the edge.
+A scrape needs the admin token like every other admin read.
 
 ### HTTP surface
 
-| Path | Method | Purpose |
-|---|---|---|
-| `/v1/chat/completions` | POST | the gateway door |
-| `/v1/systemone` | POST | a decision passthrough (`DEC-19`): the caller's System One body goes upstream with only `model` replaced, answered from its own `systemone.legs` list; `404` when the config declares none |
-| `/v1/models` | GET, HEAD | the model list derived from this config: one `kori/<alias>` per alias, plus every leg `model` id; no provider is dialled |
-| `/healthz` | GET, HEAD | `{"status":"ok","version":…,"revision":…}`; revision is the git sha the binary was built from, or `dev` |
-| `/healthz?deep` | GET, HEAD | the same liveness, plus per-leg state, cooldown, last success, last failure and window counters, read from router state with zero dials |
-| `/metrics` | GET, HEAD | Prometheus text exposition: requests, failover reasons, cooldowns, latency histogram, cost, reloads |
-| `/admin/state` | GET, HEAD | routes, window counters, failover events, recent log rows |
-| `/admin/log` | GET, HEAD | a page of the request log, newest first |
-| `/admin/config` | GET, HEAD | the loaded config with every credential redacted |
-| `/`, `/requests.html`, `/routes.html`, `/config.html`, `/assets/*`, `/fonts/*` | GET, HEAD | the dashboard, served from the compiled static table |
-| anything else | any | `404` |
+| Path | Method | Auth | Purpose |
+|---|---|---|---|
+| `/v1/chat/completions` | POST | edge bearer | the gateway door |
+| `/v1/systemone` | POST | edge bearer | a decision passthrough (`DEC-19`): the caller's System One body goes upstream with only `model` replaced, answered from its own `systemone.legs` list; `404` when the config declares none |
+| `/v1/models` | GET, HEAD | edge bearer | the model list derived from this config: one `kori/<alias>` per alias, plus every leg `model` id; no provider is dialled |
+| `/healthz` | GET, HEAD | none | `{"status":"ok","version":…,"revision":…}`; revision is the git sha the binary was built from, or `dev` |
+| `/healthz?deep` | GET, HEAD | admin | the same liveness, plus per-leg state, cooldown, last success, last failure and window counters, read from router state with zero dials |
+| `/metrics` | GET, HEAD | admin | Prometheus text exposition: requests, failover reasons, cooldowns, latency histogram, cost, reloads |
+| `/admin/state` | GET, HEAD | admin | routes, window counters, failover events, recent log rows |
+| `/admin/log` | GET, HEAD | admin | a page of the request log, newest first |
+| `/admin/config` | GET, HEAD | admin | the loaded config with every credential redacted |
+| `/`, `/index.html`, `/requests.html`, `/routes.html`, `/config.html` | GET, HEAD | admin | the dashboard pages, served from the compiled static table; a browser without the credential is redirected to `/login.html`, a script gets `401` |
+| `/login.html`, `/assets/*`, `/fonts/*` | GET, HEAD | none | the login form and the files it needs; they carry no data |
+| `/session/login` | POST | none | body `{"token":"…"}`; `204` and the `kori_admin` cookie, `401` for a wrong token, `429` over the login limit, `405` for any other method |
+| `/session/logout` | POST | none | drops the session and clears the cookie; `204` whether or not one existed |
+| anything else | any | none | `404` |
 
-Any method other than GET or HEAD under `/admin/` is a `405` that names `GET`. Nothing is read from
-disk at runtime: the dashboard files are compiled into the binary.
+`admin` means the admin token as `Authorization: Bearer <token>` or the `kori_admin` session cookie;
+see "Admin authentication" below. `edge bearer` is Caddy's `KORI_EDGE_TOKEN`; kori itself checks no
+caller credential on `/v1/*`.
+
+Any method other than GET or HEAD under `/admin/` is a `405` that names `GET`. The dashboard files
+are compiled into the binary, so no page and no asset is read from disk. The one file a request
+reads is the admin token, once per gated request.
 
 `/admin/log` takes `limit` (1-200, default 50), `offset`, `route`, `status_class` (`2xx`, `4xx`,
 `5xx`), `reason` (the token, or `none` for requests that did not fail over), `stream` (`true`,
@@ -290,9 +300,41 @@ is a `400` that names the parameter, and no file read happens.
 Router state is memory only. After a restart every leg reads `unknown` with no cooldown and zero
 counters; the log is the durable record, not a source of router state.
 
+### Admin authentication
+
+The admin surface is one shared token (`DEC-20`). A script or a scrape sends it as
+`Authorization: Bearer <token>`; a browser gets the `kori_admin` session cookie from the login form.
+Either one is enough, and the token is compared against the file in constant time.
+
+`POST /session/login` takes `{"token":"<token>"}` and answers `204` with `Set-Cookie: kori_admin=…;
+HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=43200`. `POST /session/logout` drops the entry
+and clears the cookie. Sessions live in memory for twelve hours, so a restart signs everyone out.
+Both paths sit outside `/admin/` on purpose: anything but GET or HEAD under `/admin/` is still a
+`405`.
+
+Five failed logins within five minutes answer `429` for every caller, because behind Caddy each
+request arrives from one address. The limit is counted globally and checked before the token is
+compared, so a correct token is refused inside the window too; wait it out.
+
+A gated dashboard page answers `302` to `/login.html` when the request accepts HTML, and the `401`
+JSON body otherwise, so `curl` learns why instead of receiving a page it cannot use. `/healthz` stays
+open: it is the deploy probe, and a rollback must not need a secret. `/v1/*` is unchanged and the
+edge bearer is its gate.
+
+The token is a file, not a config key: `KORI_ADMIN_TOKEN_FILE`, default `/etc/kori/admin.token`,
+read on every request, so a new value works for a new login without a restart. A live session is
+checked against the session table, not against the current token, so replacing the file does not end
+sessions already issued; rotation after a possible leak is the new file plus `systemctl --user restart
+kori-api`. It never appears in `config.json`, in `/admin/config`, in a URL or in the request log. When the file is missing,
+unreadable or empty, every gated surface answers `404` with the ordinary not-found body instead of
+`401`: a gateway with no admin token should not advertise that it has an admin surface. The dashboard
+is then dark, `/login.html` still loads, and a login attempt gets the same `404`. The token setup
+steps are under "Deployment".
+
 ### Dashboard
 
-Four read-only pages, wired to the three admin GETs:
+Four read-only pages, wired to the three admin GETs. All four need the admin token; `/login.html` is
+the only page that loads without one.
 
 | Page | Shows |
 |---|---|
@@ -358,6 +400,17 @@ or invalid JSON exits `2` before the listener opens.
 Both `--flag value` and `--flag=value` are accepted. Precedence is CLI over config over built-in
 default. An unknown flag, a non-numeric port or a non-literal address exits `2` with one usage line on
 stderr. Exit codes: `0` clean, `2` bad config or CLI, `1` anything else.
+
+The admin surface answers `404` until a token file exists, so a local run needs one too. Point the
+variable at a file you create yourself instead of `/etc/kori`:
+
+```sh
+umask 077; openssl rand -hex 32 > /tmp/kori-admin.token
+KORI_ADMIN_TOKEN_FILE=/tmp/kori-admin.token \
+  ./apps/api/src/kori --config ~/.config/kori/kori.json --port 4021 --log /tmp/kori.jsonl
+```
+
+`/healthz` and `/v1/*` answer without it. `/admin/*`, `/metrics` and the dashboard pages do not.
 
 ## Configuration
 
@@ -444,8 +497,11 @@ The caller's body is forwarded byte for byte, with one exception: for a streamin
 
 The deploy side reads its own variables, listed with defaults in
 [`ops/env/kori-prod.env.example`](ops/env/kori-prod.env.example): `KORI_APP_DIR`, `KORI_PORT`,
-`KORI_IMAGE`, `KORI_SERVICE`, `KORI_HEALTH_URL` and `KORI_EDGE_TOKEN`. `KORI_EDGE_TOKEN` is a secret
-and belongs only in the host environment, never in a committed file.
+`KORI_IMAGE`, `KORI_SERVICE`, `KORI_HEALTH_URL`, `KORI_ADMIN_TOKEN_FILE` and `KORI_EDGE_TOKEN`.
+`KORI_EDGE_TOKEN` is a secret and belongs only in the host environment, never in a committed file.
+`smoke.sh` reads the admin token from `$KORI_APP_DIR/etc/admin.token` on the host; `KORI_ADMIN_TOKEN`
+exists only as an override for a manual run and is never set on the host, because the env file it
+would sit in also becomes the container's environment.
 
 ## Quality gates
 
@@ -463,7 +519,7 @@ missing.
 The acceptance harness proves the router end to end against a real binary:
 
 ```sh
-KORI_BIN=./apps/api/src/kori sh acceptance/run-all.sh   # the thirteen cases, A1-A13
+KORI_BIN=./apps/api/src/kori sh acceptance/run-all.sh   # the sixteen cases, A1-A16
 KORI_BIN=./apps/api/src/kori sh acceptance/selftest.sh  # proves the harness itself
 ```
 
@@ -482,6 +538,9 @@ KORI_BIN=./apps/api/src/kori sh acceptance/selftest.sh  # proves the harness its
 | a11 | an expired credential is refreshed, and a refresh forced to fail stops the request |
 | a12 | a leg that names a model sends that id, and only that leg does (DEC-10) |
 | a13 | `/v1/models`, `retries`, a key pool, `model_gone`, weighted balancing and `/healthz?deep` (DEC-11 to DEC-14) |
+| a14 | `cost_usd`, the SIGHUP reload, log rotation and `/metrics` (DEC-15 to DEC-18) |
+| a15 | the System One door: passthrough, its own log line, a bad model, a caller's 400 and an unconfigured door (DEC-19) |
+| a16 | the admin gate: `401` without a credential, `404` with no token file, the cookie flags, the login limit, `429`, and `/healthz` still open (DEC-20) |
 
 Cases use logical port numbers; `acceptance/lib.sh` resolves each to a free port per run, so a run
 leaves nothing behind and can be repeated immediately.
@@ -498,6 +557,34 @@ rollback and smoke scripts, the Caddy block, the env example, systemd units and 
 template. qouver1 runs this shape. The host-side pieces (webhook install, clone, env file, config
 file, Caddy import) live on that host and belong to the deploy owner, so read `ops/` as the
 contract those files implement rather than as a snapshot of the running machine.
+
+The container mounts `/srv/qouver/apps/kori/etc` at `/etc/kori`, so the admin token file goes in that
+directory and is created once, before the first deploy that expects a dashboard:
+
+```sh
+install -d -m 0700 /srv/qouver/apps/kori/etc
+umask 077; openssl rand -hex 32 > /srv/qouver/apps/kori/etc/admin.token
+chmod 600 /srv/qouver/apps/kori/etc/admin.token
+```
+
+The token stays out of the repository, out of the image and out of `config.json`. On the host it does
+not belong in `ops/env/kori-prod.env` either, and the committed example never carries a value.
+`KORI_ADMIN_TOKEN_FILE` names the path inside the container and already defaults to
+`/etc/kori/admin.token`; set it only when the file lives somewhere else. Writing the host path into
+that variable points the binary at a directory the container does not have, and every gated surface
+answers `404` for the wrong reason.
+
+Nothing in `ops/env/kori-prod.env` carries the token: that file becomes the container's process
+environment, so a copy there is readable from inside the container and from `/proc` on the host.
+`smoke.sh` reads the file above (`$APP_DIR/etc/admin.token`) itself, so with a token file in place the
+release gate proves `200` on `/admin/state` and `/metrics`; with no file it asserts the `404` branch,
+and with a file but no readable token it accepts `401`. `KORI_ADMIN_TOKEN` is an override for a manual
+run against a local binary, not something the host sets.
+
+The deploy, rollback and smoke scripts probe `/healthz`, never `/admin/state`. A host whose token
+file is missing deploys green while the dashboard answers `404`: that is the fail-closed default,
+not a failed deploy. If the dashboard is dark after a deploy, check the file exists, is readable and
+is not empty inside the container.
 
 ## Documentation
 

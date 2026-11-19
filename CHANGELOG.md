@@ -11,6 +11,23 @@ this one, is the answer to "what is live".
 
 ## [Unreleased]
 
+### Security
+
+- The admin surface is gated (`DEC-20`). `/admin/*`, `/metrics`, `/healthz?deep` and the five
+  dashboard pages now need one shared token, sent as `Authorization: Bearer` by a script or a scrape,
+  or carried as the `kori_admin` cookie a browser gets from `POST /session/login`.
+  `POST /session/logout` drops the session; both live outside `/admin/`, which stays GET/HEAD-only with
+  `405` on every other method. Five failed logins in five minutes answer `429`, counted globally.
+  The token is a file, `KORI_ADMIN_TOKEN_FILE`, default `/etc/kori/admin.token`, read on every
+  request, so a new value takes effect for new logins without a restart; a session already issued is
+  checked against the session table, so rotating a token that may have leaked is the new file plus a
+  restart of `kori-api`. It never sits in `config.json`,
+  in `/admin/config` or in the request log. A host with no token file, or an empty one, answers `404` on
+  every gated surface rather than `401`: the dashboard stays dark until the file exists, and a
+  gateway with no admin token does not advertise that it has one. `/healthz` and `/v1/*` are
+  unchanged, and `/healthz` is now the deploy gate: `deploy-vps.sh`, `rollback.sh` and `smoke.sh`
+  probe it instead of `/admin/state`. One shared token means no per-person identity and no MFA.
+
 ### Fixed
 
 - `ops/etc/config.json.example` priced the wrong ids. It carried `deepseek-v4.1-flash` at
@@ -25,6 +42,9 @@ this one, is the answer to "what is live".
 
 ### Changed
 
+- The dashboard footer names the gate it actually sits behind ("read-only · token required") instead
+  of claiming the surface is loopback only, which stopped being true when `dash.qouver.com` was
+  published. A browser without a session is sent to `/login.html`; a script gets `401` JSON.
 - `ops/etc/config.json.example` now chains the two legs qouver1 actually runs: `commandcode` as
   primary and `sinarcloud` as fallback, each with the `model` id it is sent (`deepseek/deepseek-v4.1-flash`
   and `deepseek/deepseek-v4-1-flash`). The `opencode-go` leg is gone from the template, because a config

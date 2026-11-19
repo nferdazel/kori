@@ -442,3 +442,60 @@ that shape is a passthrough, not a translation — a provider that answers in a 
 reached by a config edit, so "add another protocol" stays a code change and is refused here on
 purpose. `systemone.legs[].model` is required, unlike a chat leg, because an empty id would forward
 a caller string the provider rejects.
+
+## DEC-20 — The admin surface has its own gate, inside the binary
+
+**Status:** accepted 2026-11-19.
+
+**Context.** `dash.qouver.com` served the dashboard and the three admin reads with no authentication.
+On 2026-11-18 Galih measured `200` with no auth challenge on `/`, `/admin/state`, `/admin/log`,
+`/admin/config`, `/metrics` and `/healthz`: no key was readable, `state=set`, `log.redacted=true`
+and every non-GET under `/admin/` was `405`, but the pages named the provider chain, the model ids
+and prices, the traffic volume, the window's `cost_usd` and the running revision. The footer said
+"loopback only", which was false. Cloudflare plus the `@not_cloudflare` guard were the only gate,
+so anyone who learned the hostname could read the dashboard. `DEC-7` binds the binary to loopback
+and `DEC-18` calls the edge "the edge's business"; both were true of the network path and neither
+decided who may read the pages.
+
+**Decision.** Auth inside kori. `/admin/*`, `/metrics`, `/healthz?deep` and the five dashboard pages
+require one shared token, presented as `Authorization: Bearer <token>` by a script or a scrape, or
+carried as the `kori_admin` session cookie a browser gets from `POST /session/login`
+(`{"token":"…"}`, `204`, twelve hours, `HttpOnly; Secure; SameSite=Strict; Path=/`).
+`POST /session/logout` drops the session. The token is a file named by `KORI_ADMIN_TOKEN_FILE`,
+default `/etc/kori/admin.token`, read on every request so a new value works for a new login without a
+restart, and compared in constant time over the full string. A session already issued is checked
+against the session table, not against the current token, so a rotation after a possible leak is the
+new file plus a restart of `kori-api`: without it, sessions minted under the old token live until they
+expire. No token file, or an empty one, means every gated surface
+answers `404` with the standard not-found body: a gateway that has no admin token should not tell a
+caller it has an admin surface, and `401` would. Five failed logins in five minutes answer `429`,
+counted globally rather than per IP, because behind Caddy every request arrives from one address and
+a per-IP window would be one window. A gated page answers `302` to `/login.html` when the request
+accepts HTML and `401` JSON otherwise, so a script learns why. `/healthz` and `/v1/*` stay ungated:
+one is the deploy probe and the other is the OpenAI door, whose caller credential lives at the edge.
+
+The two write paths sit at `/session/login` and `/session/logout`, not under `/admin/`, because
+`DEC-4` and D11 keep `/admin/` read-only and GET/HEAD-only, and that is the rule a security review
+re-checks.
+
+Why not the other four. Cloudflare Access puts the only gate in a control plane nobody diffs, and no
+Access header was present on any dash path, so it would have been a second system to learn for one
+operator. Caddy `basic_auth` is a line in `site.caddy` and the closest of the four, but the gate
+would still live only on qouver1: a rewrite of that block reopens the surface with nothing in this
+repository going red. Tailscale adds a daemon and a second network to qouver1, which the deploy veto
+on that host was already set against. Removing the DNS record and reaching the dashboard through an
+SSH tunnel ends the dashboard as a thing anyone opens. The chosen option is source in this
+repository: a reviewer sees it in a diff, the acceptance harness exercises it, and it holds if the
+Caddy block drifts or an inside path reaches the listener directly.
+
+**Consequences.** One gate for one operator, with no identity attached: no per-person audit, no MFA,
+and no way to revoke one person without replacing the token for everyone. The auth code sits in the
+binary that also serves `ai.qouver.com`, so a bug in it can close two doors at once; the log line has
+no header field at all, so a cookie or a token has nowhere to be formatted into, and a unit test
+proves a sentinel cookie value is absent from it. Sessions are memory only, so a restart signs the browser out, and a lost
+token needs the file replaced on the host. Because `/admin/state` now answers `404` without a token,
+the deploy gate moved to `/healthz`: a host with no token file deploys green with a dark dashboard,
+which is the fail-closed default rather than a broken deploy. This record does not supersede `DEC-7`
+or `DEC-18`; loopback and the edge still stand, and the binary now has a gate of its own behind
+them. If the surface grows a need for per-person identity, the gate moves to Cloudflare Access and
+this one becomes the second lock instead of the only one.
