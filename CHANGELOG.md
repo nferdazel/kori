@@ -11,6 +11,8 @@ this one, is the answer to "what is live".
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-19
+
 ### Security
 
 - The admin surface is gated (`DEC-20`). `/admin/*`, `/metrics`, `/healthz?deep` and the five
