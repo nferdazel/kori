@@ -38,19 +38,24 @@ jobs:
   # Golden CI/CD contract: the same rules the server repo enforces, run here so drift fails
   # this repo's own build instead of waiting for a manual audit. The script is a byte-identical
   # copy of the server repo's ops/scripts/contract-check.sh; fix it there and copy it out again.
-  contract:
-    name: "Contract: golden CI/CD rules"
+  # W26: the cheap gate in front of every expensive job. It runs the same script a laptop runs,
+  # so a red run stops here in about a minute instead of at the end of the queue.
+  # `--no-hook` keeps this job free of toolchain installs: the repo-specific static checks run in
+  # the jobs that already have their dependencies, and the security job owns the secret scan.
+  preflight:
+    name: "Preflight: contract, scripts, secret scan"
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: "Contract: check this repo"
-        run: ./ops/scripts/contract-check.sh .
+      - name: "Preflight: ./task gate"
+        run: ./task gate --no-hook
 
   nim:
     name: "Nim: check + tests"
+    needs: [preflight]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -128,11 +133,11 @@ jobs:
   gate:
     name: Gate
     if: always()
-    needs: [contract, nim, security, ops]
+    needs: [preflight, nim, security, ops]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     env:
-      R_CONTRACT: ${{ needs.contract.result }}
+      R_CONTRACT: ${{ needs.preflight.result }}
       R_NIM: ${{ needs.nim.result }}
       R_SECURITY: ${{ needs.security.result }}
       R_OPS: ${{ needs.ops.result }}
@@ -152,9 +157,12 @@ jobs:
   #
   # No `if:` filter here: a broken image must report red rather than disappear from the run.
   # The `needs: [gate]` is the publication gate, not a skip.
+  # `always()` keeps the job in the graph when a need is skipped; the second half keeps the
+  # ordering promise, so the image is published only after the gate is green (QOUVER_CICD_STANDARD §1).
   image-api:
     name: "Image: api"
     needs: [gate]
+    if: always() && needs.gate.result == 'success'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -231,6 +239,7 @@ jobs:
   image-web:
     name: "Web: build and dist drift check"
     needs: [gate]
+    if: always() && needs.gate.result == 'success'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -276,6 +285,7 @@ jobs:
 
   security:
     name: "Security: secrets scan"
+    needs: [preflight]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     env:
@@ -301,6 +311,7 @@ jobs:
 
   ops:
     name: "Ops: shellcheck + deploy/smoke dry runs"
+    needs: [preflight]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
