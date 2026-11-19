@@ -11,6 +11,8 @@ this one, is the answer to "what is live".
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-11-19
+
 ### Changed
 
 - The admin session lifetime is 30 days (`Max-Age=2592000`, up from 12 hours), at the owner's request:
