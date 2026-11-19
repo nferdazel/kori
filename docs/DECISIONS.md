@@ -460,7 +460,7 @@ decided who may read the pages.
 **Decision.** Auth inside kori. `/admin/*`, `/metrics`, `/healthz?deep` and the five dashboard pages
 require one shared token, presented as `Authorization: Bearer <token>` by a script or a scrape, or
 carried as the `kori_admin` session cookie a browser gets from `POST /session/login`
-(`{"token":"…"}`, `204`, twelve hours, `HttpOnly; Secure; SameSite=Strict; Path=/`).
+(`{"token":"…"}`, `204`, thirty days, `HttpOnly; Secure; SameSite=Strict; Path=/`).
 `POST /session/logout` drops the session. The token is a file named by `KORI_ADMIN_TOKEN_FILE`,
 default `/etc/kori/admin.token`, read on every request so a new value works for a new login without a
 restart, and compared in constant time over the full string. A session already issued is checked

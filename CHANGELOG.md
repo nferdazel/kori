@@ -11,6 +11,13 @@ this one, is the answer to "what is live".
 
 ## [Unreleased]
 
+### Changed
+
+- The admin session lifetime is 30 days (`Max-Age=2592000`, up from 12 hours), at the owner's request:
+  one paste of the token covers a working month. Everything else about the gate is unchanged. A stolen
+  cookie now stays useful for that month, so a suspected leak means a new token file plus a restart of
+  `kori-api`.
+
 ## [0.8.0] - 2026-11-19
 
 ### Security

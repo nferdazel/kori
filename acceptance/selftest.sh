@@ -287,7 +287,7 @@ assert_eq "with no override the fixture lives in RUN" "$(admin_token_path)" "$RU
 # be mistaken for it.
 cat >"$RUN/sc.head" <<'HEAD'
 HTTP/1.1 204 No Content
-Set-Cookie: kori_admin=abc-DEF_123; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=43200
+Set-Cookie: kori_admin=abc-DEF_123; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=2592000
 X-Cookie: kori_admin=decoy
 HEAD
 assert_eq "the cookie value is read from Set-Cookie, not the decoy" \

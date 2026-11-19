@@ -1238,13 +1238,14 @@ block:
 block:
   # The cookie the login sets, asserted literally: Galih's gate re-checks these
   # five attributes and none of them may drift.
-  let cookie = sessionCookie("abc", 43_200)
+  let cookie = sessionCookie("abc", 2_592_000)
+  check "the admin session lifetime is 30 days", int(AdminSessionTtlS) == 2_592_000
   check "the cookie is named kori_admin", cookie.startsWith(AdminCookieName & "=")
   check "the cookie is HttpOnly", cookie.contains("; HttpOnly")
   check "the cookie is Secure", cookie.contains("; Secure")
   check "the cookie is SameSite=Strict", cookie.contains("; SameSite=Strict")
   check "the cookie is scoped to Path=/", cookie.contains("; Path=/")
-  check "the cookie carries the 12 hour max age", cookie.contains("; Max-Age=43200")
+  check "the cookie carries the 30 day max age", cookie.contains("; Max-Age=2592000")
   check "a cleared cookie has Max-Age=0", sessionCookie("", 0).contains("Max-Age=0")
 
 block:
@@ -1264,7 +1265,7 @@ block:
   check "two logins get two different ids", second.get != first.get
 
   # Expiry is enforced on read: an entry past its deadline is dropped by the next
-  # gate call, so a 12 hour old cookie cannot survive in a running process.
+  # gate call, so a 30 day old cookie cannot survive in a running process.
   gateway.sessions[second.get] = epochTime() - 1
   let probe = Request(reqMethod: HttpGet,
                       headers: newHttpHeaders([("Cookie",

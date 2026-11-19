@@ -95,7 +95,7 @@ assert_present "A16e the cookie carries HttpOnly"    "$RUN/a16-login.head" "Http
 assert_present "A16e the cookie carries Secure"      "$RUN/a16-login.head" "Secure"
 assert_present "A16e the cookie carries SameSite=Strict" "$RUN/a16-login.head" "SameSite=Strict"
 assert_present "A16e the cookie carries Path=/"      "$RUN/a16-login.head" "Path=/"
-assert_present "A16e the cookie carries Max-Age=43200" "$RUN/a16-login.head" "Max-Age=43200"
+assert_present "A16e the cookie carries Max-Age=2592000" "$RUN/a16-login.head" "Max-Age=2592000"
 value=$(gate_cookie_value "$RUN/a16-login.head")
 printf '%s' "$value" >"$RUN/a16-cookie"
 assert_eq "A16e the session id is 32 bytes base64url, so 43 characters" \

@@ -120,7 +120,10 @@ const
   ## 32 random bytes, base64url, unpadded: 43 characters of URL-safe alphabet, so
   ## the value needs no quoting in a cookie and carries no `=`.
   AdminSessionBytes* = 32
-  AdminSessionTtlS* = 43_200.0
+  ## Thirty days, the owner's call: one paste of the token covers a working month.
+  ## The cost is that a stolen cookie, not just a copied token, stays useful that
+  ## long, so a suspected leak means rotating the token and restarting kori-api.
+  AdminSessionTtlS* = 2_592_000.0
   ## A restart invalidates every session, and the cap is what stops a caller that
   ## keeps logging in from growing the table without bound.
   MaxAdminSessions* = 256

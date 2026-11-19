@@ -307,8 +307,8 @@ The admin surface is one shared token (`DEC-20`). A script or a scrape sends it 
 Either one is enough, and the token is compared against the file in constant time.
 
 `POST /session/login` takes `{"token":"<token>"}` and answers `204` with `Set-Cookie: kori_admin=…;
-HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=43200`. `POST /session/logout` drops the entry
-and clears the cookie. Sessions live in memory for twelve hours, so a restart signs everyone out.
+HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=2592000`. `POST /session/logout` drops the entry
+and clears the cookie. Sessions live in memory for thirty days, so a restart signs everyone out.
 Both paths sit outside `/admin/` on purpose: anything but GET or HEAD under `/admin/` is still a
 `405`.
 
