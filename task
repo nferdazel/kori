@@ -19,7 +19,7 @@ task — one entry point for the checks CI runs.
                  fail when VERSION, kori.nimble, the generated module or CHANGELOG disagree
   ./task gate    golden contract + shell syntax + secret scan + ops dry runs (<= 90 s)
   ./task gate-full  gate + rebuild dist + Nim check/tests/acceptance
-  ./task release [major|minor|patch] [--skip-check] [--push]
+  ./task release [major|minor|patch] [--skip-check] [--push] [--current]
                  bump VERSION, sync the module and kori.nimble, move the CHANGELOG
                  Unreleased section, run gate-full, then one local commit and a local
                  annotated tag. It never pushes unless --push is given.
