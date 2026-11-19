@@ -9,12 +9,15 @@ type StaticFile* = object
 type StaticEntry* = tuple[path: string, contentType: string, body: string]
 
 const staticEntries* = [
-  (path: "/assets/main-3LGz82B_.css", contentType: "text/css; charset=utf-8", body: staticRead("../../../web/dist/assets/main-3LGz82B_.css")),
-  (path: "/assets/main-Dh4ZqD4z.js", contentType: "text/javascript; charset=utf-8", body: staticRead("../../../web/dist/assets/main-Dh4ZqD4z.js")),
+  (path: "/assets/dom-lI3mFCDs.css", contentType: "text/css; charset=utf-8", body: staticRead("../../../web/dist/assets/dom-lI3mFCDs.css")),
+  (path: "/assets/dom-qL1Bf5B4.js", contentType: "text/javascript; charset=utf-8", body: staticRead("../../../web/dist/assets/dom-qL1Bf5B4.js")),
+  (path: "/assets/login-uFfNhqB0.js", contentType: "text/javascript; charset=utf-8", body: staticRead("../../../web/dist/assets/login-uFfNhqB0.js")),
+  (path: "/assets/main-BDyBIirP.js", contentType: "text/javascript; charset=utf-8", body: staticRead("../../../web/dist/assets/main-BDyBIirP.js")),
   (path: "/config.html", contentType: "text/html; charset=utf-8", body: staticRead("../../../web/dist/config.html")),
   (path: "/fonts/inter-latin-var.woff2", contentType: "font/woff2", body: staticRead("../../../web/dist/fonts/inter-latin-var.woff2")),
   (path: "/fonts/jetbrains-mono-latin-var.woff2", contentType: "font/woff2", body: staticRead("../../../web/dist/fonts/jetbrains-mono-latin-var.woff2")),
   (path: "/index.html", contentType: "text/html; charset=utf-8", body: staticRead("../../../web/dist/index.html")),
+  (path: "/login.html", contentType: "text/html; charset=utf-8", body: staticRead("../../../web/dist/login.html")),
   (path: "/requests.html", contentType: "text/html; charset=utf-8", body: staticRead("../../../web/dist/requests.html")),
   (path: "/routes.html", contentType: "text/html; charset=utf-8", body: staticRead("../../../web/dist/routes.html")),
 ]

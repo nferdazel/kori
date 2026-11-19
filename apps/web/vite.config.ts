@@ -1,7 +1,8 @@
 import { defineConfig } from "vite";
 
-// Four server-rendered pages, no client router: every page is its own HTML entry and the shared
-// module is bundled once. Inputs are relative to this folder, so no Node path helpers are needed.
+// Four server-rendered pages plus the sign-in page, no client router: every page is its own HTML
+// entry and the shared module is bundled once. Inputs are relative to this folder, so no Node path
+// helpers are needed.
 export default defineConfig({
   base: "/",
   build: {
@@ -13,6 +14,7 @@ export default defineConfig({
         requests: "requests.html",
         routes: "routes.html",
         config: "config.html",
+        login: "login.html",
       },
     },
   },
@@ -20,6 +22,7 @@ export default defineConfig({
     proxy: {
       "/admin": "http://127.0.0.1:4019",
       "/healthz": "http://127.0.0.1:4019",
+      "/session": "http://127.0.0.1:4019",
     },
   },
 });

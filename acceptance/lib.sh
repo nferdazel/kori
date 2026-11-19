@@ -12,10 +12,11 @@
 # aliases resolved to free ones per run, and everything a run writes lands in one
 # temp directory that a green run removes.
 #
-# Three couplings to the build are deliberately isolated, each in one place:
-#   write_config()  the fixture config file  (OPEN-2)
-#   gw_start()      the binary's CLI flags   (OPEN-3)
-#   admin_json()    how /admin/state is fetched (D7)
+# Four couplings to the build are deliberately isolated, each in one place:
+#   write_config()         the fixture config file  (OPEN-2)
+#   gw_start()             the binary's CLI flags   (OPEN-3)
+#   admin_json()           how /admin/state is fetched (D7)
+#   admin_token_fixture()  the admin gate's token file and header (DEC-20)
 # Nothing else in the suite knows a path, a flag name or a config key name.
 
 ACC_DIR=${ACC_DIR:-$(cd "$(dirname "$0")" && pwd)}
@@ -299,6 +300,26 @@ PY
   chmod 600 "$GW_CFG"
 }
 
+# DEC-20: the admin surface reads its shared token from the file named by
+# KORI_ADMIN_TOKEN_FILE. `gw_start` writes one fixed test value into $RUN and
+# points the binary at it, so every case that reads /admin/state keeps working
+# now that the path is gated, and no case has to know the header format.
+#
+# A case that wants the fail-closed path (file missing → 404) sets
+# ADMIN_TOKEN_FILE to a path it never creates together with ADMIN_TOKEN_WRITE=0.
+ADMIN_TOKEN_VALUE="acc-TEST-admin-token-SENTINEL-do-not-log"
+ADMIN_COOKIE_NAME="kori_admin"
+
+admin_token_path() { printf '%s' "${ADMIN_TOKEN_FILE:-$RUN/admin.token}"; }
+
+admin_token_write() { # write the fixture token file: mode 0600, one trailing newline (the gate trims it)
+  _atp=$(admin_token_path)
+  printf '%s\n' "$ADMIN_TOKEN_VALUE" >"$_atp"
+  chmod 600 "$_atp"
+}
+
+admin_token_header() { printf 'Authorization: Bearer %s' "$ADMIN_TOKEN_VALUE"; }
+
 # A log the dashboard can page over with no request going anywhere. Called before
 # gw_start(), so the file is already its full length when the binary opens it.
 seed_log() { # seed_log <count> [route] [status]
@@ -322,6 +343,9 @@ PY
 
 gw_start() {
   if [ ! -x "$GW_BIN" ]; then fail "gw_start" "no executable at $GW_BIN"; return 1; fi
+  # DEC-20: one fixture token file per run, written here so a case never has to.
+  # ADMIN_TOKEN_WRITE=0 leaves the path absent, which is the fail-closed case.
+  if [ "${ADMIN_TOKEN_WRITE:-1}" = "1" ]; then admin_token_write; fi
   # A fresh port on every start. gw_stop's 0.2 s is not a promise that the last
   # listener has released the old number, and a3 starts the gateway three times.
   GW_PORT=$(free_port) || { fail "gw_start" "no free port on loopback"; return 1; }
@@ -335,16 +359,19 @@ cfg = json.load(open(path))
 cfg.setdefault("listen", {})["port"] = port
 json.dump(cfg, open(path, "w"), indent=2)
 PY
-  ( "$GW_BIN" --config "$GW_CFG" --port "$GW_PORT" >>"$RUN/gateway.log" 2>&1 &
+  ( KORI_ADMIN_TOKEN_FILE=$(admin_token_path) \
+    "$GW_BIN" --config "$GW_CFG" --port "$GW_PORT" >>"$RUN/gateway.log" 2>&1 &
     echo "$!" >>"$RUN/pids" )
-  gw_wait_ready || { fail "gw_start" "no answer from $GW_URL/admin/state"; return 1; }
+  gw_wait_ready || { fail "gw_start" "no answer from $GW_URL/healthz"; return 1; }
   note "gateway up on $GW_URL"
 }
 
 gw_wait_ready() {
+  # /healthz is the one path the admin gate never covers, so readiness does not
+  # depend on the token fixture being right.
   i=0
   while [ $i -lt 200 ]; do
-    if curl -sS -o /dev/null --max-time 1 "$GW_URL/admin/state" 2>/dev/null; then return 0; fi
+    if curl -sS -o /dev/null --max-time 1 "$GW_URL/healthz" 2>/dev/null; then return 0; fi
     i=$((i + 1)); sleep 0.05
   done
   return 1
@@ -359,7 +386,10 @@ gw_stop() {
 }
 
 admin_json() { # admin_json <outfile>
-  curl -sS -o "$1" -w '%{http_code}' --max-time 5 "$GW_URL/admin/state"
+  # DEC-20: /admin/state is gated. The suite always presents the fixture token,
+  # so an admin case tests the surface behind the gate, not the gate itself.
+  curl -sS -o "$1" -w '%{http_code}' --max-time 5 \
+    -H "$(admin_token_header)" "$GW_URL/admin/state"
 }
 
 # The dashboard's other two reads are `/admin/log` and `/admin/config`. Their
@@ -367,25 +397,90 @@ admin_json() { # admin_json <outfile>
 # decision yet (D11 is pending), so the readers below are the one place a shape
 # change touches (OPEN-10).
 admin_get() { # admin_get <outfile> <path-with-query> -> http code
-  curl -sS -o "$1" -w '%{http_code}' --max-time 5 "$GW_URL$2"
+  curl -sS -o "$1" -w '%{http_code}' --max-time 5 \
+    -H "$(admin_token_header)" "$GW_URL$2"
 }
 
 admin_code() { # admin_code <path> -> http code, body discarded
-  curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "$GW_URL$1"
+  curl -sS -o /dev/null -w '%{http_code}' --max-time 5 \
+    -H "$(admin_token_header)" "$GW_URL$1"
 }
 
 # A write with no body still declares one: without Content-Length (and without
 # chunked framing) the HTTP layer answers 411 before the handler runs, as nginx
 # does. ACCEPTANCE-v1.md records that as a deviation; A8b and A10f send this.
+# The token is presented so the case proves the method rule, not the gate.
 admin_post_code() { # admin_post_code <path> -> http code of a POST, body discarded
   curl -sS -o /dev/null -w '%{http_code}' --max-time 5 -X POST \
+    -H "$(admin_token_header)" \
     -H 'Content-Length: 0' "$GW_URL$1"
 }
 
 admin_post_allow() { # admin_post_allow <path> -> the Allow header of a refused POST
   curl -sS -o /dev/null -D - --max-time 5 -X POST \
+    -H "$(admin_token_header)" \
     -H 'Content-Length: 0' "$GW_URL$1" 2>/dev/null \
     | tr -d '\r' | awk 'tolower($1) == "allow:" { $1 = ""; sub(/^ /, ""); print }'
+}
+
+# Ungated reads are requested without a token on purpose, so a case can prove a
+# surface stays open (/healthz) and that the gate does not cover it.
+open_code() { # open_code <path> -> http code with no credential at all
+  curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "$GW_URL$1"
+}
+
+# ---------------------------------------------------------------- the gate ---
+# DEC-20 readers. A case asks these instead of building curl lines, so the
+# header name, the cookie name and the login path each live in this one block.
+gate_code() { # gate_code <method> <path> [curl args...] -> http code, body discarded
+  _gc_method=$1; _gc_path=$2; shift 2
+  curl -sS -o /dev/null -w '%{http_code}' --max-time 5 -X "$_gc_method" \
+    -H 'Content-Length: 0' "$@" "$GW_URL$_gc_path"
+}
+
+gate_gen() { # gate_gen <outfile> <path> [curl args...] -> http code; headers in <outfile>.head
+  _gg_out=$1; _gg_path=$2; shift 2
+  curl -sS -o "$_gg_out" -D "$_gg_out.head" -w '%{http_code}' --max-time 5 \
+    -H 'Content-Length: 0' "$@" "$GW_URL$_gg_path"
+}
+
+gate_header() { # gate_header <head-file> <name> -> every value of that header, comma-joined
+  tr -d '\r' <"$1" | awk -v want="$(printf '%s' "$2" | tr 'A-Z' 'a-z')" \
+    'index(tolower($1), want ":") == 1 { sub(/^[^:]*: */, ""); if (out != "") out = out ", "; out = out $0 }
+     END { print out }'
+}
+
+gate_cookie_value() { # gate_cookie_value <head-file> -> the kori_admin value a Set-Cookie set
+  tr -d '\r' <"$1" | awk -v n="$ADMIN_COOKIE_NAME" '
+    index(tolower($1), "set-cookie:") == 1 {
+      sub(/^[^:]*: */, ""); split($0, parts, ";")
+      split(parts[1], pair, "=")
+      if (pair[1] == n) { print pair[2]; exit }
+    }'
+}
+
+gate_login() { # gate_login <outfile> <token> -> http code of a session login
+  _gl_out=$1; _gl_token=$2
+  curl -sS -o "$_gl_out" -D "$_gl_out.head" -w '%{http_code}' --max-time 5 \
+    -X POST -H 'Content-Type: application/json' \
+    --data-binary "{\"token\":\"$_gl_token\"}" "$GW_URL/session/login"
+}
+
+gate_logout() { # gate_logout <outfile> <cookie> -> http code of a session logout
+  _lo_out=$1; _lo_cookie=$2
+  curl -sS -o "$_lo_out" -D "$_lo_out.head" -w '%{http_code}' --max-time 5 \
+    -X POST -H 'Content-Length: 0' --cookie "$ADMIN_COOKIE_NAME=$_lo_cookie" \
+    "$GW_URL/session/logout"
+}
+
+# The 404 the contract names for a gateway with no token: not an auth answer at
+# all, the standard not-found body.
+assert_not_found_body() { # label json-or-body-file
+  body=$(cat "$2" 2>/dev/null)
+  case "$body" in
+    *not_found*|*"not found"*|"") pass "$1" ;;
+    *) fail "$1" "a 404 should carry the standard not-found body, got [$body]" ;;
+  esac
 }
 
 # /admin/state shape is not fixed by D7. These helpers find the per-leg objects

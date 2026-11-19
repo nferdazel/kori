@@ -29,6 +29,7 @@ echo
 echo "=== A8b: GET only"
 assert_eq "A8b a POST is refused"  \
   "$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 -X POST \
+       -H "$(admin_token_header)" \
        -H 'Content-Length: 0' "$GW_URL/admin/state")" "405"
 assert_eq "A8b a GET is served"    "$(admin_json "$RUN/a8-get.json")" "200"
 

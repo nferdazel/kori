@@ -14,9 +14,37 @@ export interface FetchErr {
 
 export type Fetched<T> = FetchOk<T> | FetchErr;
 
+// Every read on a gated page needs the session cookie. When it is missing the endpoint answers 401
+// (or 302 to /login.html, which a fetch follows into an HTML page). Neither is fixable from here,
+// so the browser goes to the login page once and comes back to the same URL afterwards. The failed
+// call is still returned as data: a page mid-render must not throw. A fail-closed 404 is left alone,
+// because a login form cannot help when the host has no token file at all.
+let sentToLogin = false;
+
+function goToLogin(): void {
+  if (sentToLogin) return;
+  sentToLogin = true;
+  const here = location.pathname + location.search;
+  const next = here.startsWith("/") && !here.startsWith("/login.html") ? "?next=" + encodeURIComponent(here) : "";
+  location.replace("/login.html" + next);
+}
+
+function landedOnLogin(response: Response): boolean {
+  if (!response.redirected) return false;
+  try {
+    return new URL(response.url).pathname === "/login.html";
+  } catch {
+    return false;
+  }
+}
+
 async function getJson<T>(path: string): Promise<Fetched<T>> {
   try {
     const response = await fetch(path, { headers: { Accept: "application/json" }, cache: "no-store" });
+    if (response.status === 401 || landedOnLogin(response)) {
+      goToLogin();
+      return { ok: false, status: 401, message: "not signed in" };
+    }
     const text = await response.text();
     let body: unknown = null;
     try {

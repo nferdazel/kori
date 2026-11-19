@@ -28,6 +28,7 @@ mkdir -p "$BIN" "$STATE" "$APP_DIR/logs"
 export FAKE_BASE_URL="http://127.0.0.1:8787"
 export FAKE_EDGE_URL="https://ai.qouver.com"
 export FAKE_GOOD_TOKEN="smoke-token"
+export FAKE_ADMIN_TOKEN="smoke-admin-token"
 
 cat >"$BIN/curl" <<'STUB'
 #!/usr/bin/env bash
@@ -55,14 +56,35 @@ if [ "$cfg" = "-" ]; then
 fi
 say() { printf '%s' "$1"; }
 if [ "${url#*"$FAKE_BASE_URL"}" != "$url" ]; then
-  # loopback admin endpoint
-  if [ "$code_only" = "1" ]; then say 200; exit 0; fi
-  case "${FAKE_STATE:-ok}" in
-    empty) exit 22 ;;
-    notjson) say 'not json at all'; exit 0 ;;
-    *) say '{"legs":[]}' ;;
+  # loopback surface: /healthz is open, /admin/* and /metrics are gated (DEC-20)
+  path="${url#"$FAKE_BASE_URL"}"
+  case "$path" in
+    /healthz*)
+      if [ "$code_only" = "1" ]; then say 200; exit 0; fi
+      case "${FAKE_STATE:-ok}" in
+        empty) exit 22 ;;
+        notjson) say 'not json at all'; exit 0 ;;
+        *) say '{"status":"ok","version":"0.0.0-test","revision":"deadbee"}' ;;
+      esac
+      exit 0 ;;
+    /admin/state|/metrics)
+      # FAKE_ADMIN_OPEN=1 is the broken binary: no credential, and the surface answers anyway.
+      if [ "${FAKE_ADMIN_OPEN:-0}" = "1" ]; then
+        [ "$code_only" = "1" ] && { say 200; exit 0; }
+        say '{"legs":[]}'; exit 0
+      fi
+      if [ -n "${FAKE_ADMIN_TOKEN:-}" ] && [ "$hdr" = "Authorization: Bearer $FAKE_ADMIN_TOKEN" ]; then
+        [ "$code_only" = "1" ] && { say 200; exit 0; }
+        say '{"legs":[]}'; exit 0
+      fi
+      # A host with a token file answers 401 to a request that carries none; a host without one
+      # answers 404. Both are closed; FAKE_ADMIN_CODE picks which one this scenario stands for.
+      [ "$code_only" = "1" ] && { say "${FAKE_ADMIN_CODE:-404}"; exit 0; }
+      say '{"error":{"type":"not_found","message":"no such path"}}'; exit 0 ;;
+    *)
+      [ "$code_only" = "1" ] && { say 404; exit 0; }
+      exit 0 ;;
   esac
-  exit 0
 fi
 if [ "${url#*"$FAKE_EDGE_URL"}" != "$url" ]; then
   case "$url" in
@@ -120,18 +142,25 @@ reset_state() {
 
 run() {
   KORI_APP_DIR="$APP_DIR" KORI_LOG_FILE="$LOG_FILE" \
-    KORI_EDGE_URL="${1:-}" KORI_EDGE_TOKEN="${2:-}" \
+    KORI_EDGE_URL="${1:-}" KORI_EDGE_TOKEN="${2:-}" KORI_ADMIN_TOKEN="${3:-}" \
     bash "$SMOKE" >"$ROOT/out.txt" 2>&1
   echo $?
 }
 oks() { grep -c '^OK ' "$ROOT/out.txt" || true; }
 
 # ── scenario 1: everything wired and healthy -> exit 0, full edge matrix ────
+# No admin token set: the host stands where a fresh deploy does, so the gate must prove the
+# 404 branch rather than assume an authenticated surface it never tested.
 reset_state
 rc="$(run "$FAKE_EDGE_URL" "$FAKE_GOOD_TOKEN")"
 [ "$rc" = "0" ] && pass "healthy host exits 0" || fail "healthy host exited $rc: $(cat "$ROOT/out.txt")"
-[ "$(oks)" = "8" ] && pass "8 OK lines: state, loopback, log, JSON, 4 edge" \
-  || fail "expected 8 OK lines, got $(oks): $(tr '\n' '|' <"$ROOT/out.txt")"
+[ "$(oks)" = "9" ] && pass "9 OK lines: healthz, admin 404, loopback, log, JSON, 4 edge" \
+  || fail "expected 9 OK lines, got $(oks): $(tr '\n' '|' <"$ROOT/out.txt")"
+grep -q 'GET /healthz 200, valid JSON' "$ROOT/out.txt" && pass "the health probe is /healthz" \
+  || fail "the health probe is not /healthz: $(tr '\n' '|' <"$ROOT/out.txt")"
+grep -q 'GET /admin/state without a token -> 404 (no token file, fail closed)' "$ROOT/out.txt" \
+  && pass "no token, no token file: /admin/state -> 404 is asserted, not skipped" \
+  || fail "the fail-closed branch is not asserted"
 grep -q 'edge without bearer -> 401' "$ROOT/out.txt" && pass "edge refuses a missing bearer" \
   || fail "missing-bearer check absent"
 grep -q 'edge refuses /admin/state -> 404' "$ROOT/out.txt" && pass "edge refuses /admin from outside" \
@@ -139,6 +168,85 @@ grep -q 'edge refuses /admin/state -> 404' "$ROOT/out.txt" && pass "edge refuses
 grep -q "Bearer $FAKE_GOOD_TOKEN" "$STATE/calls.log" \
   && fail "the edge token reached curl argv, where /proc/<pid>/cmdline exposes it" \
   || pass "the edge token never reaches curl argv"
+grep -q "Bearer $FAKE_ADMIN_TOKEN" "$STATE/calls.log" \
+  && fail "the admin token reached curl argv" \
+  || pass "no admin token in argv (none was set in this scenario)"
+
+# ── scenario 1b: admin token set -> the authenticated branch proves 200 twice ─
+reset_state
+rc="$(run "$FAKE_EDGE_URL" "$FAKE_GOOD_TOKEN" "$FAKE_ADMIN_TOKEN")"
+[ "$rc" = "0" ] && pass "admin-token run exits 0" || fail "admin-token run exited $rc: $(cat "$ROOT/out.txt")"
+grep -q 'GET /admin/state with the admin bearer -> 200' "$ROOT/out.txt" \
+  && pass "/admin/state with the admin bearer -> 200" \
+  || fail "/admin/state authenticated check missing: $(tr '\n' '|' <"$ROOT/out.txt")"
+grep -q 'GET /metrics with the admin bearer -> 200' "$ROOT/out.txt" \
+  && pass "/metrics with the admin bearer -> 200" || fail "/metrics authenticated check missing"
+grep -q "Bearer $FAKE_ADMIN_TOKEN" "$STATE/calls.log" \
+  && fail "the admin token reached curl argv, where /proc/<pid>/cmdline exposes it" \
+  || pass "the admin token never reaches curl argv"
+grep -q 'GET /healthz 200, valid JSON' "$ROOT/out.txt" \
+  && pass "the health probe stays open with a token configured" \
+  || fail "the health probe needs a credential now"
+
+# ── scenario 1c: the binary answers the admin surface with no credential -> FAIL
+# This is the whole point of DEC-20. If /admin/state answers 200 to a request that carries
+# nothing, the gate is decorative and the smoke has to say so.
+reset_state
+export FAKE_ADMIN_OPEN=1
+rc="$(run "" "")"
+unset FAKE_ADMIN_OPEN
+[ "$rc" != "0" ] && pass "an open admin surface exits non-zero ($rc)" \
+  || fail "an open admin surface passed the release gate"
+grep -q 'GET /admin/state without a token -> 200' "$ROOT/out.txt" \
+  && pass "the open admin surface is named" || fail "the open admin surface is not named"
+
+# ── scenario 1d: token file present, no bearer -> 401 must PASS and say so ──
+# The other closed answer. On the host the binary reads /etc/kori/admin.token, so once the
+# operator creates it an unauthenticated request gets 401, not 404. A gate that demanded 404
+# would red on a correctly configured host. It must pass, and it must name which code it saw.
+reset_state
+export FAKE_ADMIN_CODE=401
+rc="$(run "" "")"
+unset FAKE_ADMIN_CODE
+[ "$rc" = "0" ] && pass "a 401 without an admin bearer exits 0 ($rc)" \
+  || fail "a 401 on /admin/state failed a correctly configured host"
+grep -q 'GET /admin/state without a token -> 401 (token file present, no bearer sent)' "$ROOT/out.txt" \
+  && pass "the 401 branch is named (token file present, no bearer sent)" \
+  || fail "the 401 branch is not named: $(tr '\n' '|' <"$ROOT/out.txt")"
+
+# ── scenario 1e: the token comes from the file, not from the env ───────────
+# The host sets no KORI_ADMIN_TOKEN: this deploy's env file is the container's EnvironmentFile, so a
+# copy of the token there would sit in the container's process environment. smoke.sh reads the file
+# the binary reads instead, and the authenticated branch must light up from it alone.
+reset_state
+mkdir -p "$APP_DIR/etc"
+printf '%s\n' "$FAKE_ADMIN_TOKEN" >"$APP_DIR/etc/admin.token"
+chmod 600 "$APP_DIR/etc/admin.token"
+rc="$(run "" "")"
+[ "$rc" = "0" ] && pass "token from the file: run exits 0 ($rc)" \
+  || fail "token from the file: run exited $rc: $(tr '\n' '|' <"$ROOT/out.txt")"
+grep -q "admin checks use the token from $APP_DIR/etc/admin.token" "$ROOT/out.txt" \
+  && pass "the gate names the token file as its source" \
+  || fail "the gate does not name the token file: $(tr '\n' '|' <"$ROOT/out.txt")"
+grep -q 'GET /admin/state with the admin bearer -> 200' "$ROOT/out.txt" \
+  && pass "the file token drives the authenticated check" \
+  || fail "the file token does not drive the authenticated check"
+grep -q "Bearer $FAKE_ADMIN_TOKEN" "$STATE/calls.log" \
+  && fail "the file token reached curl argv" \
+  || pass "the file token never reaches curl argv"
+rm -f "$APP_DIR/etc/admin.token"
+
+# ── scenario 1f: an unexpected status is still a FAIL, not a shrug ──────────
+# Anything outside {404, 401, 200} — a 500, a proxy's 502, a 000 on a dead socket — is not a
+# closed admin surface, it is a broken one, and the gate must not read it as either.
+reset_state
+export FAKE_ADMIN_CODE=500
+rc="$(run "" "")"
+unset FAKE_ADMIN_CODE
+[ "$rc" != "0" ] && pass "a 500 on /admin/state exits non-zero ($rc)" \
+  || fail "a 500 on /admin/state passed the release gate"
+grep -q 'GET /admin/state without a token -> 500 (expected 404 or 401)' "$ROOT/out.txt" \
+  && pass "the unexpected status is named" || fail "the unexpected status is not named"
 
 # ── scenario 2: local run, edge not wired yet -> 0 with a warning ───────────
 reset_state
@@ -155,21 +263,23 @@ rc="$(run "$FAKE_EDGE_URL" "")"
 grep -q 'KORI_EDGE_TOKEN is empty' "$ROOT/out.txt" && pass "half-configured edge says why" \
   || fail "half-configured edge message missing"
 
-# ── scenario 4: state endpoint silent -> FAIL ──────────────────────────────
+# ── scenario 4: health endpoint silent -> FAIL ─────────────────────────────
 reset_state
 export FAKE_STATE=empty
 rc="$(run "$FAKE_EDGE_URL" "$FAKE_GOOD_TOKEN")"
 unset FAKE_STATE
-[ "$rc" != "0" ] && pass "silent /admin/state exits non-zero" || fail "silent state exited 0"
-grep -q 'FAIL GET /admin/state did not answer' "$ROOT/out.txt" && pass "silent state is named" \
-  || fail "silent state not named"
+[ "$rc" != "0" ] && pass "silent /healthz exits non-zero" || fail "silent health exited 0"
+grep -q 'FAIL GET /healthz did not answer' "$ROOT/out.txt" && pass "silent health is named" \
+  || fail "silent health not named"
 
-# ── scenario 5: state answers non-JSON -> FAIL ─────────────────────────────
+# ── scenario 5: health answers non-JSON -> FAIL ────────────────────────────
 reset_state
 export FAKE_STATE=notjson
 rc="$(run "" "")"
 unset FAKE_STATE
-[ "$rc" != "0" ] && pass "non-JSON state exits non-zero" || fail "non-JSON state exited 0"
+[ "$rc" != "0" ] && pass "non-JSON health exits non-zero" || fail "non-JSON health exited 0"
+grep -q 'GET /healthz answered but the body is not JSON' "$ROOT/out.txt" \
+  && pass "the non-JSON health body is named" || fail "the non-JSON health body is not named"
 
 # ── scenario 6: port published on 0.0.0.0 -> FAIL ──────────────────────────
 reset_state

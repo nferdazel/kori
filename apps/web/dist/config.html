@@ -5,8 +5,9 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Config · kori</title>
 <meta name="description" content="kori gateway read-only dashboard: loaded config with credentials redacted.">
-  <script type="module" crossorigin src="/assets/main-Dh4ZqD4z.js"></script>
-  <link rel="stylesheet" crossorigin href="/assets/main-3LGz82B_.css">
+  <script type="module" crossorigin src="/assets/dom-qL1Bf5B4.js"></script>
+  <script type="module" crossorigin src="/assets/main-BDyBIirP.js"></script>
+  <link rel="stylesheet" crossorigin href="/assets/dom-lI3mFCDs.css">
 </head>
 <body data-page="config.html">
 <a class="skip" href="#main">Skip to content</a>
@@ -20,7 +21,7 @@
       <a href="routes.html"><span class="n">3</span>Routes</a>
       <a href="config.html"><span class="n">4</span>Config</a>
     </nav>
-    <div class="rail-foot">read-only<br>loopback only</div>
+    <div class="rail-foot">read-only<br>token required</div>
   </aside>
 
   <div class="main">
@@ -36,6 +37,7 @@
           </svg>
           <span class="tick" data-ring-num>5s</span>
         </span>
+        <button class="signout" type="button" data-signout>log out</button>
       </div>
       <nav class="seg" aria-label="Pages">
         <a href="index.html"><span class="n">1</span>Overview</a>
@@ -58,7 +60,7 @@
       <footer class="footer">
         <span class="path" data-footer-path>log path</span>
         <span data-footer-count></span>
-        <span>read-only · served on loopback</span>
+        <span>read-only · token required</span>
       </footer>
     </main>
   </div>

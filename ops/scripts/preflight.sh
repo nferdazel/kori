@@ -7,9 +7,10 @@
 # generator, rootless podman, disk headroom). Asking a human to remember all of that is how a
 # deploy dies at step 6 with a healthy-looking pipeline.
 #
-# It changes nothing: no podman build, no systemctl start/restart, no file write, no network
-# request beyond a loopback connect probe. Reading the env file is limited to its mode and
-# ownership — the contents are never printed.
+# It changes nothing: no podman build, no systemctl start/restart, no network request beyond a
+# loopback connect probe. The only file it may create is the deploy lock it takes and releases
+# (see the lock probe below), and the env file is read for its mode and ownership only — the
+# contents are never printed.
 #
 # Exit: 0 = no FAIL (WARNs allowed), 1 = at least one FAIL, 2 = bad usage.
 #
@@ -23,7 +24,9 @@ SERVICE="${KORI_SERVICE:-kori-api}"
 PORT="${KORI_PORT:-8787}"
 MIN_FREE_GIB="${KORI_MIN_FREE_GIB:-5}"
 ENV_FILE="$APP_DIR/env/kori-prod.env"
-LOCK_FILE="/tmp/deploy-${SERVICE}.lock"
+# Same path deploy-vps.sh takes on fd 9. It used to be /tmp/deploy-<service>.lock, which any
+# local user could pre-create; the app directory is the deploy user's.
+LOCK_FILE="$APP_DIR/.deploy.lock"
 
 FAILS=0
 WARNS=0
@@ -158,7 +161,7 @@ fi
 # Lock probe: a separate fd, and only a non-blocking try. If another deploy holds it, this
 # deploy must not start; that is the same lock deploy-vps.sh takes on fd 9.
 if have flock; then
-  if ( exec 8>"$LOCK_FILE" && flock -n 8 ) 2>/dev/null; then
+  if ( umask 077; exec 8>"$LOCK_FILE" && flock -n 8 ) 2>/dev/null; then
     pass "deploy lock" "free ($LOCK_FILE)"
   else
     bad "deploy lock" "held by another deploy ($LOCK_FILE)"

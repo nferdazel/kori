@@ -6,7 +6,7 @@ set -euo pipefail
 APP_DIR="${KORI_APP_DIR:-/srv/qouver/apps/kori}"
 IMAGE="${KORI_IMAGE:-localhost/kori}"
 SERVICE="${KORI_SERVICE:-kori-api}"
-HEALTH_URL="${KORI_HEALTH_URL:-http://127.0.0.1:8787/admin/state}"
+HEALTH_URL="${KORI_HEALTH_URL:-http://127.0.0.1:8787/healthz}"
 STATE_FILE="$APP_DIR/.deployed_rev"
 LOG="$APP_DIR/logs/deploy.log"
 

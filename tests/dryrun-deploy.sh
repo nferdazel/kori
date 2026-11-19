@@ -204,19 +204,59 @@ cat >"$BIN/curl" <<'STUB'
 #!/usr/bin/env bash
 S="${PODMAN_STATE:?}"
 printf 'curl %s\n' "$*" >>"$S/calls.log"
-# The body matters: smoke.sh parses /admin/state as JSON, so a healthy stub has to answer with
-# something parseable. wait_healthy only reads the exit code, which is why a body-only failure
-# (nonjson) keeps the health gate green and fails smoke — the case scenario 10b needs.
+# Two callers share this stub: the deploy's wait_healthy (exit code only) and smoke.sh, which
+# parses /healthz as JSON and reads a status code for the gated admin surface.
 # ok      : always healthy
 # recover : the new image is sick, the old one (:prev) is fine once it is back in service
 # nonjson : answers 200 with a body that is not JSON -> health green, smoke red
 # fail    : nothing is healthy, not even the rollback
-case "${FAKE_CURL:-ok}" in
-  ok) printf '{}\n'; exit 0 ;;
-  recover) [ -f "$S/rolled_back" ] && { printf '{}\n'; exit 0; } || exit 7 ;;
-  nonjson) printf 'not json\n'; exit 0 ;;
-  *) exit 7 ;;
+code_only=0; hdr=""; url=""; cfg=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -w) code_only=1; shift 2 ;;
+    -H) hdr="$2"; shift 2 ;;
+    -K|--config) cfg="$2"; shift 2 ;;
+    -o|--max-time|-s|-f|-S) shift 2 2>/dev/null || shift 1 ;;
+    -*) shift ;;
+    *) url="$1"; shift ;;
+  esac
+done
+if [ "$cfg" = "-" ]; then
+  while IFS= read -r cline; do
+    case "$cline" in
+      header*=*) hdr="${cline#*\"}"; hdr="${hdr%\"*}" ;;
+    esac
+  done
+fi
+healthy() {
+  case "${FAKE_CURL:-ok}" in
+    ok) return 0 ;;
+    recover) [ -f "$S/rolled_back" ] && return 0 || return 1 ;;
+    nonjson) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+case "$url" in
+  */admin/state|*/metrics)
+    # Gated surface (DEC-20). No token configured in this harness, so the honest answer is 404.
+    if [ "$hdr" = "Authorization: Bearer ${KORI_ADMIN_TOKEN:-}" ] && [ -n "${KORI_ADMIN_TOKEN:-}" ]; then
+      [ "$code_only" = "1" ] && { printf '200'; exit 0; }
+      printf '{}\n'; exit 0
+    fi
+    [ "$code_only" = "1" ] && { printf '404'; exit 0; }
+    printf '{"error":{"type":"not_found","message":"no such path"}}\n'; exit 0 ;;
 esac
+# FAKE_HEALTH_DOWN=1: liveness is down while the gated path still answers a refusal. A deploy
+# gate that borrowed /admin/state would read the 404 as trouble but a health gate that borrowed it
+# as "any answer" would read its 401 the wrong way; either way this scenario is what proves the
+# gate is on /healthz and nowhere else.
+[ "${FAKE_HEALTH_DOWN:-0}" = "1" ] && exit 7
+healthy || exit 7
+case "${FAKE_CURL:-ok}" in
+  nonjson) printf 'not json\n' ;;
+  *) printf '{}\n' ;;
+esac
+exit 0
 STUB
 
 # smoke.sh reads the publish address with `ss` and the log size with GNU `stat -c`. Neither is
@@ -379,6 +419,37 @@ grep -q 'systemctl --user restart kori-api' "$STATE/calls.log" && pass "service 
   || fail "service never restarted"
 grep -q 'sudo systemctl restart caddy' "$STATE/calls.log" && pass "caddy restarted" \
   || fail "caddy never restarted"
+
+# ── scenario 3a: the health gate probes /healthz, and the gate is really exercised ─
+# DEC-20 moved the admin surface behind a token, so /admin/state answers 404 to a probe that
+# carries none. If the deploy still probed it, every deploy would fail its gate and roll back.
+# Two assertions: the probe path itself, and a host whose liveness is down while the gated path
+# still answers — a run that passed here would have been reading the wrong endpoint.
+[ "$(grep -c 'curl -fsS --max-time 3 http://127.0.0.1:8787/healthz' "$STATE/calls.log")" -ge 1 ] \
+  && pass "the health gate probes /healthz, not the gated admin path" \
+  || fail "the health gate did not probe /healthz: $(grep '^curl' "$STATE/calls.log" | head -3)"
+grep -q 'curl -fsS --max-time 3 http://127\.0\.0\.1:8787/admin/state' "$STATE/calls.log" \
+  && fail "the health gate probed /admin/state, which answers 404 without a token" \
+  || pass "the health gate never probes /admin/state (smoke's own 404 assertion is a separate call)"
+# The default in the script itself, not only in the env file: an operator who sets nothing must
+# still land on the open endpoint.
+grep -qF 'HEALTH_URL="${KORI_HEALTH_URL:-http://127.0.0.1:8787/healthz}"' "$DEPLOY" \
+  && pass "KORI_HEALTH_URL defaults to /healthz" \
+  || fail "KORI_HEALTH_URL does not default to /healthz"
+
+# ── scenario 3a2: liveness down while the gated path answers -> rollback, not a pass ─
+# The inverse of the case above. If the gate read the admin surface, a 404/401 there could be
+# mistaken for an answer; here liveness is the only thing failing, and the deploy must roll back.
+reset_state
+printf 'local\n' >"$STATE/tags"
+happy_image
+export FAKE_HEALTH_DOWN=1
+rc="$(run refs/heads/main)"
+unset FAKE_HEALTH_DOWN
+[ "$rc" != "0" ] && pass "dead liveness with a live admin path rolls back ($rc)" \
+  || fail "a dead /healthz was read as healthy"
+[ -f "$APP_DIR/.deployed_rev" ] && fail ".deployed_rev written with liveness down" \
+  || pass "no .deployed_rev with liveness down"
 
 # ── scenario 3b: the pulled tag is the sha of the commit that was checked out ─
 grep -qxF "podman pull $(sha_ref)" "$STATE/calls.log" && pass "pulled $(sha_ref)" \
@@ -897,6 +968,45 @@ rc="$(run refs/heads/main)"
   || fail "host still behind main: $(cat "$APP_DIR/.deployed_rev") vs $(head_sha)"
 [ "$FIRST_REV" != "$(head_sha)" ] && pass "the two runs deployed different commits" \
   || fail "harness did not move main between the runs"
+
+# ── scenario 16b: the lock lives in the app dir at 0600, never in /tmp ──────
+# Galih, 2026-11-19: /tmp is world-writable, so a lock file there can be pre-created by any local
+# user before the deploy opens it. The app directory belongs to the deploy user, which is where
+# sds and qouver already keep theirs. Asserted on the file the run actually made.
+[ -f "$APP_DIR/.deploy.lock" ] && pass "lock file is $APP_DIR/.deploy.lock" \
+  || fail "no lock file in the app dir: $(ls -a "$APP_DIR" | tr '\n' ' ')"
+[ -n "$(find "$APP_DIR/.deploy.lock" -maxdepth 0 -perm 0600 2>/dev/null)" ] \
+  && pass "lock file is 0600" \
+  || fail "lock file mode is $(stat -c %a "$APP_DIR/.deploy.lock" 2>/dev/null || stat -f %Lp "$APP_DIR/.deploy.lock" 2>/dev/null)"
+grep -qF '/tmp/deploy-' "$DEPLOY" \
+  && fail "deploy script still references a /tmp lock path" \
+  || pass "no /tmp lock path left in the deploy script"
+grep -qF 'LOCK_FILE="$APP_DIR/.deploy.lock"' "$DEPLOY" \
+  && pass "the lock path is derived from the app dir" \
+  || fail "the lock path is not derived from the app dir"
+# preflight probes the same lock; a deploy that moved and a preflight that did not would report
+# "free" for a lock nobody takes.
+grep -qF 'LOCK_FILE="$APP_DIR/.deploy.lock"' "$KIT/ops/scripts/preflight.sh" \
+  && pass "preflight probes the same lock path" \
+  || fail "preflight still probes a different lock path"
+
+# ── scenario 16c: a lock file this user does not control is refused ─────────
+# The point of moving out of /tmp was pre-creation. A symlink at the new path is the same attack
+# with a friendlier directory, so the script must refuse rather than lock a name it does not own.
+reset_state
+rm -f "$APP_DIR/.deploy.lock"
+ln -s /tmp/kori-lock-target "$APP_DIR/.deploy.lock"
+happy_image
+export FAKE_CURL=ok
+rc="$(run refs/heads/main)"
+[ "$rc" != "0" ] && pass "a symlinked lock file exits non-zero ($rc)" \
+  || fail "a symlinked lock file was accepted"
+grep -q 'refusing to take a lock someone else controls' "$APP_DIR/logs/deploy.log" \
+  && pass "the refused lock is named in the deploy log" \
+  || fail "the refused lock is not named: $(tail -2 "$APP_DIR/logs/deploy.log")"
+grep -q '^podman pull' "$STATE/calls.log" && fail "pulled with an untrusted lock" \
+  || pass "nothing was pulled with an untrusted lock"
+rm -f "$APP_DIR/.deploy.lock"
 
 # ── scenario 17: the self-update re-exec keeps the lock, does not re-take it ─
 # The script copies itself and re-execs when the repo copy differs. That exec must inherit the

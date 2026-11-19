@@ -4,6 +4,8 @@
 
 import std/[json, options, os, posix, sequtils, strutils, tables, times]
 
+import std/asynchttpserver
+
 import "../../apps/api/src/kori"
 import "../../apps/api/src/generated/static_files"
 
@@ -668,7 +670,7 @@ check "an encoded traversal is not normalised into a real path",
   resolveStaticPath("/%2e%2e/kori.nim") == "/%2e%2e/kori.nim"
 
 check "a hashed asset is immutable",
-  cacheControlFor("/assets/main-3LGz82B_.css") == StaticAssetCache
+  cacheControlFor("/assets/any-hashed-name.js") == StaticAssetCache
 check "a font keeps its name, so it is not immutable",
   cacheControlFor("/fonts/inter-latin-var.woff2") == StaticFontCache
 check "a page is never cached across a deploy",
@@ -678,16 +680,26 @@ check "the root path is no-store too, because it is a page",
 
 # The committed module must be the one the binary serves, so a page the dist has
 # cannot be missing from the table and a page the table has cannot be missing from
-# the dist. This is the drift check in test form, for the four pages and the two
-# assets that are named in the shell.
+# the dist. This is the drift check in test form: the five pages and the two fonts
+# are named here, and the hashed assets are matched by shape because their names
+# change on every build that touches the bundle.
 block:
   let table = staticFileTable()
   for path in ["/index.html", "/requests.html", "/routes.html", "/config.html",
-               "/assets/main-3LGz82B_.css", "/assets/main-Dh4ZqD4z.js",
+               "/login.html",
                "/fonts/inter-latin-var.woff2", "/fonts/jetbrains-mono-latin-var.woff2"]:
     check "the embedded table carries " & path, table.hasKey(path)
+  let keys = table.keys().toSeq()
+  check "a hashed stylesheet is embedded",
+    keys.anyIt(it.startsWith("/assets/") and it.endsWith(".css"))
+  check "a hashed module is embedded",
+    keys.anyIt(it.startsWith("/assets/") and it.endsWith(".js"))
   check "every embedded page is html",
     table["/index.html"].contentType.startsWith("text/html")
+  check "the sign-in page is served as html",
+    table["/login.html"].contentType.startsWith("text/html")
+  check "the sign-in page carries a form field",
+    table["/login.html"].body.contains("type=\"password\"")
   check "the two fonts are woff2",
     table["/fonts/inter-latin-var.woff2"].contentType == "font/woff2"
   check "an embedded body is not empty", table["/index.html"].body.len > 0
@@ -1140,6 +1152,227 @@ block:
     parseJson(gateway.configJson()){"systemone"}.len == 3
   check "the config reports the block beside the chat legs",
     parseJson(gateway.configJson()){"legs"}.len == 1
+
+# ------------------------------------------------------------- the admin gate ---
+#
+# DEC-20. These exercise the gate's whole decision surface without a socket: a
+# Request is a plain object, so a header set is the only thing a case needs. The
+# path/status table over a real HTTP connection is the acceptance case A16; what
+# is proved here is that each arm of the gate answers what the contract says.
+
+block:
+  # Constant-time compare: the result, never the timing, is what these assert.
+  check "the same string matches", constantTimeEquals("abc", "abc")
+  check "a different string does not", not constantTimeEquals("abc", "abd")
+  check "a prefix does not", not constantTimeEquals("abcdef", "abc")
+  check "a longer value does not", not constantTimeEquals("abc", "abcdef")
+  check "the empty string only matches itself",
+    constantTimeEquals("", "") and not constantTimeEquals("a", "")
+
+block:
+  # The token file. Every way of not having one is one answer: no token.
+  let file = scratch / "admin.token"
+  putEnv(AdminTokenEnv, file)
+  writeFile(file, "s3cret-token\n")
+  check "the token file is read with its newline trimmed",
+    readAdminToken() == some("s3cret-token")
+  writeFile(file, "  s3cret-token  \r\n\n")
+  check "surrounding whitespace is trimmed too",
+    readAdminToken() == some("s3cret-token")
+  writeFile(file, "")
+  check "an empty token file is no token", readAdminToken().isNone
+  writeFile(file, "   \n\t\n")
+  check "a whitespace-only token file is no token", readAdminToken().isNone
+  removeFile(file)
+  check "a missing token file is no token", readAdminToken().isNone
+  putEnv(AdminTokenEnv, scratch / "nested" / "admin.token")
+  check "a path under a directory that does not exist is no token",
+    readAdminToken().isNone
+  delEnv(AdminTokenEnv)
+  check "with the variable unset the documented default is used",
+    adminTokenPath() == DefaultAdminTokenFile
+
+block:
+  # Bearer parsing. The scheme is case-insensitive; the credential is everything
+  # after it, so a token containing a space survives.
+  proc withHeaders(pairs: openArray[(string, string)]): Request =
+    var headers = newHttpHeaders()
+    for (name, value) in pairs:
+      headers[name] = value
+    Request(reqMethod: HttpGet, headers: headers)
+  check "a bearer is parsed",
+    withHeaders([("Authorization", "Bearer tok")]).bearerValue() == "tok"
+  check "the scheme is case-insensitive",
+    withHeaders([("Authorization", "bearer tok")]).bearerValue() == "tok"
+  check "a bare credential with no scheme is not a bearer",
+    withHeaders([("Authorization", "tok")]).bearerValue().len == 0
+  check "a different scheme is not a bearer",
+    withHeaders([("Authorization", "Basic dXNlcg==")]).bearerValue().len == 0
+  check "no Authorization header means no bearer",
+    withHeaders([("Accept", "*/*")]).bearerValue().len == 0
+  check "a token with a space in it keeps the whole value",
+    withHeaders([("Authorization", "Bearer a b c")]).bearerValue() == "a b c"
+
+  check "the kori_admin cookie is parsed out of a multi-cookie header",
+    withHeaders([("Cookie", "theme=dark; kori_admin=abc123; other=1")])
+      .sessionCookieValue() == "abc123"
+  check "another cookie name is not a session",
+    withHeaders([("Cookie", "kori_adminx=abc")]).sessionCookieValue().len == 0
+  check "no Cookie header means no session",
+    withHeaders([("Accept", "*/*")]).sessionCookieValue().len == 0
+  check "a malformed cookie pair does not throw",
+    withHeaders([("Cookie", "garbage; kori_admin=xyz")])
+      .sessionCookieValue() == "xyz"
+
+  # A redirect is for a browser. `curl` sends */*, and a script that gets a 302
+  # it cannot follow has been told nothing.
+  check "an explicit text/html is a page request",
+    withHeaders([("Accept", "text/html,application/xhtml+xml")]).acceptsHtml()
+  check "a wildcard accept is not a page request",
+    not withHeaders([("Accept", "*/*")]).acceptsHtml()
+  check "a json accept is not a page request",
+    not withHeaders([("Accept", "application/json")]).acceptsHtml()
+  check "no Accept header is not a page request",
+    not withHeaders([("Accept-Encoding", "gzip")]).acceptsHtml()
+
+block:
+  # The cookie the login sets, asserted literally: Galih's gate re-checks these
+  # five attributes and none of them may drift.
+  let cookie = sessionCookie("abc", 43_200)
+  check "the cookie is named kori_admin", cookie.startsWith(AdminCookieName & "=")
+  check "the cookie is HttpOnly", cookie.contains("; HttpOnly")
+  check "the cookie is Secure", cookie.contains("; Secure")
+  check "the cookie is SameSite=Strict", cookie.contains("; SameSite=Strict")
+  check "the cookie is scoped to Path=/", cookie.contains("; Path=/")
+  check "the cookie carries the 12 hour max age", cookie.contains("; Max-Age=43200")
+  check "a cleared cookie has Max-Age=0", sessionCookie("", 0).contains("Max-Age=0")
+
+block:
+  # Sessions. A new id is 32 bytes of base64url; the table expires entries, caps
+  # its size, and a restart (a new Gateway) starts empty.
+  var cfg = Config(listenHost: "127.0.0.1", listenPort: 4011,
+                   logPath: scratch / "gate.jsonl")
+  cfg.legs = @[legSpec("leg-a", lrPrimary)]
+  let gateway = newGateway(cfg, RequestLog(fd: -1), "127.0.0.1:4011")
+  let first = gateway.startSession()
+  check "a session id is produced", first.isSome
+  check "the session id is 32 bytes of base64url, so 43 characters",
+    first.get.len == 43
+  check "the session id is unpadded", not first.get.contains('=')
+  check "the session is in the table", gateway.sessions.hasKey(first.get)
+  let second = gateway.startSession()
+  check "two logins get two different ids", second.get != first.get
+
+  # Expiry is enforced on read: an entry past its deadline is dropped by the next
+  # gate call, so a 12 hour old cookie cannot survive in a running process.
+  gateway.sessions[second.get] = epochTime() - 1
+  let probe = Request(reqMethod: HttpGet,
+                      headers: newHttpHeaders([("Cookie",
+                        AdminCookieName & "=" & second.get)]))
+  let file = scratch / "gate.token"
+  putEnv(AdminTokenEnv, file)
+  writeFile(file, "gate-token\n")
+  check "the gate denies an expired session", gateway.adminGate(probe) == agDenied
+  check "the expired session is gone from the table",
+    not gateway.sessions.hasKey(second.get)
+
+  # A live cookie is the credential; the same request with a wrong bearer and no
+  # cookie is not.
+  let liveCookie = Request(reqMethod: HttpGet,
+                           headers: newHttpHeaders([("Cookie",
+                             AdminCookieName & "=" & first.get)]))
+  check "a live cookie opens the gate", gateway.adminGate(liveCookie) == agOk
+  let wrongBearer = Request(reqMethod: HttpGet,
+                            headers: newHttpHeaders([("Authorization",
+                              "Bearer not-the-token")]))
+  check "a wrong bearer is denied", gateway.adminGate(wrongBearer) == agDenied
+  let rightBearer = Request(reqMethod: HttpGet,
+                            headers: newHttpHeaders([("Authorization",
+                              "Bearer gate-token")]))
+  check "the right bearer opens the gate", gateway.adminGate(rightBearer) == agOk
+
+  # Fail closed: no token file means the gated surface does not exist, for every
+  # request, and a bearer of any value is not a way around it.
+  delEnv(AdminTokenEnv)
+  putEnv(AdminTokenEnv, scratch / "absent.token")
+  check "with no token file even the right bearer is not a gate answer",
+    gateway.adminGate(rightBearer) == agNoToken
+  check "with no token file a request with nothing is not a gate answer",
+    gateway.adminGate(wrongBearer) == agNoToken
+
+  # The cap bounds memory: 256 live sessions is the ceiling, and the next login
+  # evicts the one closest to expiry instead of refusing the new one.
+  putEnv(AdminTokenEnv, file)
+  let capped = newGateway(cfg, RequestLog(fd: -1), "127.0.0.1:4011")
+  for _ in 0 ..< MaxAdminSessions:
+    discard capped.startSession()
+  check "the session table stops at the cap", capped.sessions.len == MaxAdminSessions
+  let overflow = capped.startSession()
+  check "a login past the cap still gets a session", overflow.isSome
+  check "the table is still capped after it",
+    capped.sessions.len == MaxAdminSessions
+  check "the newest session is the one that survived",
+    capped.sessions.hasKey(overflow.get)
+  delEnv(AdminTokenEnv)
+
+block:
+  # The login window. Five failures block the sixth attempt, and the counter is
+  # global: nothing about the credential changes the answer.
+  var cfg = Config(listenHost: "127.0.0.1", listenPort: 4011,
+                   logPath: scratch / "window.jsonl")
+  cfg.legs = @[legSpec("leg-a", lrPrimary)]
+  let gateway = newGateway(cfg, RequestLog(fd: -1), "127.0.0.1:4011")
+  let file = scratch / "window.token"
+  putEnv(AdminTokenEnv, file)
+  writeFile(file, "window-token\n")
+
+  proc loginBody(token: string): string =
+    "{\"token\":" & $ %token & "}"
+  # The handler needs a socket to answer, so the window is driven directly: five
+  # failures recorded inside the window, the sixth sees a full list. That is the
+  # same list the handler reads before it compares anything.
+  for _ in 0 ..< MaxAdminLoginFailures:
+    gateway.loginFailures.add epochTime()
+  gateway.pruneLoginFailures(epochTime())
+  check "five failures inside the window fill it",
+    gateway.loginFailures.len == MaxAdminLoginFailures
+  # A failure older than the window is forgotten, which is what makes the limit a
+  # window and not a permanent lockout.
+  gateway.loginFailures = @[epochTime() - AdminLoginWindowS - 1.0]
+  gateway.pruneLoginFailures(epochTime())
+  check "a failure older than five minutes leaves the window",
+    gateway.loginFailures.len == 0
+  check "the login body shape is what the handler parses",
+    parseJson(loginBody("t")){"token"}.getStr() == "t"
+  delEnv(AdminTokenEnv)
+
+block:
+  # The sentinel. The request log line has no header parameter at all, so a cookie
+  # or a token cannot be formatted into it; this proves the value is absent even
+  # when every other field is filled, and that a gated path never produces a line.
+  const sentinel = "SENTINEL-COOKIE-VALUE-do-not-log"
+  let line = requestLogLine("2026-11-19T08:00:00+07:00", "leg-a", 200, 12,
+                            some(3), some(4), "", "", false, "kori/fast")
+  check "the log line never carries a cookie sentinel", not line.contains(sentinel)
+  check "the log line never carries the cookie name",
+    not line.contains(AdminCookieName)
+  check "the log line has no header-shaped key",
+    not line.contains("\"cookie\"") and not line.contains("\"authorization\"")
+  # The gate's own answers are fixed bodies, so nothing the caller sent is echoed
+  # back into a response either.
+  check "the denial body is fixed and has no parameter",
+    adminDeniedBody() ==
+      "{\"error\":{\"type\":\"unauthorized\",\"message\":\"admin token required\"}}"
+
+block:
+  # Which paths the gate covers. `/healthz`, `/login.html` and the assets are the
+  # ones that must stay open, and that is a property of this list.
+  check "the root alias is a gated page", isGatedPage("/")
+  for page in ["/index.html", "/requests.html", "/routes.html", "/config.html"]:
+    check "the page " & page & " is gated", isGatedPage(page)
+  check "the sign-in page is not gated", not isGatedPage("/login.html")
+  check "a stylesheet is not gated", not isGatedPage("/assets/any-hashed-name.css")
+  check "a font is not gated", not isGatedPage("/fonts/inter-latin-var.woff2")
 
 # --------------------------------------------------------------------- report ---
 

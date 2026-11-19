@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign in · kori</title>
+<meta name="description" content="kori gateway dashboard: admin token sign-in.">
+</head>
+<body data-page="login.html">
+<a class="skip" href="#main">Skip to content</a>
+
+<main class="login-page" id="main">
+  <div class="login">
+    <form class="login-card" data-login>
+      <div class="brand">kori<span>gateway</span></div>
+      <h1>Admin token</h1>
+      <p class="login-sub">The dashboard reads route state, the request log and the loaded config. One shared token guards all three.</p>
+
+      <div class="login-form">
+        <div class="login-field">
+          <label for="token">Token</label>
+          <input id="token" name="token" type="password" autocomplete="current-password"
+                 spellcheck="false" autocapitalize="off" autocorrect="off" required autofocus
+                 aria-describedby="login-help login-error">
+        </div>
+        <p class="login-error" id="login-error" role="alert" data-error hidden></p>
+        <button class="btn login-submit" type="submit" data-submit>Sign in</button>
+      </div>
+
+      <p class="login-help" id="login-help">Read from the gateway's token file · a session lasts 12 hours</p>
+      <p class="footer login-foot">read-only · token required</p>
+    </form>
+  </div>
+</main>
+
+<script type="module" src="/src/login.ts"></script>
+</body>
+</html>

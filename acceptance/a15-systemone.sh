@@ -114,7 +114,8 @@ assert_eq "A15b a one-line answer keeps the nine keys when unpriced" \
   "$(log_line | jq -c 'keys_unsorted | join(",")')" \
   '"ts,route,status,latency_ms,tokens_in,tokens_out,failover_from,failover_reason,stream"'
 assert_eq "A15b the door is counted in /metrics" \
-  "$(curl -sS --max-time 5 "$GW_URL/metrics" | awk '/^kori_requests_total\{route="jev-a"\}/ {print $2}')" \
+  "$(curl -sS --max-time 5 -H "$(admin_token_header)" "$GW_URL/metrics" \
+     | awk '/^kori_requests_total\{route="jev-a"\}/ {print $2}')" \
   "1"
 
 echo

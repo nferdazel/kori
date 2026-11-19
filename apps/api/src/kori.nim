@@ -22,14 +22,21 @@
 # request through to its own ordered legs, unchanged except the model id
 # (DEC-19). It is not a protocol translation and not part of the chat walk.
 #
+# Slice 9 (0.7.0): the admin gate (DEC-20). `/admin/*`, `/metrics`, `/healthz?deep`
+# and the four dashboard pages need one shared token, presented as a bearer or as a
+# session cookie minted by `POST /session/login`. The token lives in its own file,
+# read per request, and a gateway with no token file answers 404 on every gated
+# path instead of opening. `/healthz`, `/v1/*`, `/login.html` and the static assets
+# stay open; non-GET under `/admin/*` stays 405.
+#
 # Deliberately absent, and not to be reported as done: every chat-shaped
 # convenience endpoint (messages, responses, embeddings, images, audio, batch),
 # protocol translation between chat and System One, spend caps and cache, caller
 # identity, a second replica, and compression of rotated logs.
 # docs/ARCHITECTURE.md, "Not built", is the list this comment must agree with.
 
-import std/[algorithm, asyncdispatch, asyncnet, exitprocs,
-            httpcore, json, net, options, os, posix, strutils, tables, times, uri]
+import std/[algorithm, asyncdispatch, asyncnet, base64, exitprocs, httpcore,
+            json, net, options, os, posix, strutils, sysrand, tables, times, uri]
 import std/asynchttpserver
 
 import generated/static_files
@@ -102,6 +109,29 @@ const
   StaticAssetCache* = "public, max-age=31536000, immutable"
   StaticFontCache* = "public, max-age=86400"
   StaticNoStore* = "no-store"
+
+  # DEC-20, the admin gate. The token is one shared secret in its own file, never a
+  # config key and never a command-line argument, so it cannot leak through
+  # /admin/config, `ps` or a shell history. The path is fixed here only as a
+  # default: the host points KORI_ADMIN_TOKEN_FILE at wherever it keeps the file.
+  DefaultAdminTokenFile* = "/etc/kori/admin.token"
+  AdminTokenEnv* = "KORI_ADMIN_TOKEN_FILE"
+  AdminCookieName* = "kori_admin"
+  ## 32 random bytes, base64url, unpadded: 43 characters of URL-safe alphabet, so
+  ## the value needs no quoting in a cookie and carries no `=`.
+  AdminSessionBytes* = 32
+  AdminSessionTtlS* = 43_200.0
+  ## A restart invalidates every session, and the cap is what stops a caller that
+  ## keeps logging in from growing the table without bound.
+  MaxAdminSessions* = 256
+  ## Five failed logins in five minutes, counted globally: behind Caddy every
+  ## request arrives from one address, so a per-IP window would be one window.
+  MaxAdminLoginFailures* = 5
+  AdminLoginWindowS* = 300.0
+  ## A login body is two short strings. The HTTP layer has already read the body by the
+  ## time the handler runs, so this cap does not limit the read; it stops an oversized
+  ## body from reaching parseJson. The gateway's own body limit bounds the read.
+  MaxLoginBodyBytes* = 8_192
 
   # The seven failure classes plus the one log-only value (§3.1, §5.1).
   TokenAuth401* = "auth_401"
@@ -340,6 +370,10 @@ type
     lastReloadAt*: string
     lastReloadError*: string
     cli*: CliOptions             ## kept so a reload applies the same precedence
+    # DEC-20. The gate's own state, all of it in memory: a restart empties the
+    # session table on purpose, and nothing here is written to disk or logged.
+    sessions*: Table[string, float]   ## session id -> expiry, epoch seconds
+    loginFailures*: seq[float]        ## epochs of the failures still in the window
 
   RecvKind = enum
     rkData, rkEof, rkTruncated, rkTimeout, rkError
@@ -1098,8 +1132,7 @@ proc newGateway*(cfg: Config, log: RequestLog,
                 listenAddr: string): Gateway =
   result = Gateway(cfg: cfg, log: log, startedAt: nowStamp(),
                    listenAddr: listenAddr, cursor: -1,
-                   ssl: newUpstreamSslContext(),
-                   legs: newSeq[LegRuntime](cfg.legs.len),
+                   ssl: newUpstreamSslContext(),                   legs: newSeq[LegRuntime](cfg.legs.len),
                    systemone: newSeq[SystemoneRuntime](cfg.systemone.len),
                    oauth: newSeq[OauthState](cfg.legs.len),
                    metrics: Metrics(latency: newSeq[int](LatencyBucketsMs.len + 1),
@@ -1107,6 +1140,7 @@ proc newGateway*(cfg: Config, log: RequestLog,
                                     failoversByReason: initTable[string, int](),
                                     cooldownStarts: initTable[string, int](),
                                     statusClasses: initTable[string, int]()),
+                   sessions: initTable[string, float](),
                    staticFiles: staticFileTable())
   # The seeded credential is the starting point, not the truth: a refresh replaces
   # it in memory and, when the file is writable, on disk.
@@ -3922,6 +3956,251 @@ proc resolveStaticPath*(requestPath: string): string =
 proc notFoundBody(): string =
   "{\"error\":{\"type\":\"not_found\",\"message\":\"no such path\"}}"
 
+# -------------------------------------------------------------- admin gate ---
+#
+# DEC-20. One shared token, one cookie, no identity. The gate is deliberately the
+# smallest thing that can hold: a file read, a constant-time compare, and a table
+# in memory. Every gated answer is a fixed body, so nothing the caller sent is
+# ever echoed back and there is no path from a `Cookie` header into a log line.
+
+proc adminTokenPath*(): string =
+  ## Resolved per request so the environment is the only place the path is set:
+  ## never a config key (it would show up in /admin/config) and never an argument
+  ## (it would show up in `ps`).
+  let fromEnv = getEnv(AdminTokenEnv)
+  if fromEnv.len > 0: fromEnv else: DefaultAdminTokenFile
+
+proc readAdminToken*(): Option[string] =
+  ## Read on every request, so replacing the file rotates the token without a
+  ## restart. A file that is missing, unreadable or only whitespace is one answer:
+  ## no token. The caller turns that into a 404, never into an open gate.
+  let path = adminTokenPath()
+  var raw: string
+  try:
+    if not fileExists(path):
+      return none(string)
+    raw = readFile(path)
+  except CatchableError:
+    return none(string)
+  let token = raw.strip()
+  if token.len == 0:
+    return none(string)
+  some(token)
+
+proc constantTimeEquals*(actual, supplied: string): bool =
+  ## No early return and no short-circuit on length: the loop always runs to the
+  ## longer of the two, and a length difference is folded into the same result
+  ## instead of deciding it. What an attacker learns from timing is the length of
+  ## their own input, which they already know.
+  var diff = if actual.len == supplied.len: 0'u8 else: 1'u8
+  let spans = max(actual.len, supplied.len)
+  for index in 0 ..< spans:
+    let a = if index < actual.len: uint8(actual[index]) else: 0'u8
+    let b = if index < supplied.len: uint8(supplied[index]) else: 0'u8
+    diff = diff or (a xor b)
+  diff == 0
+
+proc bearerValue*(request: Request): string =
+  ## The `Bearer` scheme only, case-insensitive, and the whole remaining value is
+  ## the credential: a token with a space in it stays intact.
+  let values = request.headers.getOrDefault("Authorization")
+  for value in seq[string](values):
+    let trimmed = value.strip()
+    if trimmed.len > 7 and trimmed[0 ..< 7].toLowerAscii() == "bearer ":
+      return trimmed[7 .. ^1].strip()
+
+proc sessionCookieValue*(request: Request): string =
+  ## The first `kori_admin` the request carries. A malformed pair is skipped, not
+  ## rejected: the gate only ever needs one usable credential.
+  let values = request.headers.getOrDefault("Cookie")
+  for value in seq[string](values):
+    for part in value.split(';'):
+      let pair = part.strip()
+      let eq = pair.find('=')
+      if eq > 0 and pair[0 ..< eq].strip() == AdminCookieName:
+        return pair[eq + 1 .. ^1].strip()
+
+proc adminDeniedBody*(): string =
+  ## Fixed, with no parameter: nothing the caller sent can reach it.
+  "{\"error\":{\"type\":\"unauthorized\",\"message\":\"admin token required\"}}"
+
+const TooManyLoginsBody* =
+  "{\"error\":{\"type\":\"too_many_requests\",\"message\":\"too many failed logins\"}}"
+
+proc acceptsHtml*(request: Request): bool =
+  ## Explicit only. `curl` sends `*/*` by default, and a wildcard is not a request
+  ## for a page: a script gets the 401 that says why, a browser gets the form.
+  let values = request.headers.getOrDefault("Accept")
+  for value in seq[string](values):
+    for part in value.split(','):
+      let media = part.split(';')[0].strip().toLowerAscii()
+      if media == "text/html" or media == "application/xhtml+xml":
+        return true
+  false
+
+const
+  ## The five dashboard pages. `/login.html` is open, because a gated page that
+  ## answered 401 would have no way to offer the form.
+  GatedPages* = ["/", "/index.html", "/requests.html", "/routes.html", "/config.html"]
+
+proc isGatedPage*(path: string): bool =
+  path in GatedPages
+
+type
+  AdminGate* = enum
+    agOk,        ## a credential was presented and it is the one in the file
+    agNoToken,   ## no token configured: the gated surface answers 404
+    agDenied     ## a token exists and this request does not have it
+
+proc pruneSessions*(gateway: Gateway, now: float) =
+  var expired: seq[string]
+  for id, expiresAt in gateway.sessions:
+    if expiresAt <= now:
+      expired.add id
+  for id in expired:
+    gateway.sessions.del id
+
+proc pruneLoginFailures*(gateway: Gateway, now: float) =
+  var kept: seq[float]
+  for at in gateway.loginFailures:
+    if now - at < AdminLoginWindowS:
+      kept.add at
+  gateway.loginFailures = kept
+
+proc adminGate*(gateway: Gateway, request: Request): AdminGate =
+  ## Session first: it is a table lookup, and a browser sends the cookie on every
+  ## request while a script sends the bearer. Either one is enough.
+  let token = readAdminToken()
+  if token.isNone:
+    return agNoToken
+  let now = epochTime()
+  pruneSessions(gateway, now)
+  let cookie = sessionCookieValue(request)
+  if cookie.len > 0 and gateway.sessions.hasKey(cookie):
+    return agOk
+  let bearer = bearerValue(request)
+  if bearer.len > 0 and constantTimeEquals(token.get, bearer):
+    return agOk
+  agDenied
+
+proc startSession*(gateway: Gateway): Option[string] =
+  ## A session id that is guessable is not a gate, so no CSPRNG means no session
+  ## and the caller is told the surface is unavailable rather than let in.
+  var bytes: array[AdminSessionBytes, byte]
+  if not urandom(bytes):
+    return none(string)
+  var id = encode(bytes, safe = true)
+  # Unpadded: `=` is legal in a cookie value but needs quoting, and 32 bytes
+  # encode to 43 characters without it.
+  while id.len > 0 and id[^1] == '=':
+    id.setLen(id.len - 1)
+  let now = epochTime()
+  pruneSessions(gateway, now)
+  if gateway.sessions.len >= MaxAdminSessions:
+    # The cap is a bound on memory, not a queue: the entry closest to expiring
+    # goes, which is the one a caller is least likely to still be using.
+    var oldestId = ""
+    var oldestAt = 0.0
+    for existing, expiresAt in gateway.sessions:
+      if oldestId.len == 0 or expiresAt < oldestAt:
+        oldestId = existing
+        oldestAt = expiresAt
+    gateway.sessions.del oldestId
+  gateway.sessions[id] = now + AdminSessionTtlS
+  some(id)
+
+proc sessionCookie*(value: string, maxAge: int): string =
+  AdminCookieName & "=" & value &
+    "; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=" & $maxAge
+
+proc respondGateDenied*(request: Request, page: bool): Future[void] {.async.} =
+  ## A page the browser asked for redirects to the form; everything else gets the
+  ## 401 that names the problem. `no-store` keeps a browser from caching either.
+  var headers = newHttpHeaders()
+  headers["Cache-Control"] = "no-store"
+  if page and acceptsHtml(request):
+    headers["Location"] = "/login.html"
+    await request.respond(Http302, "", headers)
+    return
+  headers["Content-Type"] = "application/json"
+  let body = if request.reqMethod == HttpHead: "" else: adminDeniedBody()
+  await request.respond(Http401, body, headers)
+
+proc respondGateMissing*(request: Request): Future[void] {.async.} =
+  ## Contract 2: a gateway with no token proves nothing about having one, so the
+  ## gated surface does not exist to a caller who cannot be authenticated. Never
+  ## 401 and never 500: the answer is the same 404 an unknown path gets.
+  await respondJson(request, Http404, notFoundBody())
+
+proc handleSessionLogin(gateway: Gateway,
+                        request: Request): Future[void] {.async.} =
+  ## DEC-20 §6 and §8. Anything that is not the right token gets one 401 and
+  ## counts against the window; a caller over the limit gets 429 before its token
+  ## is even compared, which is why a correct token is refused inside the window.
+  if request.reqMethod != HttpPost:
+    var refusal = newHttpHeaders()
+    refusal["Content-Type"] = "application/json"
+    refusal["Allow"] = "POST"
+    await request.respond(Http405,
+      "{\"error\":{\"type\":\"method_not_allowed\",\"message\":\"POST\"}}", refusal)
+    return
+  let token = readAdminToken()
+  if token.isNone:
+    await respondGateMissing(request)
+    return
+  let now = epochTime()
+  pruneLoginFailures(gateway, now)
+  if gateway.loginFailures.len >= MaxAdminLoginFailures:
+    await respondJson(request, Http429, TooManyLoginsBody)
+    return
+  var supplied = ""
+  if request.body.len <= MaxLoginBodyBytes:
+    try:
+      let node = parseJson(request.body)
+      if node.kind == JObject and node.hasKey("token") and
+         node["token"].kind == JString:
+        supplied = node["token"].getStr()
+    except CatchableError:
+      # A body that is not this shape is a failed login, not a 400: the gate has
+      # one answer for "no valid token" and this is one of the ways to have none.
+      discard
+  if supplied.len == 0 or not constantTimeEquals(token.get, supplied):
+    gateway.loginFailures.add now
+    var headers = newHttpHeaders()
+    headers["Content-Type"] = "application/json"
+    headers["Cache-Control"] = "no-store"
+    await request.respond(Http401, adminDeniedBody(), headers)
+    return
+  let sessionId = startSession(gateway)
+  if sessionId.isNone:
+    await respondJson(request, Http500,
+      "{\"error\":{\"type\":\"session_unavailable\",\"message\":\"no session could be created\"}}")
+    return
+  var headers = newHttpHeaders()
+  headers["Set-Cookie"] = sessionCookie(sessionId.get, int(AdminSessionTtlS))
+  headers["Cache-Control"] = "no-store"
+  await request.respond(Http204, "", headers)
+
+proc handleSessionLogout(gateway: Gateway,
+                         request: Request): Future[void] {.async.} =
+  ## Idempotent on purpose: an unknown or absent cookie still drops nothing and
+  ## still clears the browser's copy, so a stale tab logs out in one click.
+  if request.reqMethod != HttpPost:
+    var refusal = newHttpHeaders()
+    refusal["Content-Type"] = "application/json"
+    refusal["Allow"] = "POST"
+    await request.respond(Http405,
+      "{\"error\":{\"type\":\"method_not_allowed\",\"message\":\"POST\"}}", refusal)
+    return
+  let id = sessionCookieValue(request)
+  if id.len > 0 and gateway.sessions.hasKey(id):
+    gateway.sessions.del id
+  var headers = newHttpHeaders()
+  headers["Set-Cookie"] = sessionCookie("", 0)
+  headers["Cache-Control"] = "no-store"
+  await request.respond(Http204, "", headers)
+
+
 proc handleStatic(gateway: Gateway,
                   request: Request): Future[void] {.async.} =
   ## The four pages, /assets/* and /fonts/*, from the compiled table only.
@@ -3944,6 +4223,15 @@ proc handleStatic(gateway: Gateway,
     await respondJson(request, Http404, notFoundBody())
     return
 
+  # DEC-20 §3. The five pages carry the numbers, so they sit behind the gate.
+  # `/login.html` and `/assets/*`, `/fonts/*` stay open: the form has to be
+  # reachable without a credential, and a stylesheet carries no state.
+  if isGatedPage(path):
+    case gateway.adminGate(request)
+    of agNoToken: await respondGateMissing(request)
+    of agDenied: await respondGateDenied(request, page = true)
+    of agOk: discard
+
   let entry = gateway.staticFiles[path]
   var headers = @[("Content-Type", entry.contentType),
                   ("Content-Length", $entry.body.len),
@@ -3965,7 +4253,13 @@ proc routeRequest(gateway: Gateway, request: Request): Future[void] {.async.} =
       # an explicit false keeps the shallow body.
       let deep = queryValue(parseQuery(request.url.query), "deep")
       if deep.isSome and deep.get.toLowerAscii() notin ["0", "false", "no"]:
-        await respondJson(request, Http200, gateway.deepHealthJson())
+        # DEC-20 §4: the shallow body is the deploy gate and stays open, because a
+        # rollback probe must not need a secret. `?deep` names legs, states and
+        # cooldowns, so it is the data surface and it is gated like /admin/state.
+        case gateway.adminGate(request)
+        of agNoToken: await respondGateMissing(request)
+        of agDenied: await respondGateDenied(request, page = false)
+        of agOk: await respondJson(request, Http200, gateway.deepHealthJson())
       else:
         await respondJson(request, Http200, healthzJson())
   elif path == "/v1/models":
@@ -3974,34 +4268,46 @@ proc routeRequest(gateway: Gateway, request: Request): Future[void] {.async.} =
       await respondJson(request, Http405, "{\"error\":\"method not allowed\"}")
     else:
       await respondJson(request, Http200, gateway.modelsJson())
+  elif path == "/session/login":
+    await gateway.handleSessionLogin(request)
+  elif path == "/session/logout":
+    await gateway.handleSessionLogout(request)
   elif path == "/metrics":
     # Prometheus scrapes a GET and nothing else. Text format, `prometheus` type
     # version 0.0.4, which every scraper in use reads.
     if request.reqMethod notin {HttpGet, HttpHead}:
       await respondJson(request, Http405, "{\"error\":\"method not allowed\"}")
     else:
-      let body = gateway.metricsText()
-      let headers = @[("Content-Type", "text/plain; version=0.0.4; charset=utf-8"),
-                      ("Cache-Control", "no-store"),
-                      ("Content-Length", $body.len)]
-      # A HEAD gets the same headers and no body, like every other read surface.
-      let payload = if request.reqMethod == HttpHead: "" else: body
-      await request.client.send(buildHead(200, headers) & payload)
+      case gateway.adminGate(request)
+      of agNoToken: await respondGateMissing(request)
+      of agDenied: await respondGateDenied(request, page = false)
+      of agOk:
+        let body = gateway.metricsText()
+        let headers = @[("Content-Type", "text/plain; version=0.0.4; charset=utf-8"),
+                        ("Cache-Control", "no-store"),
+                        ("Content-Length", $body.len)]
+        # A HEAD gets the same headers and no body, like every other read surface.
+        let payload = if request.reqMethod == HttpHead: "" else: body
+        await request.client.send(buildHead(200, headers) & payload)
   elif path.startsWith("/admin/"):
     # D11 point 4: any method but GET or HEAD under /admin/ is a 405 that names
     # GET, with no upstream dial and no state change. An unknown path under
     # /admin/ is a 404, so nothing else can grow there unnoticed.
     if request.reqMethod notin {HttpGet, HttpHead}:
       await respondMethodNotAllowed(request)
-    elif path == "/admin/state":
-      await respondJson(request, Http200, gateway.stateJson())
-    elif path == "/admin/log":
-      await gateway.handleAdminLog(request)
-    elif path == "/admin/config":
-      await respondJson(request, Http200, gateway.configJson())
     else:
-      await respondJson(request, Http404,
-                        "{\"error\":{\"type\":\"not_found\",\"message\":\"no such path\"}}")
+      case gateway.adminGate(request)
+      of agNoToken: await respondGateMissing(request)
+      of agDenied: await respondGateDenied(request, page = false)
+      of agOk:
+        if path == "/admin/state":
+          await respondJson(request, Http200, gateway.stateJson())
+        elif path == "/admin/log":
+          await gateway.handleAdminLog(request)
+        elif path == "/admin/config":
+          await respondJson(request, Http200, gateway.configJson())
+        else:
+          await respondJson(request, Http404, notFoundBody())
   elif path == "/v1/chat/completions":
     if request.reqMethod != HttpPost:
       await respondJson(request, Http405, "{\"error\":\"method not allowed\"}")

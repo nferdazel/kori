@@ -35,7 +35,7 @@ SERVICE="${KORI_SERVICE:-kori-api}"
 UNIT_DIR="${KORI_UNIT_DIR:-$HOME/.config/containers/systemd}"
 STATE_FILE="$APP_DIR/.deployed_rev"
 LOG="$APP_DIR/logs/deploy.log"
-HEALTH_URL="${KORI_HEALTH_URL:-http://127.0.0.1:8787/admin/state}"
+HEALTH_URL="${KORI_HEALTH_URL:-http://127.0.0.1:8787/healthz}"
 HEALTH_GATE_SECONDS="${KORI_HEALTH_GATE_SECONDS:-60}"
 
 # The edge block backup is a copy of the rendered block, so it carries the edge token. A run that
@@ -86,10 +86,12 @@ die() { log "ERROR: $*"; exit 1; }
 # silently (2026-11-18, 098e29b vs f76887a). Queued runs are harmless because the git sync
 # below re-reads origin/main after the lock is taken: the second one deploys the newest commit,
 # and the first has already done the earlier one.
-# The wait is bounded by the deploy itself, so a wedged deploy still fails this run and still
-# raises the alert instead of piling handlers up forever. 30 min covers the worst case a single
-# run can take: 15 min waiting for CI to publish the image, plus cosign retries and the two
-# health gates. A wedged deploy is the only way this expires.
+# The lock lives in the app directory, not /tmp. /tmp is world-writable (sticky, but still
+# readable and pre-creatable by any local user), so a lock file there can be planted before this
+# script opens it and the survivor deploys unguarded (Galih, 2026-11-19). $APP_DIR belongs to the
+# deploy user, which is where sds and qouver already keep theirs. The fd, the wait and the queue
+# behaviour are unchanged; only the path moved. preflight.sh reads the same path.
+LOCK_FILE="$APP_DIR/.deploy.lock"
 LOCK_WAIT_SECONDS="${KORI_LOCK_WAIT_SECONDS:-1800}"
 # The self-update below re-execs this same process. `exec 9>...` in the re-executed script would
 # replace the open file description and release the lock for a moment; a queued run could take it
@@ -97,7 +99,15 @@ LOCK_WAIT_SECONDS="${KORI_LOCK_WAIT_SECONDS:-1800}"
 # lock is held, and the fd check makes it true rather than trusted: an inherited marker with no
 # open fd 9 is not a held lock.
 if [ -z "${KORI_LOCK_HELD:-}" ] || [ ! -e /dev/fd/9 ]; then
-  exec 9>"/tmp/deploy-${SERVICE}.lock"
+  # Fail closed on a lock file this user does not control: a symlink or another owner's file
+  # would be locked in name only. 0600 on creation, and narrowed again on every run for a file
+  # an older deploy left wider.
+  if [ -L "$LOCK_FILE" ] || { [ -e "$LOCK_FILE" ] && [ ! -O "$LOCK_FILE" ]; }; then
+    die "lock file $LOCK_FILE is a symlink or owned by another user; refusing to take a lock someone else controls"
+  fi
+  ( umask 077; : >>"$LOCK_FILE" )
+  chmod 0600 "$LOCK_FILE" || die "could not narrow $LOCK_FILE to 0600"
+  exec 9>"$LOCK_FILE"
   if ! flock -w "$LOCK_WAIT_SECONDS" 9; then
     log "Deploy lock still held after ${LOCK_WAIT_SECONDS}s. Exiting."
     exit 1
@@ -210,7 +220,7 @@ unit_renders() {
   return 0
 }
 
-# smoke.sh is part of the release gate, not a suggestion: a container that answers /admin/state
+# smoke.sh is part of the release gate, not a suggestion: a container that answers /healthz
 # while its request log is unparseable, or that listens on a non-loopback address, is not a
 # deploy. Its output goes to its own log so a failed run is readable afterwards.
 SMOKE_LOG="$APP_DIR/logs/smoke.log"

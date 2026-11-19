@@ -2,12 +2,20 @@
 # smoke.sh — post-deploy checks for kori. Exit 0 only when every hard check passes.
 #
 # Checks, in order:
-#   1. GET /admin/state answers 200 and parses as JSON (this is the health probe; see OPS-SHIP §6.2)
-#   2. the listener is reachable on loopback and NOT on any non-loopback address
-#   3. the request log is append-only: the file never shrinks across a request, and its last line
+#   1. GET /healthz answers 200 and parses as JSON. This is the health probe and it stays open by
+#      design (DEC-20): the deploy gate must not need the admin token to learn that a container is
+#      up. /healthz?deep is gated like the rest of the data surface and is not probed here.
+#   2. admin surface, keyed on the token file the binary reads:
+#      - token available ($APP_DIR/etc/admin.token, or KORI_ADMIN_TOKEN as an explicit override):
+#        /admin/state and /metrics answer 200 with that bearer (sent on stdin, never argv)
+#      - no token   : /admin/state must answer 404 (no token file, fail closed) or 401 (token file
+#                     present, no bearer sent). Both are closed; the branch prints which one it saw.
+#                     Only a 200 fails: that is the open surface DEC-20 exists to prevent.
+#   3. the listener is reachable on loopback and NOT on any non-loopback address
+#   4. the request log is append-only: the file never shrinks across a request, and its last line
 #      parses as JSON. It does NOT prove one line per proxied request: that needs a real provider
 #      leg, and a smoke run must not spend tokens.
-#   4. edge, only when KORI_EDGE_URL is set: no bearer -> 401, wrong bearer -> 401, right bearer ->
+#   5. edge, only when KORI_EDGE_URL is set: no bearer -> 401, wrong bearer -> 401, right bearer ->
 #      405 with kori's own JSON body on a GET of the v1 chat path, and /admin/* stays unreachable
 #      from the edge. The body matters: a 405 alone can come from any proxy in front of the origin.
 set -euo pipefail
@@ -22,19 +30,60 @@ ok() { printf 'OK   %s\n' "$*"; }
 bad() { printf 'FAIL %s\n' "$*"; fail=1; }
 warn() { printf 'WARN %s\n' "$*"; }
 
-# ── 1. state endpoint ───────────────────────────────────────────────────────
-body="$(curl -fsS --max-time 5 "$BASE_URL/admin/state" 2>/dev/null || true)"
+# ── 1. health endpoint (open by design) ─────────────────────────────────────
+body="$(curl -fsS --max-time 5 "$BASE_URL/healthz" 2>/dev/null || true)"
 if [ -z "$body" ]; then
-  bad "GET /admin/state did not answer"
+  bad "GET /healthz did not answer"
 else
   if printf '%s' "$body" | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null; then
-    ok "GET /admin/state 200, valid JSON"
+    ok "GET /healthz 200, valid JSON"
   else
-    bad "GET /admin/state answered but the body is not JSON"
+    bad "GET /healthz answered but the body is not JSON"
   fi
 fi
 
-# ── 2. loopback only ────────────────────────────────────────────────────────
+# ── 2. admin surface: gated when a token exists, fail-closed when it does not ─
+# A bearer goes to curl as a config on stdin, never in argv: /proc/<pid>/cmdline is readable on
+# the host, so an argument would hand the admin token to any local process for the life of the
+# request. `printf` is a shell builtin, so no second process sees it either.
+admin_code() { curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$@"; }
+admin_code_auth() {
+  printf 'header = "Authorization: Bearer %s"\n' "$ADMIN_TOKEN" | admin_code -K - "$@"
+}
+# The token is read from the file the binary reads, not from this process's environment: this
+# deploy's env file is also the container's EnvironmentFile, so a copy of the token there lands in
+# the container's process environment for anything that can read /proc. KORI_ADMIN_TOKEN stays as
+# an explicit override for a manual run against a local binary.
+ADMIN_TOKEN="${KORI_ADMIN_TOKEN:-}"
+ADMIN_SOURCE="KORI_ADMIN_TOKEN"
+if [ -z "$ADMIN_TOKEN" ] && [ -r "$APP_DIR/etc/admin.token" ]; then
+  ADMIN_TOKEN="$(tr -d '\r\n' <"$APP_DIR/etc/admin.token")"
+  ADMIN_SOURCE="$APP_DIR/etc/admin.token"
+fi
+if [ -n "$ADMIN_TOKEN" ]; then
+  ok "admin checks use the token from $ADMIN_SOURCE"
+  c="$(admin_code_auth "$BASE_URL/admin/state")"
+  [ "$c" = "200" ] && ok "GET /admin/state with the admin bearer -> 200" \
+    || bad "GET /admin/state with the admin bearer -> $c (expected 200)"
+  c="$(admin_code_auth "$BASE_URL/metrics")"
+  [ "$c" = "200" ] && ok "GET /metrics with the admin bearer -> 200" \
+    || bad "GET /metrics with the admin bearer -> $c (expected 200)"
+else
+  # DEC-20 point 2 and the host reality: two closed answers are honest, and they mean different
+  # things. 404 = no token file on the host, the fail-closed branch. 401 = a token file exists and
+  # this request carried no bearer. Both prove the surface is not open; a gate that demanded 404
+  # would red on every correctly configured host the moment the operator creates the token file.
+  # 200 is the state that must never pass, and it is the only one this branch rejects by status.
+  c="$(admin_code "$BASE_URL/admin/state")"
+  case "$c" in
+    404) ok "GET /admin/state without a token -> 404 (no token file, fail closed)" ;;
+    401) ok "GET /admin/state without a token -> 401 (token file present, no bearer sent)" ;;
+    200) bad "GET /admin/state without a token -> 200 (the admin gate is open)" ;;
+    *) bad "GET /admin/state without a token -> $c (expected 404 or 401)" ;;
+  esac
+fi
+
+# ── 3. loopback only ────────────────────────────────────────────────────────
 # `ss` reports the publish address of the podman forward, which is what the host exposes.
 if command -v ss >/dev/null 2>&1; then
   if ss -ltn "sport = :$PORT" | grep -qE "0\.0\.0\.0:$PORT|\*:$PORT|\[::\]:$PORT"; then
@@ -48,11 +97,11 @@ else
   warn "ss not available, loopback check skipped"
 fi
 
-# ── 3. append-only log ──────────────────────────────────────────────────────
+# ── 4. append-only log ──────────────────────────────────────────────────────
 if [ -f "$LOG_FILE" ]; then
   before_size="$(stat -c %s "$LOG_FILE")"
   before_lines="$(wc -l <"$LOG_FILE")"
-  curl -fsS --max-time 20 -o /dev/null "$BASE_URL/admin/state" >/dev/null 2>&1 || true
+  curl -fsS --max-time 20 -o /dev/null "$BASE_URL/healthz" >/dev/null 2>&1 || true
   after_size="$(stat -c %s "$LOG_FILE")"
   if [ "$after_size" -lt "$before_size" ]; then
     bad "request log shrank ($before_size -> $after_size bytes)"

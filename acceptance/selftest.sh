@@ -270,5 +270,42 @@ req after-2 "$RUN/req.json"
 assert_eq "the stub answers before --after"  "$(http_code after-1)" "200"
 assert_eq "the stub fails from --after on"   "$(http_code after-2)" "401"
 
+# 11. DEC-20 gate helpers: the token fixture, the header, the cookie parsers.
+ADMIN_TOKEN_FILE="$RUN/gate.token"
+ADMIN_TOKEN_WRITE=1 admin_token_write
+assert_eq "the token fixture is written where KORI_ADMIN_TOKEN_FILE points" \
+  "$(cat "$ADMIN_TOKEN_FILE")" "$ADMIN_TOKEN_VALUE"
+assert_eq "the token fixture is mode 0600" "$(file_mode "$ADMIN_TOKEN_FILE")" "600"
+assert_eq "the token fixture ends in exactly one newline, which the gate trims" \
+  "$(wc -l <"$ADMIN_TOKEN_FILE" | tr -d ' ')" "1"
+assert_eq "the header helper builds one Authorization value" \
+  "$(admin_token_header)" "Authorization: Bearer $ADMIN_TOKEN_VALUE"
+ADMIN_TOKEN_FILE=
+assert_eq "with no override the fixture lives in RUN" "$(admin_token_path)" "$RUN/admin.token"
+
+# A Set-Cookie line as the contract spells it, plus a decoy header that must not
+# be mistaken for it.
+cat >"$RUN/sc.head" <<'HEAD'
+HTTP/1.1 204 No Content
+Set-Cookie: kori_admin=abc-DEF_123; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=43200
+X-Cookie: kori_admin=decoy
+HEAD
+assert_eq "the cookie value is read from Set-Cookie, not the decoy" \
+  "$(gate_cookie_value "$RUN/sc.head")" "abc-DEF_123"
+assert_eq "a header is read by name, case-insensitively" \
+  "$(gate_header "$RUN/sc.head" set-cookie | cut -c1-20)" "kori_admin=abc-DEF_1"
+assert_eq "an absent header reads as empty" "$(gate_header "$RUN/sc.head" Location)" ""
+cat >"$RUN/sc-none.head" <<'HEAD'
+HTTP/1.1 401 Unauthorized
+Content-Type: application/json
+HEAD
+assert_eq "no Set-Cookie reads as no cookie value" "$(gate_cookie_value "$RUN/sc-none.head")" ""
+
+# The 404 body helper accepts the standard not-found body and rejects a data body.
+printf '{"error":{"type":"not_found","message":"no such path"}}' >"$RUN/nf-good.json"
+printf '{"legs":[{"name":"leg-a"}]}' >"$RUN/nf-bad.json"
+assert_not_found_body "a not_found body passes" "$RUN/nf-good.json"
+rejects "a state body is not a not-found body" assert_not_found_body "404" "$RUN/nf-bad.json"
+
 kill_stubs
 finish

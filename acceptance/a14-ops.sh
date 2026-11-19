@@ -151,7 +151,8 @@ assert_eq "A14c /admin/config reports the policy" \
 echo
 echo "=== A14d: /metrics is the Prometheus text format"
 assert_eq "A14d /metrics answers 200" "$(admin_code '/metrics')" "200"
-curl -sS -o "$RUN/a14-metrics.txt" --max-time 5 "$GW_URL/metrics"
+curl -sS -o "$RUN/a14-metrics.txt" --max-time 5 \
+  -H "$(admin_token_header)" "$GW_URL/metrics"
 assert_present "A14d the exposition names its type" \
   "$RUN/a14-metrics.txt" "kori_requests_total"
 assert_present "A14d the histogram carries an +Inf bucket" \
@@ -163,11 +164,15 @@ assert_present "A14d route counters are labelled" \
 assert_eq "A14d the route counters sum to the requests this run made" \
   "$(awk '/^kori_requests_total\{/ {sum += $2} END {print sum+0}' "$RUN/a14-metrics.txt")" \
   "12"
+# The token is presented, so a 405 here proves the method rule and not the gate
+# (DEC-20 puts /metrics behind the token without changing what it accepts).
 assert_eq "A14d a POST is refused" \
   "$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 -X POST \
+      -H "$(admin_token_header)" \
       -H 'Content-Length: 0' "$GW_URL/metrics")" "405"
 assert_eq "A14d the content type is the text exposition" \
-  "$(curl -sS -o /dev/null -D - --max-time 5 "$GW_URL/metrics" 2>/dev/null \
+  "$(curl -sS -o /dev/null -D - --max-time 5 -H "$(admin_token_header)" \
+      "$GW_URL/metrics" 2>/dev/null \
       | tr -d '\r' | awk 'tolower($1)=="content-type:" {print $2}')" \
   "text/plain;"
 

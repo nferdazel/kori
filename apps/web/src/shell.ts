@@ -19,11 +19,34 @@ export function initShell(page: string): void {
   qq<HTMLAnchorElement>(".rail-nav a, .seg a").forEach((a) => {
     if (a.getAttribute("href") === page) a.setAttribute("aria-current", "page");
   });
+  const out = q<HTMLButtonElement>("[data-signout]");
+  out?.addEventListener("click", () => void signOut(out));
   const arc = q<SVGCircleElement>("[data-ring-arc]");
   if (arc) arc.setAttribute("stroke-dasharray", CIRC.toFixed(2));
   paintRing();
   paintRefreshed();
   window.setInterval(onTick, 1000);
+}
+
+// The cookie is what the dashboard holds on to, so leaving means telling the binary to drop the
+// session and then loading the login page. A dead endpoint still lands on the login page: the cookie
+// is HttpOnly, so this page cannot clear it, and a cookie the server no longer knows is harmless.
+async function signOut(button: HTMLButtonElement): Promise<void> {
+  button.disabled = true;
+  button.textContent = "signing out";
+  try {
+    // The gateway's own length check answers a bodyless POST with 411, so the empty body is sent
+    // explicitly. It reads no fields on this path.
+    await fetch("/session/logout", {
+      method: "POST",
+      headers: { Accept: "application/json", "Content-Type": "application/json" },
+      body: "{}",
+      cache: "no-store",
+    });
+  } catch {
+    /* the redirect below is the part that matters */
+  }
+  location.replace("/login.html");
 }
 
 export function setSentence(text: string, dead = false): void {
