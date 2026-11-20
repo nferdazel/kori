@@ -1033,6 +1033,17 @@ flock_calls="$(grep -c '^flock ' "$STATE/flock_calls.log" 2>/dev/null || true)"
   || fail "flock called $flock_calls time(s) across the re-exec"
 [ "$(cat "$APP_DIR/.deployed_rev")" = "$(head_sha)" ] && pass "self-update run deployed its commit" \
   || fail "self-update run did not deploy: $(cat "$APP_DIR/.deployed_rev") vs $(head_sha)"
+# Every helper in ops/scripts, not a hand-kept pair: on 2026-11-20 the host copy of
+# contract-check.sh was 379 lines behind the repo and kori-config.sh had never been installed,
+# because the sync loop only named smoke.sh and rollback.sh. Nothing failed while it aged.
+missing_helpers=""
+for f in "$WORK"/ops/scripts/*.sh; do
+  name="$(basename "$f")"
+  [ "$name" = "deploy-vps.sh" ] && continue
+  cmp -s "$f" "$APP_DIR/scripts/$name" || missing_helpers="$missing_helpers $name"
+done
+[ -z "$missing_helpers" ] && pass "every ops/scripts helper reached the app dir" \
+  || fail "helpers not synced:$missing_helpers"
 
 # ── scenario 18: a queued run that finds its commit already live does nothing ─
 # Three pushes during one deploy means three queued handlers. The first one deploys the newest

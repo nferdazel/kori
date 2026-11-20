@@ -167,8 +167,12 @@ if [ -f "$REPO_SCRIPT" ] && ! cmp -s "$REPO_SCRIPT" "$SELF_SCRIPT"; then
     && mv -f "$SELF_SCRIPT.new.$$" "$SELF_SCRIPT" \
     && SCRIPT_SWAPPED=1 && log "==> scripts/deploy-vps.sh updated from repo"
 fi
-for helper in smoke.sh rollback.sh; do
-  SRC="$MONO_DIR/ops/scripts/$helper"
+# Every helper, not a hand-kept list: a helper left out of the list drifts silently, because
+# nothing fails when the host copy ages. contract-check.sh on qouver1 was 379 lines behind the
+# repo and kori-config.sh was absent (found 2026-11-20). deploy-vps.sh is handled above.
+for SRC in "$MONO_DIR"/ops/scripts/*.sh; do
+  helper="$(basename "$SRC")"
+  [ "$helper" = "deploy-vps.sh" ] && continue
   DST="$APP_DIR/scripts/$helper"
   if [ -f "$SRC" ] && ! cmp -s "$SRC" "$DST"; then
     install -m 0755 "$SRC" "$DST.new.$$" && mv -f "$DST.new.$$" "$DST" \
