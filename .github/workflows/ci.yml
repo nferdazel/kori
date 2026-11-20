@@ -250,7 +250,7 @@ jobs:
       # place and this step never drifts from what a laptop runs. v6 is the line that reads a
       # pnpm 12 pin; v4 predates it.
       - name: Set up pnpm
-        uses: pnpm/action-setup@v6
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         with:
           # packageManager lives in apps/web, not at the repo root: without this the action
           # looks for a root package.json, finds none and fails with "No pnpm version is
