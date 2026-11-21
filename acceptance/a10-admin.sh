@@ -114,5 +114,69 @@ echo "=== A10h: read-only, in the two ways that are observable from outside"
 assert_eq "A10h no admin call dialled a leg" "$(dials leg-a)" "0"
 assert_eq "A10h no admin call wrote a request line" "$(log_count)" "$before"
 
+echo
+echo "=== A10i: a malformed log parameter is a 400 that names it (§5.2)"
+# Every branch below refuses at its own value and never reaches the file, so a
+# bad parameter can be told apart from a page that legitimately has no rows.
+log_param_refused() { # label query parameter outfile
+  assert_eq "$1 answers 400" "$(admin_get "$RUN/$4" "/admin/log?$2")" "400"
+  assert_eq "$1 names '$3'" \
+    "$(jq -r '.error.type + "/" + .error.message' "$RUN/$4" 2>/dev/null)" \
+    "bad_request/$3"
+}
+log_param_refused "A10i a since that is not an instant" "since=yesterday" since a10-bad-since.json
+log_param_refused "A10i a since without an offset" \
+  "since=2026-11-16T09%3A53%3A20" since a10-bad-since-offset.json
+log_param_refused "A10i a negative offset" "offset=-1" offset a10-bad-offset-neg.json
+log_param_refused "A10i an offset that is not a number" "offset=ten" offset a10-bad-offset-text.json
+log_param_refused "A10i a status_class outside 2xx/4xx/5xx" \
+  "status_class=3xx" status_class a10-bad-class.json
+log_param_refused "A10i a stream outside true/false" "stream=maybe" stream a10-bad-stream.json
+log_param_refused "A10i a limit below one" "limit=0" limit a10-bad-limit-zero.json
+log_param_refused "A10i a limit that is not a number" "limit=ten" limit a10-bad-limit-text.json
+
+echo
+echo "=== A10j: a well-formed filter narrows the page"
+# The seeded lines are all 200 with stream=false on leg-b, so a filter that keeps
+# them is distinguishable from one that matches nothing, and neither is a 400.
+assert_eq "A10j status_class=2xx answers 200" \
+  "$(admin_get "$RUN/a10-f-class2.json" '/admin/log?status_class=2xx')" "200"
+assert_eq "A10j status_class=2xx keeps 50 rows" \
+  "$(log_row_count "$RUN/a10-f-class2.json")" "50"
+assert_eq "A10j status_class=4xx matches nothing" \
+  "$(admin_get "$RUN/a10-f-class4.json" '/admin/log?status_class=4xx')" "200"
+assert_eq "A10j status_class=4xx is an empty page" \
+  "$(log_row_count "$RUN/a10-f-class4.json")" "0"
+assert_eq "A10j stream=true matches nothing" \
+  "$(admin_get "$RUN/a10-f-stream.json" '/admin/log?stream=true')" "200"
+assert_eq "A10j stream=true is an empty page" \
+  "$(log_row_count "$RUN/a10-f-stream.json")" "0"
+assert_eq "A10j stream=false keeps the rows" \
+  "$(admin_get "$RUN/a10-f-nostream.json" '/admin/log?stream=false')" "200"
+assert_eq "A10j stream=false keeps 50 rows" \
+  "$(log_row_count "$RUN/a10-f-nostream.json")" "50"
+assert_eq "A10j an unknown route matches nothing" \
+  "$(admin_get "$RUN/a10-f-route.json" '/admin/log?route=nope')" "200"
+assert_eq "A10j an unknown route is an empty page" \
+  "$(log_row_count "$RUN/a10-f-route.json")" "0"
+assert_eq "A10j an offset past the end is a page, not a 400" \
+  "$(admin_get "$RUN/a10-f-offset.json" '/admin/log?offset=999999')" "200"
+assert_eq "A10j an offset past the end is empty" \
+  "$(log_row_count "$RUN/a10-f-offset.json")" "0"
+
+since_ts=$(tail -n 30 "$GW_LOG" | head -1 | jq -r '.ts')
+# A "+07:00" offset carries a `+`, which a query string reads as a space. The
+# instant is percent-encoded so the value reaching the handler is the one written.
+since_q=$(printf '%s' "$since_ts" | sed 's/+/%2B/g')
+assert_eq "A10j a since answers 200" \
+  "$(admin_get "$RUN/a10-f-since.json" "/admin/log?since=$since_q")" "200"
+assert_eq "A10j a since keeps the 30 newest rows" \
+  "$(log_row_count "$RUN/a10-f-since.json")" "30"
+assert_eq "A10j the oldest kept row is the since line" \
+  "$(log_row "$RUN/a10-f-since.json" 29 ts)" "$since_ts"
+assert_eq "A10j every kept row is at or after the since instant" \
+  "$(jq -c '[.rows[].ts]' "$RUN/a10-f-since.json" | \
+     jq -c --arg s "$since_ts" 'all(. >= $s)')" "true"
+
 kill_stubs
 finish
