@@ -1185,6 +1185,51 @@ grep -q 'KORI_EDGE_TOKEN is empty; the ai.qouver.com' "$APP_DIR/logs/deploy.log"
   || fail "an edge-less deploy recorded nothing"
 unset FAKE_CURL
 
+# ── scenario 3l: an unchanged edge block does not restart caddy ─────────────
+# Caddy's unit sets TimeoutStopSec=5s, so `systemctl restart caddy` SIGKILLs it and cuts every
+# stream in flight. The deploy restarted it on every run regardless, because the render always
+# rewrote the file: qouver1's journal carried four `Failed with result 'timeout'` lines by
+# 2026-11-21 for a block that had barely changed. An identical render must be a no-op.
+reset_state
+# Scenario 20 above leaves an empty edge token on purpose; this one needs a real one.
+printf 'KORI_EDGE_TOKEN=dryrun-token\n' >"$APP_DIR/env/kori-prod.env"
+happy_image
+export FAKE_CURL=ok
+rc="$(run refs/heads/main)"
+[ "$rc" = "0" ] && pass "first deploy with an edge block exits 0" || fail "first edge deploy exited $rc"
+[ -f "$APP_DIR/caddy/site.caddy" ] && pass "the first deploy renders the block" \
+  || fail "the first deploy rendered nothing"
+: >"$STATE/calls.log"
+# The second run must get past the "already at this revision" stop to reach the render at all.
+export KORI_FORCE_DEPLOY=1
+rc="$(run refs/heads/main)"
+[ "$rc" = "0" ] && pass "redeploy with an identical block exits 0" || fail "identical redeploy exited $rc"
+grep -q 'sudo systemctl restart caddy' "$STATE/calls.log" \
+  && fail "caddy was restarted for a byte-identical block" \
+  || pass "an unchanged edge block does not restart caddy"
+grep -q 'edge block unchanged' "$APP_DIR/logs/deploy.log" \
+  && pass "the skip is announced in the deploy log" \
+  || fail "the skip is silent: $(tail -3 "$APP_DIR/logs/deploy.log")"
+leaked="$(find "$APP_DIR/caddy" -mindepth 1 -maxdepth 1 ! -name site.caddy -print 2>/dev/null)"
+[ -z "$leaked" ] && pass "a skipped render leaves no token-bearing backup" \
+  || fail "a skipped render left a backup behind: $leaked"
+
+# ── scenario 3m: a rotated edge token still restarts caddy ─────────────────
+# The comparison is on the rendered bytes, so the skip above must not become a way to keep serving
+# a bearer nobody chose.
+reset_state
+printf 'KORI_EDGE_TOKEN=rotated-dryrun-token\n' >"$APP_DIR/env/kori-prod.env"
+happy_image
+export FAKE_CURL=ok
+rc="$(run refs/heads/main)"
+[ "$rc" = "0" ] && pass "a token rotation deploys ($rc)" || fail "a token rotation exited $rc"
+unset KORI_FORCE_DEPLOY
+grep -q 'sudo systemctl restart caddy' "$STATE/calls.log" \
+  && pass "a rotated token restarts caddy" || fail "a rotated token did not reach caddy"
+grep -q 'rotated-dryrun-token' "$APP_DIR/caddy/site.caddy" \
+  && pass "the new bearer is in the rendered block" || fail "the block still carries the old bearer"
+printf 'KORI_EDGE_TOKEN=dryrun-token\n' >"$APP_DIR/env/kori-prod.env"
+
 printf '\n%s\n' "artifacts: $ROOT"
 if [ "$FAILS" -eq 0 ]; then
   printf 'RESULT: all scenarios passed\n'

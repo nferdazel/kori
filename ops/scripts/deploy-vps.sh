@@ -574,10 +574,13 @@ fi
 if [ -n "${KORI_EDGE_TOKEN:-}" ]; then
   RENDERED="$APP_DIR/caddy/site.caddy"
   mkdir -p "$APP_DIR/caddy"
-  # The token is substituted by the shell, never by sed/awk: an external process would carry it in
-  # argv, where every user on the host can read it from `ps` while the process lives. The temp file
-  # is created by the shell at 0600 (umask 077), raised to 0640 only once its content is complete,
-  # then renamed into place — no world-readable copy exists at any point.
+  # An unchanged block is not rewritten and, above all, not restarted. Caddy's own unit sets
+  # TimeoutStopSec=5s, so a restart SIGKILLs it: every in-flight completion and every SSE stream
+  # is cut. Measured on qouver1, 2026-11-21: the journal carries four `Failed with result
+  # 'timeout'` lines and the deploy log fifteen "rendered edge block" lines, almost all of them
+  # for an identical file — the block only changes when the template or the token does.
+  # The token is not compared here, so a rotated token still restarts: the rendered bytes differ.
+  RENDER_CHANGED=0
   CADDY_BAK=""
   if [ -f "$RENDERED" ]; then
     CADDY_BAK="$RENDERED.prev.$$"
@@ -596,67 +599,83 @@ if [ -n "${KORI_EDGE_TOKEN:-}" ]; then
     printf '%s\n' "$out" >>"$RENDERED.tmp.$$"
   done <"$EDGE_TEMPLATE"
   chmod 0640 "$RENDERED.tmp.$$"
-  mv -f "$RENDERED.tmp.$$" "$RENDERED"
-  umask "$OLD_UMASK"
-  # SELinux: Caddy runs as httpd_t and must be able to read this file (team note, 2026-11-15).
-  restorecon "$RENDERED" 2>/dev/null || true
-  log "==> rendered edge block $RENDERED"
-  # Validate before the restart. A block that does not adapt takes every site on this host down
-  # with it: the first run carried `servers` inside a site block (a global-only option), Caddy
-  # exited 1 and the whole edge was dark until the import was commented out by hand (2026-11-16).
-  # `caddy validate` adapts /etc/caddy/Caddyfile, which imports the block just rendered, so it
-  # catches this with zero downtime. It needs root for the same reason the restart does.
-  # The output goes to a 0600 file and is logged with the token masked: an adapt error quotes the
-  # offending line, and one of those lines carries the bearer.
-  VALIDATE_LOG="$(umask 077; mktemp)"
-  # The redirect stays on the deploy user's side on purpose: the file is created 0600 by mktemp,
-  # and `sudo tee` would need root to write into a path the script then has to read back.
-  # shellcheck disable=SC2024
-  if ! sudo caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >"$VALIDATE_LOG" 2>&1; then
-    log "ERROR: the rendered block does not validate; restoring the previous one, caddy untouched"
-    if [ -n "$CADDY_BAK" ]; then
-      mv -f "$CADDY_BAK" "$RENDERED"
-    else
-      # Never remove the file: /etc/caddy/Caddyfile imports it unconditionally, and a missing
-      # import target makes Caddy refuse to start ("File to import not found"), so the next
-      # restart would take every site down. A comment-only block adapts to nothing.
-      printf '# kori edge block withdrawn: the rendered block did not validate\n' >"$RENDERED"
-    fi
-    # Masking happens in the shell, not through sed: the token must never reach another
-    # process's argv, which is the same rule the render itself follows.
-    tail -n 5 "$VALIDATE_LOG" | while IFS= read -r vline; do
-      log "    caddy: ${vline//$KORI_EDGE_TOKEN/<redacted>}"
-    done
-    rm -f "$VALIDATE_LOG"
-    exit 1
-  fi
-  rm -f "$VALIDATE_LOG"
-  log "==> edge block validates (caddy validate)"
-  # `admin off` on qouver1 makes `caddy reload` fail every time; restart is the switch.
-  # A Caddy that cannot load the new block takes every site on this host down with it, so a failed
-  # restart is not a warning: put back the block that was serving, restart once more, and fail the
-  # deploy either way. The journal lines copied below carry no token.
-  if sudo systemctl restart caddy; then
-    if [ -n "$CADDY_BAK" ]; then rm -f "$CADDY_BAK"; fi
+  # Compared before the rename, against the file that is serving right now. `cmp` reads both sides;
+  # neither copy leaves the deploy user, and the temp is already 0600 by the umask above.
+  if [ -f "$RENDERED" ] && cmp -s "$RENDERED.tmp.$$" "$RENDERED"; then
+    rm -f "$RENDERED.tmp.$$"
+    umask "$OLD_UMASK"
+    rm -f "$CADDY_BAK"; CADDY_BAK=""
+    log "==> edge block unchanged, not re-rendered and caddy not restarted"
   else
-    log "ERROR: caddy rejected the rendered block; restoring the previous one"
-    if [ -n "$CADDY_BAK" ]; then
-      mv -f "$CADDY_BAK" "$RENDERED"
-    else
-      # No previous block existed, so the last state Caddy loaded is "no file at this path".
-      rm -f "$RENDERED"
+    mv -f "$RENDERED.tmp.$$" "$RENDERED"
+    umask "$OLD_UMASK"
+    RENDER_CHANGED=1
+  fi
+  if [ "$RENDER_CHANGED" = "1" ]; then
+    # SELinux: Caddy runs as httpd_t and must be able to read this file (team note, 2026-11-15).
+    restorecon "$RENDERED" 2>/dev/null || true
+    log "==> rendered edge block $RENDERED"
+  fi
+  if [ "$RENDER_CHANGED" = "1" ]; then
+    # Validate before the restart. A block that does not adapt takes every site on this host down
+    # with it: the first run carried `servers` inside a site block (a global-only option), Caddy
+    # exited 1 and the whole edge was dark until the import was commented out by hand (2026-11-16).
+    # `caddy validate` adapts /etc/caddy/Caddyfile, which imports the block just rendered, so it
+    # catches this with zero downtime. It needs root for the same reason the restart does.
+    # The output goes to a 0600 file and is logged with the token masked: an adapt error quotes the
+    # offending line, and one of those lines carries the bearer.
+    VALIDATE_LOG="$(umask 077; mktemp)"
+    # The redirect stays on the deploy user's side on purpose: the file is created 0600 by mktemp,
+    # and `sudo tee` would need root to write into a path the script then has to read back.
+    # shellcheck disable=SC2024
+    if ! sudo caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >"$VALIDATE_LOG" 2>&1; then
+      log "ERROR: the rendered block does not validate; restoring the previous one, caddy untouched"
+      if [ -n "$CADDY_BAK" ]; then
+        mv -f "$CADDY_BAK" "$RENDERED"
+        CADDY_BAK=""
+      else
+        # Never remove the file: /etc/caddy/Caddyfile imports it unconditionally, and a missing
+        # import target makes Caddy refuse to start ("File to import not found"), so the next
+        # restart would take every site down. A comment-only block adapts to nothing.
+        printf '# kori edge block withdrawn: the rendered block did not validate\n' >"$RENDERED"
+      fi
+      # Masking happens in the shell, not through sed: the token must never reach another
+      # process's argv, which is the same rule the render itself follows.
+      tail -n 5 "$VALIDATE_LOG" | while IFS= read -r vline; do
+        log "    caddy: ${vline//$KORI_EDGE_TOKEN/<redacted>}"
+      done
+      rm -f "$VALIDATE_LOG"
+      exit 1
     fi
+    rm -f "$VALIDATE_LOG"
+    log "==> edge block validates (caddy validate)"
+    # `admin off` on qouver1 makes `caddy reload` fail every time; restart is the switch.
+    # A Caddy that cannot load the new block takes every site on this host down with it, so a failed
+    # restart is not a warning: put back the block that was serving, restart once more, and fail the
+    # deploy either way. The journal lines copied below carry no token.
     if sudo systemctl restart caddy; then
-      log "ERROR: caddy answers again with the previous block; deploy of ${SHORT} REJECTED at the edge"
+      if [ -n "$CADDY_BAK" ]; then rm -f "$CADDY_BAK"; CADDY_BAK=""; fi
     else
-      log "ERROR: caddy did not restart even with the previous block restored — the public edge is down, human needed"
+      log "ERROR: caddy rejected the rendered block; restoring the previous one"
+      if [ -n "$CADDY_BAK" ]; then
+        mv -f "$CADDY_BAK" "$RENDERED"
+        CADDY_BAK=""
+      else
+        # No previous block existed, so the last state Caddy loaded is "no file at this path".
+        rm -f "$RENDERED"
+      fi
+      if sudo systemctl restart caddy; then
+        log "ERROR: caddy answers again with the previous block; deploy of ${SHORT} REJECTED at the edge"
+      else
+        log "ERROR: caddy did not restart even with the previous block restored — the public edge is down, human needed"
+      fi
+      if command -v journalctl >/dev/null 2>&1; then
+        journalctl -u caddy -n 20 --no-pager 2>&1 | while IFS= read -r jline; do log "    caddy: $jline"; done
+      else
+        log "    (journalctl not available here; read the caddy unit journal by hand)"
+      fi
+      exit 1
     fi
-    if command -v journalctl >/dev/null 2>&1; then
-      journalctl -u caddy -n 20 --no-pager 2>&1 | while IFS= read -r jline; do log "    caddy: $jline"; done
-    else
-      log "    (journalctl not available here; read the caddy unit journal by hand)"
-    fi
-    exit 1
   fi
 else
   # Not fatal: a host can be deliberately edge-less. But it must not be silent. The block on disk
