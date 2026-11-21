@@ -14,6 +14,7 @@ const staticEntries* = [
   (path: "/assets/login-CbidIkjX.js", contentType: "text/javascript; charset=utf-8", body: staticRead("../../../web/dist/assets/login-CbidIkjX.js")),
   (path: "/assets/main-BP9IWkI8.js", contentType: "text/javascript; charset=utf-8", body: staticRead("../../../web/dist/assets/main-BP9IWkI8.js")),
   (path: "/config.html", contentType: "text/html; charset=utf-8", body: staticRead("../../../web/dist/config.html")),
+  (path: "/favicon.svg", contentType: "image/svg+xml", body: staticRead("../../../web/dist/favicon.svg")),
   (path: "/fonts/inter-latin-var.woff2", contentType: "font/woff2", body: staticRead("../../../web/dist/fonts/inter-latin-var.woff2")),
   (path: "/fonts/jetbrains-mono-latin-var.woff2", contentType: "font/woff2", body: staticRead("../../../web/dist/fonts/jetbrains-mono-latin-var.woff2")),
   (path: "/index.html", contentType: "text/html; charset=utf-8", body: staticRead("../../../web/dist/index.html")),
