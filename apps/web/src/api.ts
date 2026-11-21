@@ -38,9 +38,36 @@ function landedOnLogin(response: Response): boolean {
   }
 }
 
+// A read against a loopback admin endpoint answers in milliseconds, and the shell refreshes every
+// 5 s. A timeout that outlives the tick would starve the next refresh, so it sits under it: one stuck
+// read costs one tick, never the page. The shell also carries a watchdog of its own, past this, for a
+// promise that hangs above fetch.
+export const READ_TIMEOUT_MS = 4000;
+
+export function readSignal(ms = READ_TIMEOUT_MS): { signal: AbortSignal; cancel: () => void } {
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), ms);
+  return { signal: controller.signal, cancel: () => window.clearTimeout(timer) };
+}
+
+export function isTimeout(e: unknown): boolean {
+  return e instanceof DOMException && e.name === "AbortError";
+}
+
+export function timeoutMessage(ms = READ_TIMEOUT_MS): string {
+  return `no answer within ${ms / 1000}s`;
+}
+
+export const READ_TIMEOUT_S = READ_TIMEOUT_MS / 1000;
+
 async function getJson<T>(path: string): Promise<Fetched<T>> {
+  const { signal, cancel } = readSignal();
   try {
-    const response = await fetch(path, { headers: { Accept: "application/json" }, cache: "no-store" });
+    const response = await fetch(path, {
+      headers: { Accept: "application/json" },
+      cache: "no-store",
+      signal,
+    });
     if (response.status === 401 || landedOnLogin(response)) {
       goToLogin();
       return { ok: false, status: 401, message: "not signed in" };
@@ -63,7 +90,10 @@ async function getJson<T>(path: string): Promise<Fetched<T>> {
     }
     return { ok: true, data: body as T };
   } catch (e) {
+    if (isTimeout(e)) return { ok: false, status: 0, message: timeoutMessage() };
     return { ok: false, status: 0, message: e instanceof Error ? e.message : "network error" };
+  } finally {
+    cancel();
   }
 }
 

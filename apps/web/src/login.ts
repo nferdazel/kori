@@ -4,6 +4,7 @@
 
 import "./app.css";
 import { q } from "./dom";
+import { isTimeout, READ_TIMEOUT_S, readSignal } from "./api";
 
 const form = q<HTMLFormElement>("[data-login]");
 const input = q<HTMLInputElement>("#token");
@@ -64,6 +65,7 @@ function message(status: number): string {
 async function signIn(token: string): Promise<void> {
   setBusy(true);
   clearError();
+  const { signal, cancel } = readSignal();
   let response: Response;
   try {
     response = await fetch("/session/login", {
@@ -72,13 +74,20 @@ async function signIn(token: string): Promise<void> {
       body: JSON.stringify({ token }),
       credentials: "same-origin",
       cache: "no-store",
+      signal,
     });
-  } catch {
+  } catch (e) {
     // The field keeps what was typed, so a retry does not need the token again.
     setBusy(false);
-    showError("Could not reach the gateway. Check the connection and try again.");
+    showError(
+      isTimeout(e)
+        ? `The gateway did not answer within ${READ_TIMEOUT_S}s. Try again.`
+        : "Could not reach the gateway. Check the connection and try again.",
+    );
     input?.focus();
     return;
+  } finally {
+    cancel();
   }
   if (response.status === 204) {
     // replace, not assign: the login page stays out of the back history.
