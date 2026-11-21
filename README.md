@@ -354,7 +354,7 @@ for drift in CI, so a stale embed fails the build instead of shipping an old pag
 apps/api/       Nim gateway source, Dockerfile
 apps/api/src/generated/static_files.nim   dashboard compiled into the binary
 apps/web/       dashboard source (vite, TypeScript) and the committed dist
-acceptance/     A1-A13 harness, lib.sh, stub.py, self-test
+acceptance/     A1-A17 harness, lib.sh, stub.py, self-test
 ops/            deploy, rollback and smoke scripts, Caddy, env, systemd, webhook templates
 tests/          unit tests and the dry runs ./task ops calls
 tools/          gen-static.sh
@@ -587,6 +587,45 @@ The deploy, rollback and smoke scripts probe `/healthz`, never `/admin/state`. A
 file is missing deploys green while the dashboard answers `404`: that is the fail-closed default,
 not a failed deploy. If the dashboard is dark after a deploy, check the file exists, is readable and
 is not empty inside the container.
+
+### The readiness probe
+
+`ops/systemd/kori-readyz.service` and `ops/systemd/kori-readyz.timer` are the only thing on the
+host that notices a gateway which is up and no longer answering. `Restart=always` reacts to a
+process that exits; `OnFailure=alert@kori-api.service` on the container unit only fires when the
+unit itself fails. A wedged process, or a container up with the port dead, was silent until this
+probe existed.
+
+`deploy-vps.sh` installs both units into `~/.config/systemd/user` (not the Quadlet directory: systemd
+answers `LoadState=not-found` for a timer placed there) and runs `systemctl --user enable --now
+kori-readyz.timer`. An unchanged unit is not rewritten, so a normal deploy does not restart the timer.
+
+The probe is one `curl --fail` against `http://127.0.0.1:8787/healthz`, every five minutes with up
+to 30 s of randomised delay. It asks `/healthz` and not `/admin/state` on purpose: `/healthz` is open
+by design (`DEC-20`), so the probe needs no credential and cannot go red because a token file is
+missing or unreadable. Liveness and the gate are two different questions, and only the first one is
+"It is 3 AM and the gateway is dead".
+
+Reading a probe failure, and reproducing it by hand:
+
+```sh
+systemctl --user status kori-readyz.timer kori-readyz.service   # last run, next run
+journalctl --user -u kori-readyz.service -n 20                  # what curl answered
+curl -sS --fail --max-time 10 http://127.0.0.1:8787/healthz     # the same check, by hand
+```
+
+A failed run exits non-zero, and `OnFailure=alert@%N.service` pages through the same sink the rest of
+the host uses. A deliberate stop also trips it: `deploy-vps.sh` restarts the unit to load the new
+image, and `rollback.sh` restarts it again, so a probe failure inside or just after a deploy is the
+deploy, not an outage. Read it together with the deploy log:
+
+```sh
+tail -n 40 /srv/qouver/apps/kori/logs/deploy.log   # was a deploy running at that minute?
+```
+
+A failure with no deploy and no rollback in that window is the real thing: pages even though
+nothing was touched. Start with `journalctl --user -u kori-api -n 50` and the request log, and if the
+gateway is really down, `ops/scripts/rollback.sh` puts the `:prev` image back.
 
 ## Documentation
 

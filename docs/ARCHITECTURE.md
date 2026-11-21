@@ -163,12 +163,19 @@ network, which is why it can run in the `Nim` job before the release build.
 ## Ops templates
 
 `ops/` mirrors the host shape one to one: `deploy-vps.sh`, `rollback.sh`, `smoke.sh`,
-`preflight.sh`, `contract-check.sh`, a Caddy site template, an env template, a Quadlet unit and a
-webhook definition. They are the contract the deploy runs to, not a taping of one host: the
-host-side pieces (hook install, clone, env file, config file, Caddy import line) live on the host
-and are owned by the deploy owner, not by this repository. qouver1 has run kori behind the Caddy
-edge since 2026-11-18; which revision is on it right now is recorded there in `.deployed_rev`, and
-a document that repeated it here would be wrong after the next deploy.
+`preflight.sh`, `contract-check.sh`, a Caddy site template, an env template, a Quadlet unit, the
+`kori-readyz` readiness probe and a webhook definition. They are the contract the deploy runs to,
+not a taping of one host: the host-side pieces (hook install, clone, env file, config file, Caddy
+import line) live on the host and are owned by the deploy owner, not by this repository. qouver1 has
+run kori behind the Caddy edge since 2026-11-18; which revision is on it right now is recorded there
+in `.deployed_rev`, and a document that repeated it here would be wrong after the next deploy.
+
+Two different checks watch the process, and they answer different questions. The deploy gate asks
+`/healthz` once, at the end of a deploy, and rolls back to `:prev` if it does not answer. The
+readiness probe asks the same route every five minutes from a separate systemd user unit and pages
+through `OnFailure=alert@`; it covers the window the deploy gate cannot see, a process that is still
+running and stopped answering. The probe reads `/healthz` rather than `/healthz?deep`, which is
+gated: a credential missing from the host must not be able to page as an outage.
 
 ## Not built
 

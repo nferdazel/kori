@@ -11,6 +11,18 @@ this one, is the answer to "what is live".
 
 ## [Unreleased]
 
+### Added
+
+- A readiness probe for the gateway: `kori-readyz.service` and `kori-readyz.timer` ask
+  `/healthz` every five minutes and page through the host's `alert@` unit when the answer is
+  not `200`. `Restart=always` reacts to a process that exits, and nothing reacted to one that
+  stays up and stops answering; `OnFailure=` on `kori-api` itself had never fired on qouver1.
+  `/healthz` is the probe target on purpose: it stays open (`DEC-20`), so the probe needs no
+  credential and cannot fail because a token file went missing. `deploy-vps.sh` installs both
+  units into `~/.config/systemd/user`, not the quadlet directory, where systemd answers
+  `LoadState=not-found` for a timer. A deliberate stop (a deploy or a rollback) trips the probe
+  too; that is the intended signal, and `README.md` says how to read it.
+
 ### Fixed
 
 - `deploy-vps.sh` treated a missing `scripts/smoke.sh` as a passed release gate
@@ -24,13 +36,50 @@ this one, is the answer to "what is live".
   to `.deployed_rev` instead of `rollback-from-<sha>` — a phrase every later deploy read as
   `PREV_MAIN` and silently fell back to `REV^`.
 - `preflight.sh` checks `cosign`, which `deploy-vps.sh` hard-requires before it tags `:local`.
+- `ops/scripts/kori-config.sh --force` renamed the new provider config over the live one and kept
+  nothing, on the one file that holds every credential and whose usual reason for being rewritten
+  is that the new values do not work. The old file is now copied 0600 beside it (`.bak-<stamp>`)
+  before the rename, and the newest two are kept.
 
 ### Changed
 
+- `deploy-vps.sh` no longer restarts Caddy for a byte-identical edge block. The render always
+  rewrote `caddy/site.caddy`, so every deploy ran `systemctl restart caddy`, and Caddy's own unit
+  sets `TimeoutStopSec=5s`: the restart was a `SIGKILL` that cut every completion and every SSE
+  stream in flight (four `Failed with result 'timeout'` lines in qouver1's journal by 2026-11-21).
+  The rendered bytes are now compared against the file that is serving, and an identical block
+  skips both the rename and the restart. The comparison is on the rendered output and not on the
+  template, so a rotated `KORI_EDGE_TOKEN` still restarts. Validate and rollback are unchanged.
+- `./task gate-full` runs `acceptance/run-all.sh`, the same end-to-end suite CI's `nim` job runs. It
+  ran `acceptance/selftest.sh`, which proves the harness's own assertions fire both ways and never
+  touches the router, so the laptop gate was green on a tree CI would fail. A green local gate now
+  means what CI means, at the cost of the suite's runtime.
 - CI runs the same shellcheck file list as `./task ops` (`task` and `tools/gen-version.sh` were
   never linted there), the new `tests/dryrun-rollback.sh`, and `tests/dryrun-config.sh` with the
   built binary, so the config-fill and real-parser block finally run in CI.
 - `retention.yml` drops the `OWNER` env the prune script never reads.
+
+### Security
+
+- The anonymous transport is bounded before anything is buffered. `MaxRequestBytes` is 8 MiB, down
+  from 32 MiB, and the declared `Content-Length` is now checked on the framing pass, so an oversized
+  body is a `413` with memory flat instead of an allocation: one 30 MiB `POST /session/login` used to
+  move RSS from 6 MB to 190 MB inside a 512M container and then answer `401`. `readTimeout` is 30 s,
+  so a half-sent header block is released with a `408` instead of holding its socket and buffers for
+  the life of the process.
+- The login window throttles a failed attempt, not the credential (`DEC-21`, narrowing two
+  sentences of `DEC-20`). `/session/login` is reachable unauthenticated, so the global counter let
+  five wrong tokens lock the owner out of their own dashboard for the rest of every window, for
+  about one request a minute. The token is compared first; only a mismatch is counted and `429`'d,
+  so the throttle survives and the lockout an anonymous caller could trigger is gone.
+- `ai.qouver.com` and `dash.qouver.com` import the host's shared `(security)` snippet, so both legs
+  answer `Strict-Transport-Security`, `X-Frame-Options` and `Referrer-Policy`. They were the only
+  site blocks on the host that did not, and Cloudflare forwards what the origin sends, so the header
+  could come from nowhere else. `smoke.sh` asserts the HSTS header with the real bearer instead of
+  status codes alone, and a dryrun scenario requires it to go red against a header-less origin.
+- `respondJson` and `respondMethodNotAllowed` set `no-store` and `nosniff` in one place instead of
+  the four routes that each forgot them, and `/metrics`, which builds its headers by hand, sets
+  `nosniff` itself. `HEAD` now declares the length a `GET` answers and sends no body.
 
 ## [0.8.2] - 2026-11-20
 
