@@ -11,6 +11,14 @@ this one, is the answer to "what is live".
 
 ## [Unreleased]
 
+### Fixed
+
+- `acceptance/a18-log-write.sh` now proves the serving leg by counting the stub's dials instead of
+  reading `.route` off the request log that the case itself breaks with `ulimit -f`. BSD let one
+  append through the cap and Linux refused it, so the same tree passed on macOS and failed on the
+  Ubuntu runner; v0.9.0's tag pointed at a commit whose CI was red for that reason. Test-only
+  change: the gateway binary is byte-identical to 0.9.0.
+
 ## [0.9.0] - 2026-11-21
 
 ### Added
