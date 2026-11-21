@@ -13,7 +13,9 @@ task — one entry point for the checks CI runs.
   ./task check   everything below, in CI order
   ./task ops     shellcheck + deploy/smoke/preflight/config dry runs (no podman, no network)
   ./task web     vite build in apps/web, then fail if the committed dist is stale
+  ./task audit   pnpm audit --audit-level=high on apps/web (the dependency CVE gate)
   ./task nim     nim check, nimble test, acceptance harness against a real binary
+  ./task secrets gitleaks over the whole history, the same scan CI's security job runs
   ./task version print VERSION, the single source for the binary and the nimble package
   ./task version-check
                  fail when VERSION, kori.nimble, the generated module or CHANGELOG disagree
@@ -47,6 +49,22 @@ task_web() {
   # The committed dist is what `nim c` embeds; a stale one ships an old dashboard silently.
   git diff --quiet -- apps/web/dist \
     || { echo "apps/web/dist is stale — commit the fresh build" >&2; exit 1; }
+}
+
+# The dependency CVE gate for the node stack, same level CI's image-web job runs. Every repo here
+# is public, so a known-bad transitive package is as public as a leaked token. Needs the registry.
+task_audit() {
+  [ -f apps/web/package.json ] || missing apps/web "the Svelte source"
+  need pnpm "npm install -g pnpm, or brew install pnpm"
+  ( cd apps/web && pnpm audit --audit-level=high )
+}
+
+# The whole-history secret scan CI's `security` job runs. `./task gate` scans only the commits this
+# branch would publish, which cannot see a leak that is already on origin/main; a full walk can,
+# and it reports what only a history rewrite would fix. `git log` is the input, no network needed.
+task_secrets() {
+  need gitleaks "brew install gitleaks, or the pinned release tarball"
+  gitleaks git . --redact --no-banner --verbose --exit-code 1
 }
 
 task_nim() {
@@ -118,9 +136,11 @@ task_version_check() {
 # purpose, because a push to main starts CI and a deploy attempt.
 
 case "${1:-check}" in
-  check) task_ops; task_web; task_nim ;;
+  check) task_ops; task_web; task_audit; task_nim; task_secrets ;;
   ops) task_ops ;;
   web) task_web ;;
+  audit) task_audit ;;
+  secrets) task_secrets ;;
   nim) task_nim ;;
   version) task_version ;;
   version-check) task_version_check ;;

@@ -513,9 +513,16 @@ missing.
 ./task help    # the target list
 ./task ops     # shellcheck + deploy/smoke/preflight/rollback/config dry runs, no podman, no network
 ./task web     # vite build in apps/web, then fail if the committed dist is stale
+./task audit   # pnpm audit --audit-level=high on apps/web, the dependency CVE gate
+./task secrets # gitleaks over the whole history, the same walk CI's security job does
 ./task nim     # nim check, nimble test, embed drift, release build, acceptance self-test
 ./task check   # all of the above, in CI order
 ```
+
+`./task gate` scans only the commits a branch would publish; `./task secrets` walks every commit,
+which is the only local way to see a leak that is already on `origin/main`.
+`./task gate-full` runs `web`, `audit`, `secrets` and `nim` after `gate`, so the release gate and
+CI's `security` and `image-web` jobs check the same things.
 
 The acceptance harness proves the router end to end against a real binary:
 

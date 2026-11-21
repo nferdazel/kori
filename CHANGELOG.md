@@ -73,6 +73,12 @@ this one, is the answer to "what is live".
 
 ### Changed
 
+- `./task gate-full` now covers the two CI gates that had no local equivalent. `./task secrets` runs
+  gitleaks over the whole history instead of the `merge-base origin/main..HEAD` range `./task gate`
+  scans, so a leak older than `origin/main` is visible on a laptop and not only in CI's `security`
+  job; `./task audit` runs `pnpm audit --audit-level=high` in `apps/web`, the dependency CVE gate
+  that lived only in CI's `image-web` job. Both are separate targets as well, because `gate` may not
+  need a registry or a whole-history walk, and `gate-full` is where a release can afford them.
 - `deploy-vps.sh` no longer restarts Caddy for a byte-identical edge block. The render always
   rewrote `caddy/site.caddy`, so every deploy ran `systemctl restart caddy`, and Caddy's own unit
   sets `TimeoutStopSec=5s`: the restart was a `SIGKILL` that cut every completion and every SSE
