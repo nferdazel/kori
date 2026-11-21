@@ -11,6 +11,27 @@ this one, is the answer to "what is live".
 
 ## [Unreleased]
 
+### Fixed
+
+- `deploy-vps.sh` treated a missing `scripts/smoke.sh` as a passed release gate
+  (`return 0`, "gate skipped"). It is an `ERROR` now, so the deploy takes the existing
+  rollback-to-`:prev` path and never writes `.deployed_rev` without a smoke behind it. The same
+  pass gives `logs/smoke.log` the 0600 mode `logs/deploy.log` already had, and logs an empty
+  `KORI_EDGE_TOKEN` instead of skipping the edge render in silence.
+- `rollback.sh` is now the same production surface as the deploy: it takes the deploy lock on fd 9
+  (it used to retag `:local` and restart the unit while a deploy was pulling), narrows `deploy.log`
+  to 0600 instead of creating it with the caller's umask, and writes the image's own revision label
+  to `.deployed_rev` instead of `rollback-from-<sha>` — a phrase every later deploy read as
+  `PREV_MAIN` and silently fell back to `REV^`.
+- `preflight.sh` checks `cosign`, which `deploy-vps.sh` hard-requires before it tags `:local`.
+
+### Changed
+
+- CI runs the same shellcheck file list as `./task ops` (`task` and `tools/gen-version.sh` were
+  never linted there), the new `tests/dryrun-rollback.sh`, and `tests/dryrun-config.sh` with the
+  built binary, so the config-fill and real-parser block finally run in CI.
+- `retention.yml` drops the `OWNER` env the prune script never reads.
+
 ## [0.8.2] - 2026-11-20
 
 ### Changed

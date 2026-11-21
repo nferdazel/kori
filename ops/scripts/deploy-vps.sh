@@ -17,8 +17,9 @@
 # No secret lives in this repo. Everything host-specific comes from the env file
 # (/srv/qouver/apps/kori/env/kori-prod.env, mode 600).
 #
-# NOT YET RUN ON qouver1. kori is in development (owner, 2026-11-16): the skeleton below is the
-# whole host contract, and the first run is a separate slot with Dimas watching.
+# Live on qouver1 since 2026-11-19 13:12 WIB (v0.8.1, rev 3f149dd) and deployed by the webhook on
+# its own since. The first run was a separate slot with Dimas watching; this header used to say
+# "not yet run", which is how the next operator concludes an untested script.
 #
 # The script copies itself mid-run (self-update) and re-execs into the new file, so a fix merged
 # to it takes effect on that same deploy. The lock fd survives exec.
@@ -229,10 +230,17 @@ unit_renders() {
 # deploy. Its output goes to its own log so a failed run is readable afterwards.
 SMOKE_LOG="$APP_DIR/logs/smoke.log"
 run_smoke() {
+  # Fail closed like every other gate in this file: a release gate that could not run is not a
+  # release gate that passed. The helper sync above is the only thing that puts this file in the
+  # app dir and it says nothing when the file is not in the repo, so this branch is reachable.
   if [ ! -f "$APP_DIR/scripts/smoke.sh" ]; then
-    log "==> WARN: scripts/smoke.sh missing; smoke gate skipped on this run"
-    return 0
+    log "ERROR: scripts/smoke.sh is missing; the smoke gate cannot run and this deploy is rejected"
+    return 1
   fi
+  # The log stays 0600 like deploy.log: smoke prints token paths and status codes today, and the
+  # next `curl -v` line someone adds would print more.
+  ( umask 077; : >>"$SMOKE_LOG" )
+  chmod 0600 "$SMOKE_LOG" 2>/dev/null || true
   if bash "$APP_DIR/scripts/smoke.sh" >"$SMOKE_LOG" 2>&1; then
     log "==> smoke passed ($SMOKE_LOG)"
     return 0
@@ -610,6 +618,12 @@ if [ -n "${KORI_EDGE_TOKEN:-}" ]; then
     fi
     exit 1
   fi
+else
+  # Not fatal: a host can be deliberately edge-less. But it must not be silent. The block on disk
+  # keeps whatever bearer the last deploy rendered, so an empty token here means the edge either
+  # runs a token nobody chose or has no block at all, and the deploy log is the only place that
+  # would say so.
+  log "==> WARN: KORI_EDGE_TOKEN is empty; the ai.qouver.com/dash.qouver.com block was not rendered and the edge keeps whatever it served before"
 fi
 
 # ── 7. Restart + health gate + smoke, with automatic rollback ───────────────

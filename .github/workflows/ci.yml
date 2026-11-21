@@ -127,6 +127,15 @@ jobs:
           }
           sh acceptance/run-all.sh
 
+      # The config-fill dry run is the only thing that proves the filled config is accepted by the
+      # real parser and that every credential-bearing mode rule holds. Until 2026-11-21 it ran only
+      # from ./task ops on a laptop that happened to have a binary built, so CI never ran it at
+      # all. Here the binary already exists, so the real-parser block executes instead of skipping.
+      - name: "Config fill dry run (0600 rules, real parser)"
+        env:
+          KORI_BIN: ./apps/api/src/kori
+        run: bash tests/dryrun-config.sh
+
   # One required status for branch protection, and the only door to publication: the image job
   # below needs this job, so a commit whose quality gates are red can never become a pullable
   # tag. Results travel through env, never interpolated into a shell script.
@@ -345,8 +354,10 @@ jobs:
 
       # -S warning on purpose: SC2015 (info) fires on the `[ test ] && pass || fail` idiom the
       # harnesses use throughout, and `pass` cannot fail, so the pattern is not a bug there.
+      # Same file list as ./task ops. A local gate that reds on a file CI never lints is drift in
+      # the wrong direction: `task` and tools/gen-version.sh were missing here until 2026-11-21.
       - name: Shellcheck
-        run: shellcheck -S warning -x ops/scripts/*.sh tools/gen-static.sh tests/dryrun-*.sh
+        run: shellcheck -S warning -x ops/scripts/*.sh tools/gen-version.sh tools/gen-static.sh tests/dryrun-*.sh task
 
       - name: "Deploy dry run (ref guard, lock, retag, rollback)"
         run: bash tests/dryrun-deploy.sh
@@ -359,3 +370,8 @@ jobs:
       # by the harness, so the check cannot rot into "always green".
       - name: "Preflight dry run (host gate branches)"
         run: bash tests/dryrun-preflight.sh
+
+      # The manual path back to :prev. It is the command an operator runs at 02:00, so its lock,
+      # its log mode and what it writes to .deployed_rev are asserted here and not in the dark.
+      - name: "Rollback dry run (lock, log mode, .deployed_rev)"
+        run: bash tests/dryrun-rollback.sh

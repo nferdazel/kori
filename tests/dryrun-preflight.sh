@@ -104,6 +104,15 @@ cat >"$BIN/restorecon" <<'STUB'
 exit 0
 STUB
 
+# cosign is a deploy hard-requirement (verify_signature). Stubbed so the harness does not depend on
+# the laptop having it; the missing-cosign scenario moves this file out of PATH instead of faking
+# an exit code, because `command -v` is what the script actually asks.
+cat >"$BIN/cosign" <<'STUB'
+#!/usr/bin/env bash
+printf 'cosign %s\n' "$*" >>"${SMOKE_STATE:-/dev/null}"
+exit 0
+STUB
+
 chmod +x "$BIN"/*
 export PATH="$BIN:$PATH"
 
@@ -265,6 +274,28 @@ export FAKE_GETENFORCE=Permissive
 rc="$(run)"
 [ "$rc" = "0" ] && pass "permissive selinux does not block" || fail "permissive selinux blocked with $rc"
 grep -q '^WARN  selinux ' "$ROOT/out.txt" && pass "permissive selinux warned" || fail "permissive selinux not warned"
+
+# ── scenario 16: cosign missing -> FAIL, not a deploy that dies at step 5 ──
+# deploy-vps.sh calls `cosign verify` before it tags :local. Without the binary the deploy burns the
+# 45x20s registry window first and then aborts on the host's only slot, which is exactly the fact
+# preflight is supposed to surface from a laptop.
+reset_host
+mv "$BIN/cosign" "$BIN/cosign.hidden"
+# The laptop has a real cosign in /opt/homebrew/bin, so hiding the stub is not enough: run this
+# scenario with a PATH that holds the stubs and the system dirs only.
+SAVED_PATH="$PATH"
+PATH="$BIN:/usr/bin:/bin:/usr/sbin:/sbin"
+rc="$(run)"
+PATH="$SAVED_PATH"
+mv "$BIN/cosign.hidden" "$BIN/cosign"
+[ "$rc" = "1" ] && pass "missing cosign exits 1 ($rc)" || fail "missing cosign exited $rc"
+grep -q '^FAIL  tools .*cosign' "$ROOT/out.txt" && pass "cosign is named as the blocker" \
+  || fail "cosign not named: $(grep '^FAIL' "$ROOT/out.txt" | head -3)"
+
+# A clean host still passes with the stub present, so the new requirement cannot red the baseline.
+reset_host
+rc="$(run)"
+[ "$rc" = "0" ] && pass "cosign present keeps the clean host green" || fail "cosign stub reddened the clean host"
 
 printf '\n%s\n' "artifacts: $ROOT"
 if [ "$FAILS" -eq 0 ]; then

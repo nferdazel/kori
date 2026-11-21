@@ -17,7 +17,7 @@ kori is an in-house LLM gateway with a single maintainer: one Nim binary that ex
 | Step | Command | Notes |
 |---|---|---|
 | Build | `./task nim` | `nim check`, `nimble test`, the static-embed drift check, the release build, then the acceptance self-test |
-| Ops scripts | `./task ops` | shellcheck plus the deploy, smoke and preflight dry runs; no podman, no network |
+| Ops scripts | `./task ops` | shellcheck plus the deploy, smoke, preflight, rollback and config dry runs; no podman, no network |
 | Dashboard | `./task web` | vite build in `apps/web`, then fail if the committed `dist` is stale |
 | Everything | `./task check` | all of the above in CI order |
 

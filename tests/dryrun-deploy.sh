@@ -575,6 +575,9 @@ leftovers="$(find "$APP_DIR/caddy" -mindepth 1 -maxdepth 1 ! -name site.caddy -p
 [ -n "$(find "$APP_DIR/logs/deploy.log" -maxdepth 0 -perm 0600 2>/dev/null)" ] \
   && pass "deploy log is 0600, so a journal line carrying a credential is not world-readable" \
   || fail "deploy log mode is not 0600"
+[ -n "$(find "$APP_DIR/logs/smoke.log" -maxdepth 0 -perm 0600 2>/dev/null)" ] \
+  && pass "smoke log is 0600 like the deploy log" \
+  || fail "smoke log mode is $(stat -f '%Lp' "$APP_DIR/logs/smoke.log" 2>/dev/null || stat -c '%a' "$APP_DIR/logs/smoke.log" 2>/dev/null)"
 grep -q 'old run' "$APP_DIR/logs/deploy.log" \
   && pass "a log left at 0644 by an older deploy is narrowed in place, not replaced" \
   || fail "deploy log was replaced instead of narrowed: $(head -2 "$APP_DIR/logs/deploy.log")"
@@ -1066,6 +1069,71 @@ grep -q '^podman pull' "$STATE/calls.log" && fail "duplicate revision pulled an 
   || fail "duplicate revision restarted the service"
 [ "$(cat "$APP_DIR/.deployed_rev")" = "$deployed" ] && pass "duplicate revision kept .deployed_rev" \
   || fail "duplicate revision moved .deployed_rev"
+
+# ── scenario 19: the smoke gate cannot run -> refuse, do not pass ──────────
+# run_smoke used to `return 0` when scripts/smoke.sh was absent, so the one gate that proves the
+# release was not a release gate that passed — the deploy reached .deployed_rev with nothing
+# behind it. The helper sync copies every ops/scripts/*.sh, so a file missing from the repo is
+# missing from the app dir too, which is exactly the real shape.
+reset_state
+printf 'local\nprev\n' >"$STATE/tags"
+git -C "$WORK" rm --quiet ops/scripts/smoke.sh
+# A non-ops path too, or the run stops at the ops-only branch before it ever pulls an image.
+printf '# harness: missing smoke gate\n' >>"$WORK/apps/api/src/kori.nim"
+git -C "$WORK" add -A
+git -C "$WORK" -c user.email=arif@kori.local -c user.name=Arif commit --quiet -m "drop smoke"
+git -C "$WORK" push --quiet origin HEAD:main
+rm -f "$APP_DIR/scripts/smoke.sh"
+happy_image
+export FAKE_CURL=ok
+rc="$(run refs/heads/main)"
+[ "$rc" != "0" ] && pass "a deploy without smoke.sh exits non-zero ($rc)" \
+  || fail "a missing smoke gate passed the deploy"
+grep -q 'smoke gate cannot run' "$APP_DIR/logs/deploy.log" \
+  && pass "the missing smoke gate is an ERROR in the deploy log" \
+  || fail "missing smoke gate not logged: $(tail -3 "$APP_DIR/logs/deploy.log")"
+grep -q 'health gate passed but smoke failed' "$APP_DIR/logs/deploy.log" \
+  && pass "the missing gate takes the same rollback path" \
+  || fail "the missing gate did not reach the rollback path: $(tail -3 "$APP_DIR/logs/deploy.log")"
+[ "$(restarts)" -ge 2 ] && pass "restarted twice: new image, then :prev" \
+  || fail "expected a rollback restart, saw $(restarts)"
+[ -f "$APP_DIR/.deployed_rev" ] && fail ".deployed_rev written without a smoke gate" \
+  || pass "no .deployed_rev without a smoke gate"
+# Put the kit back, so the scenarios after this one deploy the same tree.
+git -C "$WORK" checkout --quiet HEAD~1 -- ops/scripts/smoke.sh
+git -C "$WORK" -c user.email=arif@kori.local -c user.name=Arif commit --quiet -m "restore smoke"
+git -C "$WORK" push --quiet origin HEAD:main
+unset FAKE_CURL
+
+# ── scenario 20: an empty edge token is announced, the old block is not clobbered ──
+# The render sits under `if [ -n "$KORI_EDGE_TOKEN" ]`, which is right (a host can be edge-less),
+# but the else branch was silent. The block on disk keeps the last bearer rendered, so "the edge was
+# not touched" has to be a line in the deploy log or the next reader assumes it was re-rendered.
+reset_state
+mkdir -p "$APP_DIR/caddy"
+printf '# block from an earlier deploy\n' >"$APP_DIR/caddy/site.caddy"
+chmod 0640 "$APP_DIR/caddy/site.caddy"
+PREV_EDGE_SUM="$(cksum <"$APP_DIR/caddy/site.caddy")"
+printf 'KORI_EDGE_TOKEN=\n' >"$APP_DIR/env/kori-prod.env"
+# A non-ops path too, or the ops-only branch stops the run before the edge section.
+printf '# harness: empty edge token\n' >>"$WORK/apps/api/src/kori.nim"
+git -C "$WORK" add -A
+git -C "$WORK" -c user.email=arif@kori.local -c user.name=Arif commit --quiet -m "empty edge token"
+git -C "$WORK" push --quiet origin HEAD:main
+happy_image
+export FAKE_CURL=ok
+rc="$(run refs/heads/main)"
+[ "$rc" = "0" ] && pass "a deploy with an empty edge token still deploys ($rc)" \
+  || fail "a deploy with an empty edge token exited $rc: $(tail -3 "$ROOT/out.txt")"
+grep -q 'KORI_EDGE_TOKEN is empty; the ai.qouver.com' "$APP_DIR/logs/deploy.log" \
+  && pass "the empty edge token is announced in the deploy log" \
+  || fail "the empty edge token is silent: $(tail -3 "$APP_DIR/logs/deploy.log")"
+[ "$(cksum <"$APP_DIR/caddy/site.caddy")" = "$PREV_EDGE_SUM" ] \
+  && pass "the previous edge block is left untouched" \
+  || fail "the edge block changed without a token"
+[ -f "$APP_DIR/.deployed_rev" ] && pass "an edge-less deploy still records its revision" \
+  || fail "an edge-less deploy recorded nothing"
+unset FAKE_CURL
 
 printf '\n%s\n' "artifacts: $ROOT"
 if [ "$FAILS" -eq 0 ]; then

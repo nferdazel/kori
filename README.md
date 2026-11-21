@@ -510,7 +510,7 @@ missing.
 
 ```sh
 ./task help    # the target list
-./task ops     # shellcheck + deploy/smoke/preflight dry runs, no podman, no network
+./task ops     # shellcheck + deploy/smoke/preflight/rollback/config dry runs, no podman, no network
 ./task web     # vite build in apps/web, then fail if the committed dist is stale
 ./task nim     # nim check, nimble test, embed drift, release build, acceptance self-test
 ./task check   # all of the above, in CI order

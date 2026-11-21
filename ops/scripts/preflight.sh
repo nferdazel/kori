@@ -105,12 +105,15 @@ else
 fi
 
 # ── required commands ───────────────────────────────────────────────────────
+# cosign is in this list because deploy-vps.sh:437 hard-requires it: without it the deploy dies at
+# step 5 after the 45x20s registry wait, on the one host slot. Preflight exists to answer "will
+# this deploy die at step N" before the slot is taken.
 missing_cmds=""
-for cmd in flock curl git install; do
+for cmd in flock curl git install cosign; do
   have "$cmd" || missing_cmds="$missing_cmds $cmd"
 done
 if [ -z "$missing_cmds" ]; then
-  pass "tools" "flock curl git install present"
+  pass "tools" "flock curl git install cosign present"
 else
   bad "tools" "missing:$missing_cmds"
 fi

@@ -41,8 +41,10 @@ jobs:
     permissions:
       contents: read
       packages: write
+    # OWNER is not here on purpose: the script reads `gh api user/packages/...`, which resolves the
+    # authenticated login. An unused OWNER env only invites the next reader to believe the package
+    # path is parameterised.
     env:
-      OWNER: ${{ github.repository_owner }}
       KEEP: '10'
       PACKAGES: 'kori-api'
     steps:

@@ -36,6 +36,7 @@ task_ops() {
   bash tests/dryrun-deploy.sh
   bash tests/dryrun-smoke.sh
   bash tests/dryrun-preflight.sh
+  bash tests/dryrun-rollback.sh
   bash tests/dryrun-config.sh
 }
 
