@@ -22,6 +22,17 @@ this one, is the answer to "what is live".
   units into `~/.config/systemd/user`, not the quadlet directory, where systemd answers
   `LoadState=not-found` for a timer. A deliberate stop (a deploy or a rollback) trips the probe
   too; that is the intended signal, and `README.md` says how to read it.
+- `/metrics` counts request-log lines that never reached the file:
+  `kori_log_write_failures_total`, a counter with no labels. The gateway keeps serving when the log
+  cannot be written, so a full disk that stopped the log looked exactly like a healthy gateway —
+  nothing in `/metrics` moved, and the only way to learn was to read the log and notice lines
+  missing. The tally sits in one `recordRequestLog` proc that both request paths reach the file
+  through, not in `appendLine`, which takes only the `RequestLog`: tallying there would have meant
+  passing the gateway into the log or reaching for a module global, and the two copies of those
+  four lines had already drifted apart once. Acceptance case `a18-log-write` induces the shape with
+  a file-size limit rather than a full disk, and proves the request is still served, the counter
+  moves once per lost line, the file gains no line while `/admin/log` keeps reporting the file's
+  own count, and an outage is one stderr line.
 
 ### Fixed
 
@@ -40,6 +51,25 @@ this one, is the answer to "what is live".
   nothing, on the one file that holds every credential and whose usual reason for being rewritten
   is that the new values do not work. The old file is now copied 0600 beside it (`.bak-<stamp>`)
   before the rename, and the newest two are kept.
+- The dashboard could stop refreshing for the rest of the page's life and say nothing. `getJson`
+  called `fetch` with no timeout and no `AbortSignal`, and `runRefresh` guarded the 5 s tick with a
+  module-level `busy` flag cleared only in its `finally`: one read that never settled left `busy`
+  true, so the tick returned immediately, the page froze at its last render, and "refreshed Ns ago"
+  kept counting up as if it were live. Every read now aborts at 4 s (`READ_TIMEOUT_MS`, under the
+  tick on purpose, so one stuck read costs one tick and never starves the next) and reports the
+  timeout as ordinary failed-call data, which keeps the existing contract: a failed refresh keeps
+  the last good render, and a `401` still goes to the login page. `runRefresh` carries an 8 s
+  watchdog as a second net, for a promise that hangs above `fetch`, and an `attempt` counter keeps
+  a stale promise that settles late from painting "refreshed" over a newer failure. `signIn` and
+  `signOut` carry the same signal, so a hung login re-enables the button and says the gateway did
+  not answer instead of sitting on "checking" for ever.
+- A rotation whose reopen failed left the closed fd number in `log.fd`, and the kernel hands that
+  number to the next open anywhere in the process, so the request log could append its lines into
+  an unrelated file. The field is `-1` now, and each append retries the open once by path: a full
+  disk or a dropped mount is the condition that clears, and an append that never retried would
+  stay broken after the cause was gone. An outage writes one stderr line instead of one per
+  request, recovery writes one more, and the byte counter follows the file that is actually open,
+  so the next rotation fires at the right size.
 
 ### Changed
 
