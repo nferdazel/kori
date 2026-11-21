@@ -34,13 +34,15 @@ cat >"$BIN/curl" <<'STUB'
 #!/usr/bin/env bash
 S="${SMOKE_STATE:?}"
 printf 'curl %s\n' "$*" >>"$S/calls.log"
-code_only=0; hdr=""; url=""; cfg=""
+code_only=0; hdr=""; url=""; cfg=""; dump_headers=0
 while [ $# -gt 0 ]; do
   case "$1" in
     -w) code_only=1; shift 2 ;;
+    -D) dump_headers=1; shift 2 ;;
     -H) hdr="$2"; shift 2 ;;
     -K|--config) cfg="$2"; shift 2 ;;
-    -o|--max-time|-s|-f|-S) shift 2 2>/dev/null || shift 1 ;;
+    -o|--max-time) shift 2 ;;
+    -s|-S|-f) shift 1 ;;
     -*) shift ;;
     *) url="$1"; shift ;;
   esac
@@ -87,6 +89,16 @@ if [ "${url#*"$FAKE_BASE_URL"}" != "$url" ]; then
   esac
 fi
 if [ "${url#*"$FAKE_EDGE_URL"}" != "$url" ]; then
+  # FAKE_EDGE_SECURITY=0 replays the origin as it answered before 2026-11-21: no HSTS at all,
+  # which is what a site block that does not import the host's (security) snippet looks like.
+  if [ "${FAKE_EDGE_SECURITY:-1}" = "1" ] && [ "$dump_headers" = "1" ]; then
+    printf 'HTTP/2 200 \n'
+    printf 'strict-transport-security: max-age=31536000; includeSubDomains\n'
+    printf 'x-frame-options: DENY\n'
+    printf 'referrer-policy: strict-origin-when-cross-origin\n'
+    printf '\n'
+    exit 0
+  fi
   case "$url" in
     */admin/state)
       [ "$hdr" = "Authorization: Bearer $FAKE_GOOD_TOKEN" ] && { say 404; exit 0; }
@@ -154,8 +166,8 @@ oks() { grep -c '^OK ' "$ROOT/out.txt" || true; }
 reset_state
 rc="$(run "$FAKE_EDGE_URL" "$FAKE_GOOD_TOKEN")"
 [ "$rc" = "0" ] && pass "healthy host exits 0" || fail "healthy host exited $rc: $(cat "$ROOT/out.txt")"
-[ "$(oks)" = "9" ] && pass "9 OK lines: healthz, admin 404, loopback, log, JSON, 4 edge" \
-  || fail "expected 9 OK lines, got $(oks): $(tr '\n' '|' <"$ROOT/out.txt")"
+[ "$(oks)" = "10" ] && pass "10 OK lines: healthz, admin 404, loopback, log, JSON, 5 edge" \
+  || fail "expected 10 OK lines, got $(oks): $(tr '\n' '|' <"$ROOT/out.txt")"
 grep -q 'GET /healthz 200, valid JSON' "$ROOT/out.txt" && pass "the health probe is /healthz" \
   || fail "the health probe is not /healthz: $(tr '\n' '|' <"$ROOT/out.txt")"
 grep -q 'GET /admin/state without a token -> 404 (no token file, fail closed)' "$ROOT/out.txt" \
@@ -165,6 +177,9 @@ grep -q 'edge without bearer -> 401' "$ROOT/out.txt" && pass "edge refuses a mis
   || fail "missing-bearer check absent"
 grep -q 'edge refuses /admin/state -> 404' "$ROOT/out.txt" && pass "edge refuses /admin from outside" \
   || fail "/admin edge check absent"
+grep -q 'edge answers with Strict-Transport-Security' "$ROOT/out.txt" \
+  && pass "the security headers are asserted, not assumed" \
+  || fail "no assertion that the edge sends HSTS"
 grep -q "Bearer $FAKE_GOOD_TOKEN" "$STATE/calls.log" \
   && fail "the edge token reached curl argv, where /proc/<pid>/cmdline exposes it" \
   || pass "the edge token never reaches curl argv"
@@ -349,6 +364,19 @@ unset FAKE_V1_BODY
 [ "$rc" != "0" ] && pass "a foreign 405 body exits non-zero" || fail "a foreign 405 body passed the edge matrix"
 grep -q "the body is not kori's" "$ROOT/out.txt" && pass "the foreign 405 body is named" \
   || fail "foreign 405 body not named"
+
+# ── scenario 14: an edge without HSTS -> FAIL ────────────────────────────
+# The measured state of ai.qouver.com until 2026-11-21: the block did not import the host's
+# (security) snippet, so Cloudflare forwarded a response with no Strict-Transport-Security, no
+# X-Frame-Options and no Referrer-Policy. A gate that only checks status codes calls that healthy.
+reset_state
+export FAKE_EDGE_SECURITY=0
+rc="$(run "$FAKE_EDGE_URL" "$FAKE_GOOD_TOKEN")"
+unset FAKE_EDGE_SECURITY
+[ "$rc" != "0" ] && pass "an edge without HSTS exits non-zero ($rc)" \
+  || fail "an edge without HSTS passed the release gate"
+grep -q 'edge answers without Strict-Transport-Security' "$ROOT/out.txt" \
+  && pass "the missing HSTS header is named" || fail "the missing HSTS header is not named"
 
 printf '\n%s\n' "artifacts: $ROOT"
 if [ "$FAILS" -eq 0 ]; then

@@ -143,10 +143,32 @@ for key in KORI_OPENCODE_REFRESH_TOKEN KORI_OPENCODE_ACCESS_TOKEN KORI_OPENCODE_
   esac
 done
 
-# ── refuse to replace a live config ──────────────────────────────────────────
+# ── refuse to replace a live config, and keep the one it replaces ─────────────
+# The old file is the only copy of a working set of provider credentials, and the reason to run
+# this script is usually that the new one does not work. So --force backs the live file up first,
+# 0600, beside it, and keeps the newest two: the host had four hand-made .bak files of an earlier
+# config, none of them pruned, one of them a 372-byte half-written file (2026-11-21).
 if [ -e "$OUT" ] && [ "$FORCE" -ne 1 ]; then
   die "$OUT exists — pass --force to replace it"
 fi
+CONFIG_BAK_KEEP="${KORI_CONFIG_BAK_KEEP:-2}"
+backup_live_config() { # backup_live_config <path>
+  local live="$1" bak
+  [ -f "$live" ] || return 0
+  bak="$live.bak-$(date '+%Y%m%d-%H%M%S')"
+  # `cp -p` would carry a wider source mode over; the copy holds the same credentials, so it gets
+  # the same 0600 as the original at creation and is renamed into place.
+  ( umask 077; cp -- "$live" "$bak.tmp.$$" ) && mv -f "$bak.tmp.$$" "$bak" \
+    || die "cannot back up $live; refusing to replace it"
+  chmod 0600 "$bak" || die "could not narrow $bak to 0600"
+  printf 'kori-config: previous config kept as %s\n' "$bak" >&2
+  # Oldest first, drop everything beyond the newest $CONFIG_BAK_KEEP. `-t` is mtime order, so a
+  # name that does not parse still sorts by when it was written.
+  case "$CONFIG_BAK_KEEP" in '' | *[!0-9]*) CONFIG_BAK_KEEP=2 ;; esac
+  ls -1t "$live".bak-* 2>/dev/null | tail -n "+$((CONFIG_BAK_KEEP + 1))" \
+    | while IFS= read -r old; do rm -f -- "$old"; done
+}
+if [ "$FORCE" -eq 1 ]; then backup_live_config "$OUT"; fi
 [ -d "$(dirname "$OUT")" ] || die "output directory does not exist: $(dirname "$OUT")"
 
 # ── substitute, in the shell, into a 0600 temp beside the target ────────────

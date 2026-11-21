@@ -415,6 +415,12 @@ grep -qxF 'local' "$STATE/tags" && pass "image tagged :local" || fail "no :local
 [ -f "$APP_DIR/caddy/site.caddy" ] && pass "edge block rendered" || fail "edge block not rendered"
 grep -q 'dryrun-token' "$APP_DIR/caddy/site.caddy" && pass "edge token substituted" \
   || fail "edge token not substituted"
+# The host/00 shared header snippet. Every other site block on qouver1 imports it; kori's did not,
+# so the origin answered with no HSTS and no X-Frame-Options at all (measured 2026-11-21). Both
+# blocks need it: ai is the API door and dash is the page a browser loads.
+imports="$(grep -c '^	import security' "$APP_DIR/caddy/site.caddy" || true)"
+[ "$imports" = "2" ] && pass "both site blocks import the shared header snippet" \
+  || fail "expected import security in both blocks, found $imports"
 grep -q 'systemctl --user restart kori-api' "$STATE/calls.log" && pass "service restarted" \
   || fail "service never restarted"
 grep -q 'sudo systemctl restart caddy' "$STATE/calls.log" && pass "caddy restarted" \
@@ -450,6 +456,50 @@ unset FAKE_HEALTH_DOWN
   || fail "a dead /healthz was read as healthy"
 [ -f "$APP_DIR/.deployed_rev" ] && fail ".deployed_rev written with liveness down" \
   || pass "no .deployed_rev with liveness down"
+
+# ── scenario 3a3: the readiness probe is installed and it watches /healthz ──
+# `Restart=always` reacts to a process that exits; nothing watched a process that stays up and
+# stops answering, and OnFailure on kori-api itself only fires when the unit fails (its alert unit
+# had no journal entries at all on qouver1, 2026-11-21). The probe is a separate unit so a wedged
+# gateway pages on its own, and it must probe the open path: /admin/state answers 404 without a
+# token, so a probe there would page on every correctly configured host.
+# The units land in KORI_SYSTEMD_DIR, not KORI_UNIT_DIR: the latter is the quadlet directory, and
+# systemd answers LoadState=not-found for a timer placed there (measured 2026-11-21).
+reset_state
+happy_image
+export FAKE_CURL=ok
+rc="$(run refs/heads/main)"
+[ "$rc" = "0" ] && pass "deploy with the readiness probe exits 0" || fail "probe deploy exited $rc"
+export KORI_SYSTEMD_DIR="$ROOT/user-units"
+mkdir -p "$KORI_SYSTEMD_DIR"
+reset_state
+rc="$(run refs/heads/main)"
+[ -f "$KORI_SYSTEMD_DIR/kori-readyz.service" ] && pass "kori-readyz.service installed as a user unit" \
+  || fail "kori-readyz.service not installed into KORI_SYSTEMD_DIR"
+[ -f "$KORI_SYSTEMD_DIR/kori-readyz.timer" ] && pass "kori-readyz.timer installed as a user unit" \
+  || fail "kori-readyz.timer not installed into KORI_SYSTEMD_DIR"
+[ -f "$UNIT_DIR/kori-readyz.timer" ] \
+  && fail "the timer was installed in the quadlet directory, where systemd cannot see it" \
+  || pass "the timer is not in the quadlet directory"
+grep -q 'enable --now kori-readyz.timer' "$STATE/calls.log" \
+  && pass "the timer is enabled, not just written" \
+  || fail "the timer was installed but never enabled: $(grep '^systemctl' "$STATE/calls.log" | tr '\n' ' ')"
+grep -q '/healthz' "$KORI_SYSTEMD_DIR/kori-readyz.service" && pass "the probe asks /healthz" \
+  || fail "the probe does not ask /healthz: $(grep ExecStart "$KORI_SYSTEMD_DIR/kori-readyz.service")"
+grep -q '^ExecStart=.*/admin/' "$KORI_SYSTEMD_DIR/kori-readyz.service" \
+  && fail "the probe asks a gated path; it would page on a healthy host" \
+  || pass "the probe never borrows the gated admin surface"
+grep -q 'OnFailure=alert@%N.service' "$KORI_SYSTEMD_DIR/kori-readyz.service" \
+  && pass "a failed probe pages through the host alert sink" \
+  || fail "the probe carries no OnFailure, so a failure is silent"
+# An unchanged probe must not be reinstalled: rewriting the unit restarts nothing today but leaves
+# a diff and a daemon-reload on every deploy.
+before="$(cksum <"$KORI_SYSTEMD_DIR/kori-readyz.service")"
+rc="$(run refs/heads/main)"
+[ "$(cksum <"$KORI_SYSTEMD_DIR/kori-readyz.service")" = "$before" ] \
+  && pass "an unchanged probe unit is left alone" \
+  || fail "the probe unit was rewritten for an identical file"
+unset KORI_SYSTEMD_DIR
 
 # ── scenario 3b: the pulled tag is the sha of the commit that was checked out ─
 grep -qxF "podman pull $(sha_ref)" "$STATE/calls.log" && pass "pulled $(sha_ref)" \

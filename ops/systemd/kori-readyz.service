@@ -1,0 +1,23 @@
+# Readiness probe — started by kori-readyz.timer, installed by deploy-vps.sh.
+#
+# Why this exists: `Restart=always` reacts to a process that exits, and nothing reacts to one that
+# stays up and stops answering. `OnFailure=alert@%N.service` sits on kori-api itself, so it only
+# fires when the unit fails — and the journal for alert@kori-api.service had no entries at all on
+# qouver1 (checked 2026-11-21). A wedged gateway, or a container up with the port dead, was silent.
+#
+# The probe asks /healthz, not /admin/state: /healthz stays open by design (DEC-20), so the probe
+# needs no credential and cannot fail because a token file went missing. `--fail` makes curl exit
+# non-zero on a 4xx/5xx as well as on a connection failure, which is what turns this into a unit
+# failure and a Telegram line.
+#
+# A deliberate stop (deploy, rollback, maintenance) also fails this probe. That is the intended
+# signal, not noise: a minute of downtime is worth one sentence.
+[Unit]
+Description=kori readiness probe
+Wants=network-online.target
+After=network-online.target kori-api.service
+OnFailure=alert@%N.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/curl --fail --silent --show-error --max-time 10 http://127.0.0.1:8787/healthz

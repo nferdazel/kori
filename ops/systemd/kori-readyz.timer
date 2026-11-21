@@ -1,0 +1,13 @@
+# Probes /healthz every five minutes; a failed probe pages through alert@ (see the .service).
+#
+# Same shape and cadence as the other probes on qouver1 (majadu-readyz.timer), so one alert rule
+# and one habit cover every app on the host.
+[Unit]
+Description=Probe kori readiness every five minutes
+
+[Timer]
+OnCalendar=*:0/5
+RandomizedDelaySec=30s
+
+[Install]
+WantedBy=timers.target

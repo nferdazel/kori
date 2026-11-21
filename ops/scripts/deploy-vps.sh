@@ -34,6 +34,10 @@ IMAGE="${KORI_IMAGE:-localhost/kori}"
 IMAGE_REPO="${KORI_IMAGE_REPO:-ghcr.io/nferdazel/kori-api}"
 SERVICE="${KORI_SERVICE:-kori-api}"
 UNIT_DIR="${KORI_UNIT_DIR:-$HOME/.config/containers/systemd}"
+# Quadlet only turns files in $UNIT_DIR into units; `systemctl --user` cannot see a .service or a
+# .timer there (measured on qouver1, 2026-11-21: LoadState=not-found). The readiness probe is a
+# plain systemd user unit, so it goes in the plain user-unit directory, not next to the container.
+SYSTEMD_DIR="${KORI_SYSTEMD_DIR:-$HOME/.config/systemd/user}"
 STATE_FILE="$APP_DIR/.deployed_rev"
 LOG="$APP_DIR/logs/deploy.log"
 HEALTH_URL="${KORI_HEALTH_URL:-http://127.0.0.1:8787/healthz}"
@@ -317,6 +321,42 @@ stage_unit() {
   fi
 }
 stage_unit
+
+# ── 4a2. Readiness probe units ──────────────────────────────────────────────
+# `Restart=always` reacts to a process that exits. Nothing reacted to a process that stays up and
+# stops answering, and `OnFailure=alert@%N.service` on kori-api only fires when the unit fails —
+# on qouver1 its journal had no entries at all (2026-11-21). The probe is a separate unit so its
+# failures page on their own, the same shape majadu-readyz carries on this host.
+# An unchanged file is not rewritten, so the usual deploy does not restart the timer.
+install_probe_units() {
+  local src dst changed=0
+  # The plain user-unit directory, not $UNIT_DIR: quadlet owns that one and systemd does not look
+  # for timers there (measured 2026-11-21).
+  mkdir -p "$SYSTEMD_DIR"
+  for name in kori-readyz.service kori-readyz.timer; do
+    src="$MONO_DIR/ops/systemd/$name"
+    dst="$SYSTEMD_DIR/$name"
+    # A probe missing from the repo is not a deploy failure: the gateway itself is still the
+    # payload. It is a loud warning, because losing the watcher is exactly the silent state this
+    # change exists to end.
+    if [ ! -f "$src" ]; then
+      log "WARN: ops/systemd/$name is missing from the repo; the readiness probe is not installed"
+      continue
+    fi
+    if cmp -s "$src" "$dst"; then continue; fi
+    install -m 0644 "$src" "$dst.new.$$" && mv -f "$dst.new.$$" "$dst" \
+      || die "could not install $dst"
+    changed=1
+    log "==> installed $name"
+  done
+  if [ "$changed" = "1" ]; then
+    systemctl --user daemon-reload || true
+  fi
+  # Idempotent: enable --now on an already-running timer is a no-op, so this is safe every deploy.
+  systemctl --user enable --now kori-readyz.timer \
+    || log "WARN: could not enable kori-readyz.timer; readiness failures will not page"
+}
+install_probe_units
 
 # ── 4b. Ops-only commit: the unit is the whole payload ─────────────────────
 # No image is pulled here, so .deployed_rev keeps the running image's revision. Install the unit

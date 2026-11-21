@@ -159,6 +159,33 @@ rc=$?
 grep -qF 'cc-SENTINEL-second-run' "$OUT" && pass "--force wrote the new value" \
   || fail "--force did not write the new value"
 
+# ── scenario 3a: --force keeps the config it replaced, and keeps only two ───
+# The old file is the last working set of provider credentials, and the reason to run this is
+# usually that the new one does not work. Without a backup there is nothing to go back to.
+baks="$(ls -1 "$OUT".bak-* 2>/dev/null)"
+[ -n "$baks" ] && pass "--force left a backup of the config it replaced" \
+  || fail "--force replaced the live config with no backup at all"
+bak_mode="$(file_mode "${baks%%$'\n'*}")"
+[ "$bak_mode" = "600" ] && pass "the backup is 0600 like the config" \
+  || fail "the backup is $bak_mode, not 600"
+grep -qF "$SENTINEL_CC" "${baks%%$'\n'*}" \
+  && pass "the backup holds the previous value, not the new one" \
+  || fail "the backup is not the replaced config"
+# Three more --force runs: retention is two, so the count must stay at two and the oldest go.
+i=0
+while [ "$i" -lt 3 ]; do
+  sed -e "s/$SENTINEL_CC/cc-SENTINEL-run-$i/" "$VALUES" >"$ROOT/values-ret-$i.env"
+  chmod 600 "$ROOT/values-ret-$i.env"
+  bash "$FILL" --values "$ROOT/values-ret-$i.env" --out "$OUT" --force 2>"$ROOT/stderr" \
+    || fail "--force run $i failed: $(cat "$ROOT/stderr")"
+  i=$((i + 1))
+done
+kept="$(ls -1 "$OUT".bak-* 2>/dev/null | wc -l | tr -d ' ')"
+[ "$kept" = "2" ] && pass "backups are pruned to the newest two (found $kept)" \
+  || fail "backup retention kept $kept files, expected 2: $(ls -1 "$OUT".bak-* 2>/dev/null | tr '\n' ' ')"
+grep -qF 'cc-SENTINEL-run-2' "$OUT" && pass "retention did not touch the live config" \
+  || fail "the live config is not the last run's"
+
 # ── scenario 4: a missing key fails and writes nothing ─────────────────────
 grep -v 'KORI_COMMANDCODE_API_KEY' "$VALUES" >"$ROOT/values-missing.env"
 chmod 600 "$ROOT/values-missing.env"

@@ -16,8 +16,9 @@
 #      parses as JSON. It does NOT prove one line per proxied request: that needs a real provider
 #      leg, and a smoke run must not spend tokens.
 #   5. edge, only when KORI_EDGE_URL is set: no bearer -> 401, wrong bearer -> 401, right bearer ->
-#      405 with kori's own JSON body on a GET of the v1 chat path, and /admin/* stays unreachable
-#      from the edge. The body matters: a 405 alone can come from any proxy in front of the origin.
+#      405 with kori's own JSON body on a GET of the v1 chat path, /admin/* stays unreachable from
+#      the edge, and the site block sends the host's security headers. The body matters: a 405 alone
+#      can come from any proxy in front of the origin.
 set -euo pipefail
 
 APP_DIR="${KORI_APP_DIR:-/srv/qouver/apps/kori}"
@@ -125,6 +126,7 @@ if [ -n "${KORI_EDGE_URL:-}" ] && [ -z "${KORI_EDGE_TOKEN:-}" ]; then
   bad "KORI_EDGE_URL is set but KORI_EDGE_TOKEN is empty; edge matrix cannot run"
 elif [ -n "${KORI_EDGE_URL:-}" ]; then
   code() { curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$@"; }
+  headers_auth() { printf 'header = "Authorization: Bearer %s"\n' "$KORI_EDGE_TOKEN" | curl -s -D - -o /dev/null --max-time 10 -K - "$@"; }
   # The real bearer goes to curl as a config on stdin, never in argv: /proc/<pid>/cmdline is
   # readable on the host, so an argument would hand the edge token to any local process for the
   # life of the request. `printf` here is a shell builtin, so no second process sees it either.
@@ -135,9 +137,10 @@ elif [ -n "${KORI_EDGE_URL:-}" ]; then
   # The literal below is a deliberately wrong bearer: it must be rejected. Not a credential.
   c="$(code -H "Authorization: Bearer wrong-token" "$KORI_EDGE_URL/v1/chat/completions")"  # gitleaks:allow
   [ "$c" = "401" ] && ok "edge with wrong bearer -> 401" || bad "edge with wrong bearer -> $c (expected 401)"
-  # v1 has one route and no /v1/models, so a GET of the chat path answers 405 from the binary. That
-  # proves the edge forwarded into kori without spending a provider token. The old /v1/models -> 200
-  # assertion was a permanent false negative: no such route exists in v1 (SPEC v1.1 R14).
+  # A GET of the chat path answers 405 from the binary: the route is POST-only. That proves the
+  # edge forwarded into kori without spending a provider token. `/v1/models` also answers 200 for
+  # free (DEC-14, derived from the config with no dial), but the 405 body below is the stronger
+  # signal — it names kori's own error shape, which a proxy in front of the origin cannot fake.
   c="$(code_auth "$KORI_EDGE_URL/v1/chat/completions")"
   if [ "$c" != "405" ]; then
     bad "edge with right bearer -> $c (expected 405)"
@@ -154,6 +157,16 @@ elif [ -n "${KORI_EDGE_URL:-}" ]; then
   fi
   c="$(code_auth "$KORI_EDGE_URL/admin/state")"
   [ "$c" = "404" ] && ok "edge refuses /admin/state -> 404" || bad "edge answered /admin/state with $c (expected 404)"
+  # The shared `(security)` snippet the rest of the host carries, which kori's blocks did not
+  # import until 2026-11-21: the origin answered with no HSTS and nothing that stops framing.
+  # Cloudflare forwards what the origin sends, so this header can only come from that snippet —
+  # measured absent before the fix on ai.qouver.com and present on api.qouver.com.
+  edge_headers="$(headers_auth "$KORI_EDGE_URL/v1/models" || true)"
+  if printf '%s' "$edge_headers" | grep -qi '^strict-transport-security:'; then
+    ok "edge answers with Strict-Transport-Security"
+  else
+    bad "edge answers without Strict-Transport-Security; the site block does not import the host's (security) snippet"
+  fi
 else
   warn "KORI_EDGE_URL/KORI_EDGE_TOKEN unset, edge checks skipped"
 fi
