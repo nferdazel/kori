@@ -359,7 +359,15 @@ cfg = json.load(open(path))
 cfg.setdefault("listen", {})["port"] = port
 json.dump(cfg, open(path, "w"), indent=2)
 PY
-  ( KORI_ADMIN_TOKEN_FILE=$(admin_token_path) \
+  # GW_FSIZE_BLOCKS caps how large any file this process writes may grow, which is
+  # how a18 makes a log write fail on purpose: a write past the limit comes back
+  # short. The signal is ignored first, or the kernel would kill the gateway
+  # instead of letting write(2) answer. Both are inherited by the exec.
+  ( if [ -n "${GW_FSIZE_BLOCKS:-}" ]; then
+      trap '' XFSZ
+      ulimit -f "$GW_FSIZE_BLOCKS" || fail "gw_start" "cannot set a file size limit"
+    fi
+    KORI_ADMIN_TOKEN_FILE=$(admin_token_path) \
     "$GW_BIN" --config "$GW_CFG" --port "$GW_PORT" >>"$RUN/gateway.log" 2>&1 &
     echo "$!" >>"$RUN/pids" )
   gw_wait_ready || { fail "gw_start" "no answer from $GW_URL/healthz"; return 1; }

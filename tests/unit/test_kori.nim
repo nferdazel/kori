@@ -1034,6 +1034,47 @@ block:
   check "every live line is still JSON", whole
 
 block:
+  # A failed rotation leaves fd = -1. Every append retries the open once instead of
+  # writing to fd -1 for the rest of the process's life, and the outage is one
+  # stderr line rather than one per request.
+  let path = scratch / "reopen.jsonl"
+  removeFile(path)
+  var log = openRequestLog(path)
+  discard posix.close(log.fd)
+  log.fd = -1
+  check "an append with no open file reopens it", log.appendLine("{\"a\":1}")
+  check "the line reached the file", fileExists(path) and readFile(path).len > 0
+  check "recovering reports one outage line", not log.failing
+  discard posix.close(log.fd)
+
+block:
+  # The tally both request paths share: one counter for every line that did not
+  # land, and the dashboard's line count only for the ones that did.
+  let path = scratch / "record.jsonl"
+  removeFile(path)
+  var cfg = Config(listenHost: "127.0.0.1", listenPort: 4011, logPath: path)
+  cfg.legs = @[legSpec("leg-a", lrPrimary)]
+  var reqLog = openRequestLog(path)
+  let written = newGateway(cfg, reqLog, "127.0.0.1:4011")
+  written.recordRequestLog("{\"a\":1}")
+  check "a line that lands counts", written.logLines == 1 and
+    written.metrics.logWriteFailures == 0
+  check "metrics prints the counter",
+    written.metricsText().contains("kori_log_write_failures_total 0")
+  check "metrics names it a counter",
+    written.metricsText().contains("# TYPE kori_log_write_failures_total counter")
+  discard posix.close(reqLog.fd)
+  # A directory that does not exist: the fd is -1 and the reopen must fail too,
+  # which is the full-disk shape without needing a full disk.
+  let missing = scratch / "no-such-dir" / "record.jsonl"
+  let lost = newGateway(cfg, RequestLog(fd: -1, path: missing), "127.0.0.1:4011")
+  lost.recordRequestLog("{\"a\":2}")
+  check "a line that does not land is tallied", lost.metrics.logWriteFailures == 1
+  check "it does not inflate the line count", lost.logLines == 0
+  check "metrics prints the failure",
+    lost.metricsText().contains("kori_log_write_failures_total 1")
+
+block:
   # Reload: a broken file changes nothing, a good one swaps the legs in place.
   let path = writeConfig("reload.json", """
 {"listen":{"host":"127.0.0.1","port":4011},"log":{"path":"/tmp/reload.jsonl"},

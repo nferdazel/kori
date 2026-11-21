@@ -302,6 +302,7 @@ type
     keep*: int
     bytes*: int64            ## what this process has written to the live file
     justRotated*: bool       ## set for the append that opened a fresh file
+    failing*: bool           ## the last append failed; one stderr line per outage
 
   LegRuntime* = object
     attempted*: bool
@@ -342,6 +343,7 @@ type
     ## the request path, so this is a tally, never a second source of truth: no
     ## leg state, no cooldown time, nothing that /admin/state also owns.
     requestsByRoute*: Table[string, int]
+    logWriteFailures*: int       ## request-log lines that never reached the file
     failoversByReason*: Table[string, int]
     cooldownsByRoute*: Table[string, int]
     cooldownStarts*: Table[string, int]
@@ -968,6 +970,12 @@ proc rotateLog*(log: var RequestLog): bool =
     if fd >= 0:
       log.fd = fd
       logFdToClose = fd
+    else:
+      # The fd this proc closed is still in `log.fd`. Keeping that number is a
+      # real hazard: the kernel hands it to the next open, and the log would then
+      # write request lines into whatever that turns out to be. -1 makes
+      # appendLine reopen by path instead.
+      log.fd = -1
     return false
   let fd = posix.open(path.cstring, O_WRONLY or O_CREAT or O_APPEND,
                       Mode(LogFileMode))
@@ -981,10 +989,37 @@ proc rotateLog*(log: var RequestLog): bool =
   log.justRotated = true
   true
 
+proc reopenLog(log: var RequestLog): bool =
+  ## After a rotation that could not reopen the file, the fd is -1. Writing to it
+  ## fails on every request, so each append retries the open once: the disk may
+  ## have room again, or the mount may be back.
+  let fd = posix.open(log.path.cstring, O_WRONLY or O_CREAT or O_APPEND,
+                      Mode(LogFileMode))
+  if fd < 0:
+    return false
+  log.fd = fd
+  logFdToClose = fd
+  # The byte counter follows the file this process is now writing to, not the one
+  # it lost, or the next rotation would fire at the wrong size.
+  try:
+    log.bytes = getFileSize(log.path)
+  except CatchableError:
+    log.bytes = 0
+  true
+
+proc reportLogFailure(log: var RequestLog, detail: string) =
+  ## The request path is the hot path: report the first failed append of an
+  ## outage and the first one that succeeds after it, never one line per request.
+  if not log.failing:
+    log.failing = true
+    stderr.writeLine("kori: request log is not being written: " & detail)
+
 proc appendLine*(log: var RequestLog, line: string): bool =
   ## One write(2) carrying the whole line including its newline (CONTRACT §3). A
   ## short write is left short rather than spliced: a partial line is honest, two
-  ## interleaved requests are not.
+  ## interleaved requests are not. Returns false whenever the line did not reach
+  ## the file, so the caller can tally it; the line it writes to stderr is one
+  ## per outage, not one per request.
   let data = line & "\n"
   log.justRotated = false
   # Rotation is checked against the size this process has accounted for, so a
@@ -994,15 +1029,37 @@ proc appendLine*(log: var RequestLog, line: string): bool =
      log.bytes + int64(data.len) > log.rotateBytes:
     if log.rotateLog():
       log.bytes = 0
+  if log.fd < 0 and not reopenLog(log):
+    log.reportLogFailure("no open file for '" & log.path & "': errno " & $errno)
+    return false
   var written = posix.write(log.fd, unsafeAddr data[0], data.len)
   if written < 0 and errno == EINTR:
     written = posix.write(log.fd, unsafeAddr data[0], data.len)
   if written != data.len:
-    stderr.writeLine("kori: short log write: " & $written & " of " &
-                     $data.len & " bytes")
+    let detail = if written < 0: "errno " & $errno
+                 else: "short write: " & $written & " of " & $data.len & " bytes"
+    log.reportLogFailure(detail & " to '" & log.path & "'")
     return false
+  if log.failing:
+    log.failing = false
+    stderr.writeLine("kori: request log is being written again: '" &
+                     log.path & "'")
   log.bytes += int64(written)
   true
+
+proc recordRequestLog*(gateway: Gateway, line: string) =
+  ## Both request paths reach the file through here, so the answer to "did this
+  ## line land" is tallied in one place. A lost line is the whole risk of this
+  ## design: the gateway keeps serving, so only a counter can make it visible.
+  if not gateway.log.appendLine(line):
+    inc gateway.metrics.logWriteFailures
+    return
+  # After a rotation the live file starts at zero, so the total the page reports
+  # is the one for the file it is actually reading.
+  if gateway.log.justRotated:
+    gateway.logLines = 1
+  else:
+    inc gateway.logLines
 
 # ------------------------------------------------------------------- pricing ---
 
@@ -1125,6 +1182,12 @@ proc metricsText*(gateway: Gateway): string =
   text.add "# HELP kori_reloads_total Config reloads applied from SIGHUP.\n"
   text.add "# TYPE kori_reloads_total counter\n"
   text.add "kori_reloads_total " & $gateway.reloads & "\n"
+  # The gateway keeps serving when the log cannot be written, so a lost request
+  # line is invisible everywhere else. This counter is the only signal that the
+  # artifact the whole gateway exists to produce stopped arriving.
+  text.add "# HELP kori_log_write_failures_total Request-log lines that never reached the file.\n"
+  text.add "# TYPE kori_log_write_failures_total counter\n"
+  text.add "kori_log_write_failures_total " & $gateway.metrics.logWriteFailures & "\n"
   text.add "# HELP kori_info Build information, always 1.\n"
   text.add "# TYPE kori_info gauge\n"
   text.add "kori_info{version=\"" & promEscape(KoriVersion) & "\",revision=\"" &
@@ -2921,7 +2984,7 @@ proc handleChat(gateway: Gateway, request: Request): Future[void] {.async.} =
   if costUsd.isSome:
     gateway.costUsdTotal += costUsd.get
     inc gateway.costUsdKnown
-  if gateway.log.appendLine(requestLogLine(
+  gateway.recordRequestLog(requestLogLine(
       ts = nowStamp(),
       route = route,
       status = status,
@@ -2938,13 +3001,7 @@ proc handleChat(gateway: Gateway, request: Request): Future[void] {.async.} =
       # never clamped keeps the nine keys it had before this feature.
       effortClamped = effortClampedLog,
       # Absent on a model the config does not price: "not priced" is not "$0.00".
-      costUsd = costUsd)):
-    # After a rotation the live file starts at zero, so the total the page reports
-    # is the one for the file it is actually reading.
-    if gateway.log.justRotated:
-      gateway.logLines = 1
-    else:
-      inc gateway.logLines
+      costUsd = costUsd))
 
 # ------------------------------------------------------------- systemone ---
 
@@ -3209,7 +3266,7 @@ proc handleSystemone(gateway: Gateway, request: Request): Future[void] {.async.}
   if costUsd.isSome:
     gateway.costUsdTotal += costUsd.get
     inc gateway.costUsdKnown
-  if gateway.log.appendLine(requestLogLine(
+  gateway.recordRequestLog(requestLogLine(
       ts = nowStamp(),
       route = route,
       status = status,
@@ -3219,11 +3276,7 @@ proc handleSystemone(gateway: Gateway, request: Request): Future[void] {.async.}
       failoverFrom = firstFrom,
       failoverReason = logReason,
       stream = false,
-      costUsd = costUsd)):
-    if gateway.log.justRotated:
-      gateway.logLines = 1
-    else:
-      inc gateway.logLines
+      costUsd = costUsd))
 
 # ---------------------------------------------------------------- log tail ---
 
