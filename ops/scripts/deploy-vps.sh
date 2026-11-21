@@ -615,8 +615,6 @@ if [ -n "${KORI_EDGE_TOKEN:-}" ]; then
     # SELinux: Caddy runs as httpd_t and must be able to read this file (team note, 2026-11-15).
     restorecon "$RENDERED" 2>/dev/null || true
     log "==> rendered edge block $RENDERED"
-  fi
-  if [ "$RENDER_CHANGED" = "1" ]; then
     # Validate before the restart. A block that does not adapt takes every site on this host down
     # with it: the first run carried `servers` inside a site block (a global-only option), Caddy
     # exited 1 and the whole edge was dark until the import was commented out by hand (2026-11-16).
