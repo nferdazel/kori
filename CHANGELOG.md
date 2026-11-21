@@ -11,6 +11,8 @@ this one, is the answer to "what is live".
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-11-21
+
 ### Added
 
 - A readiness probe for the gateway: `kori-readyz.service` and `kori-readyz.timer` ask
