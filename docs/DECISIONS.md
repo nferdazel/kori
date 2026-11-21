@@ -499,3 +499,34 @@ which is the fail-closed default rather than a broken deploy. This record does n
 or `DEC-18`; loopback and the edge still stand, and the binary now has a gate of its own behind
 them. If the surface grows a need for per-person identity, the gate moves to Cloudflare Access and
 this one becomes the second lock instead of the only one.
+
+---
+
+## DEC-21 — The login window throttles a failed attempt, not the credential
+
+**Status:** accepted 2026-11-21. Narrows two sentences of `DEC-20`; `DEC-20`'s decision stands.
+
+**Context.** `DEC-20` decided that five failed logins in five minutes answer `429`, counted
+globally. It did not say *when* in the handler the window is read, and the code read it before the
+token was compared, so a correct token was refused inside the window. The reasoning that made the
+count global — behind Caddy every request arrives from one address, so a per-IP window would be one
+window — is still true. What it did not account for is that `/session/login` is reachable without a
+credential from the internet: measured 2026-11-21, five wrong tokens answered `429` to the sixth, and
+the owner's own token answered `429` in the same window, locally and on `dash.qouver.com`. A loop of
+five wrong logins every five minutes therefore keeps the owner out of their own dashboard for ever,
+at a cost of about one request per minute. An availability decision had become a remote denial of
+the gate it was meant to protect.
+
+**Decision.** Compare first, throttle the failure. A request whose token matches gets its session
+whatever the window holds. A request whose token does not match is counted, and the `429` applies to
+that failed attempt only — the list never grows past `MaxAdminLoginFailures`, so the window still
+closes after five failures for five minutes and a brute-force run is still cut off. The count stays
+global for the `DEC-20` reason. The comparison an over-limit caller provokes is one constant-time
+pass on a fixed-size string, so nothing is gained by refusing to do it.
+
+**Consequences.** The lockout an anonymous caller could trigger is gone; the throttle it was there
+for is not. The window is still not a per-caller signal, so an attacker who keeps the window full
+makes *failed* logins answer `429` instead of `401` — a cheaper answer than before, and the reason
+the edge rule in `OPS-SHIP §4.4` is still the right place for anything per-IP. `a16` asserts the new
+contract: five failures, then a `429` for a wrong token and a `204` for the right one. The unit test
+and the constant's comment name this record, so a reader following the number finds the reason.

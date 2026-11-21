@@ -53,9 +53,24 @@ const
   DefaultPort = 8787
 
   LogFileMode = 0o640
-  MaxRequestBytes = 33_554_432
+  ## The cap on a caller's body, enforced by the HTTP layer before a byte is
+  ## buffered: a declared Content-Length over it is a 413 on the framing check.
+  ## 8 MiB is ten times the largest legitimate body this gateway is sent — a
+  ## 200k-token chat request is under 1 MB, and there is no image, audio or batch
+  ## path to carry anything bigger — and it is small enough that an
+  ## unauthenticated POST cannot hold the container's 512M budget. Before this it
+  ## was 32 MiB, which one 30 MiB login body turned into ~190 MB of RSS at a
+  ## caller who never authenticated (measured, SEC-1).
+  MaxRequestBytes* = 8_388_608
   MaxHeaderBytes = 65_536
+  ## Bounds the *answer* read from an upstream, not a caller's body.
   MaxBodyBytes = 67_108_864
+  ## The one deadline the HTTP library enforces, not this binary: from the first
+  ## byte of a request to its last, headers and body included, and the idle time
+  ## between two requests on a keep-alive connection. Without it a half-sent
+  ## header block holds its connection and buffers for ever (SEC-2). It is looser
+  ## than every other deadline because it bounds the caller, not a provider.
+  ReadTimeoutMs* = 30_000
 
   # SPEC §3b.1. Every number is a deadline this binary enforces itself.
   ConnectDeadlineMs* = 2_000
@@ -129,6 +144,10 @@ const
   MaxAdminSessions* = 256
   ## Five failed logins in five minutes, counted globally: behind Caddy every
   ## request arrives from one address, so a per-IP window would be one window.
+  ## DEC-21: the window throttles the *failed* attempt. A correct token is
+  ## compared first and always gets its session, because the surface is reachable
+  ## unauthenticated and a window that refused the credential let anyone lock the
+  ## owner out with five wrong tokens every five minutes.
   MaxAdminLoginFailures* = 5
   AdminLoginWindowS* = 300.0
   ## A login body is two short strings. The HTTP layer has already read the body by the
@@ -3823,17 +3842,34 @@ proc modelsJson*(gateway: Gateway): string =
 
 proc respondJson(request: Request, status: HttpCode,
                  body: string): Future[void] {.async.} =
+  ## Every JSON answer goes through here, so the two headers a JSON read surface
+  ## needs are set once: `no-store` keeps a proxy or a browser from caching a
+  ## gated read, and `nosniff` keeps a sniffing browser from reinterpreting the
+  ## body. A HEAD gets the same headers and the length a GET would answer, and no
+  ## body: RFC 9110 §9.3.2.
   var headers = newHttpHeaders()
   headers["Content-Type"] = "application/json"
-  await request.respond(status, body, headers)
+  headers["Cache-Control"] = "no-store"
+  headers["X-Content-Type-Options"] = "nosniff"
+  # Declared here, not by `respond`: it would otherwise measure the empty HEAD
+  # payload and answer `Content-Length: 0`, which is not the length a GET answers.
+  headers["Content-Length"] = $body.len
+  let payload = if request.reqMethod == HttpHead: "" else: body
+  await request.respond(status, payload, headers)
 
-proc respondMethodNotAllowed(request: Request): Future[void] {.async.} =
-  ## D11 point 4: the refusal names the one method the read surface answers.
+proc respondMethodNotAllowed(request: Request, allow = "GET"): Future[void] {.async.} =
+  ## D11 point 4: the refusal names the methods the surface answers. A HEAD gets
+  ## no body (RFC 9110 §9.3.2), which is why every refusal is built here rather
+  ## than in five copies that each forgot it.
   var headers = newHttpHeaders()
   headers["Content-Type"] = "application/json"
-  headers["Allow"] = "GET"
-  await request.respond(Http405,
-    "{\"error\":{\"type\":\"method_not_allowed\",\"message\":\"GET\"}}", headers)
+  headers["Cache-Control"] = "no-store"
+  headers["X-Content-Type-Options"] = "nosniff"
+  headers["Allow"] = allow
+  let full = "{\"error\":{\"type\":\"method_not_allowed\",\"message\":" & $ %allow & "}}"
+  headers["Content-Length"] = $full.len
+  let body = if request.reqMethod == HttpHead: "" else: full
+  await request.respond(Http405, body, headers)
 
 proc handleAdminLog(gateway: Gateway,
                     request: Request): Future[void] {.async.} =
@@ -4126,7 +4162,9 @@ proc respondGateDenied*(request: Request, page: bool): Future[void] {.async.} =
     await request.respond(Http302, "", headers)
     return
   headers["Content-Type"] = "application/json"
-  let body = if request.reqMethod == HttpHead: "" else: adminDeniedBody()
+  let full = adminDeniedBody()
+  headers["Content-Length"] = $full.len
+  let body = if request.reqMethod == HttpHead: "" else: full
   await request.respond(Http401, body, headers)
 
 proc respondGateMissing*(request: Request): Future[void] {.async.} =
@@ -4137,15 +4175,15 @@ proc respondGateMissing*(request: Request): Future[void] {.async.} =
 
 proc handleSessionLogin(gateway: Gateway,
                         request: Request): Future[void] {.async.} =
-  ## DEC-20 §6 and §8. Anything that is not the right token gets one 401 and
-  ## counts against the window; a caller over the limit gets 429 before its token
-  ## is even compared, which is why a correct token is refused inside the window.
+  ## DEC-20 §6 and §8, as narrowed by DEC-21: the window throttles a *failed*
+  ## attempt, never the credential. A caller over the limit gets 429 without the
+  ## token being compared, but only after its own attempt would have failed; a
+  ## correct token always gets its session. The window is global because behind
+  ## Caddy every request arrives from one address, and it used to be checked
+  ## before the comparison, which let anyone lock the owner out of the dashboard
+  ## with five wrong tokens every five minutes (SEC-3).
   if request.reqMethod != HttpPost:
-    var refusal = newHttpHeaders()
-    refusal["Content-Type"] = "application/json"
-    refusal["Allow"] = "POST"
-    await request.respond(Http405,
-      "{\"error\":{\"type\":\"method_not_allowed\",\"message\":\"POST\"}}", refusal)
+    await respondMethodNotAllowed(request, allow = "POST")
     return
   let token = readAdminToken()
   if token.isNone:
@@ -4153,9 +4191,6 @@ proc handleSessionLogin(gateway: Gateway,
     return
   let now = epochTime()
   pruneLoginFailures(gateway, now)
-  if gateway.loginFailures.len >= MaxAdminLoginFailures:
-    await respondJson(request, Http429, TooManyLoginsBody)
-    return
   var supplied = ""
   if request.body.len <= MaxLoginBodyBytes:
     try:
@@ -4167,33 +4202,31 @@ proc handleSessionLogin(gateway: Gateway,
       # A body that is not this shape is a failed login, not a 400: the gate has
       # one answer for "no valid token" and this is one of the ways to have none.
       discard
-  if supplied.len == 0 or not constantTimeEquals(token.get, supplied):
-    gateway.loginFailures.add now
+  if supplied.len > 0 and constantTimeEquals(token.get, supplied):
+    let sessionId = startSession(gateway)
+    if sessionId.isNone:
+      await respondJson(request, Http500,
+        "{\"error\":{\"type\":\"session_unavailable\",\"message\":\"no session could be created\"}}")
+      return
     var headers = newHttpHeaders()
-    headers["Content-Type"] = "application/json"
+    headers["Set-Cookie"] = sessionCookie(sessionId.get, int(AdminSessionTtlS))
     headers["Cache-Control"] = "no-store"
-    await request.respond(Http401, adminDeniedBody(), headers)
+    await request.respond(Http204, "", headers)
     return
-  let sessionId = startSession(gateway)
-  if sessionId.isNone:
-    await respondJson(request, Http500,
-      "{\"error\":{\"type\":\"session_unavailable\",\"message\":\"no session could be created\"}}")
+  # A failed attempt: over the limit it is a 429 and the list is not appended to
+  # (that is what keeps the window a window), under it the failure is recorded.
+  if gateway.loginFailures.len >= MaxAdminLoginFailures:
+    await respondJson(request, Http429, TooManyLoginsBody)
     return
-  var headers = newHttpHeaders()
-  headers["Set-Cookie"] = sessionCookie(sessionId.get, int(AdminSessionTtlS))
-  headers["Cache-Control"] = "no-store"
-  await request.respond(Http204, "", headers)
+  gateway.loginFailures.add now
+  await respondJson(request, Http401, adminDeniedBody())
 
 proc handleSessionLogout(gateway: Gateway,
                          request: Request): Future[void] {.async.} =
   ## Idempotent on purpose: an unknown or absent cookie still drops nothing and
   ## still clears the browser's copy, so a stale tab logs out in one click.
   if request.reqMethod != HttpPost:
-    var refusal = newHttpHeaders()
-    refusal["Content-Type"] = "application/json"
-    refusal["Allow"] = "POST"
-    await request.respond(Http405,
-      "{\"error\":{\"type\":\"method_not_allowed\",\"message\":\"POST\"}}", refusal)
+    await respondMethodNotAllowed(request, allow = "POST")
     return
   let id = sessionCookieValue(request)
   if id.len > 0 and gateway.sessions.hasKey(id):
@@ -4213,12 +4246,7 @@ proc handleStatic(gateway: Gateway,
   ## table to reach a file. Nothing here touches the filesystem, so a traversal
   ## attempt is just a key that is not present.
   if request.reqMethod notin {HttpGet, HttpHead}:
-    var refusal = newHttpHeaders()
-    refusal["Content-Type"] = "application/json"
-    refusal["Allow"] = "GET, HEAD"
-    await request.respond(Http405,
-      "{\"error\":{\"type\":\"method_not_allowed\",\"message\":\"GET, HEAD\"}}",
-      refusal)
+    await respondMethodNotAllowed(request, allow = "GET, HEAD")
     return
 
   let path = resolveStaticPath(request.url.path)
@@ -4288,6 +4316,7 @@ proc routeRequest(gateway: Gateway, request: Request): Future[void] {.async.} =
         let body = gateway.metricsText()
         let headers = @[("Content-Type", "text/plain; version=0.0.4; charset=utf-8"),
                         ("Cache-Control", "no-store"),
+                        ("X-Content-Type-Options", "nosniff"),
                         ("Content-Length", $body.len)]
         # A HEAD gets the same headers and no body, like every other read surface.
         let payload = if request.reqMethod == HttpHead: "" else: body
@@ -4545,7 +4574,8 @@ proc main() =
                    gateway.listenAddr & ", log " & cfg.logPath)
 
   installStopHandlers()
-  let server = newAsyncHttpServer(maxBody = MaxRequestBytes)
+  let server = newAsyncHttpServer(maxBody = MaxRequestBytes,
+                                  readTimeout = ReadTimeoutMs)
   let handler = proc (request: Request): Future[void] {.async, gcsafe.} =
     await gateway.dispatch(request)
   let serving = server.serve(Port(cfg.listenPort), handler, cfg.listenHost)

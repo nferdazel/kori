@@ -1317,8 +1317,10 @@ block:
   delEnv(AdminTokenEnv)
 
 block:
-  # The login window. Five failures block the sixth attempt, and the counter is
-  # global: nothing about the credential changes the answer.
+  # The login window. Five failures block the sixth *failed* attempt, and the
+  # counter is global: behind Caddy every request arrives from one address. DEC-21
+  # narrowed it so the window never refuses a correct token — the handler compares
+  # first and only a mismatch is counted or 429'd.
   var cfg = Config(listenHost: "127.0.0.1", listenPort: 4011,
                    logPath: scratch / "window.jsonl")
   cfg.legs = @[legSpec("leg-a", lrPrimary)]
@@ -1331,7 +1333,7 @@ block:
     "{\"token\":" & $ %token & "}"
   # The handler needs a socket to answer, so the window is driven directly: five
   # failures recorded inside the window, the sixth sees a full list. That is the
-  # same list the handler reads before it compares anything.
+  # same list the handler reads after a mismatch.
   for _ in 0 ..< MaxAdminLoginFailures:
     gateway.loginFailures.add epochTime()
   gateway.pruneLoginFailures(epochTime())
@@ -1345,6 +1347,11 @@ block:
     gateway.loginFailures.len == 0
   check "the login body shape is what the handler parses",
     parseJson(loginBody("t")){"token"}.getStr() == "t"
+  # The two numbers the transport depends on. Both are enforced outside Nim code
+  # this test can reach, so what is checked here is that they are the values the
+  # acceptance harness measures against.
+  check "a caller's body cap is 8 MiB, not the old 32", MaxRequestBytes == 8_388_608
+  check "the read timeout is 30 s", ReadTimeoutMs == 30_000
   delEnv(AdminTokenEnv)
 
 block:

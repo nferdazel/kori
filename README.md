@@ -313,8 +313,9 @@ Both paths sit outside `/admin/` on purpose: anything but GET or HEAD under `/ad
 `405`.
 
 Five failed logins within five minutes answer `429` for every caller, because behind Caddy each
-request arrives from one address. The limit is counted globally and checked before the token is
-compared, so a correct token is refused inside the window too; wait it out.
+request arrives from one address. The limit is counted globally and applies to a *failed* attempt: a
+correct token is compared first and always gets its session, so the window throttles brute force
+without ever locking the owner out (`DEC-21`). Wait the window out for a wrong token.
 
 A gated dashboard page answers `302` to `/login.html` when the request accepts HTML, and the `401`
 JSON body otherwise, so `curl` learns why instead of receiving a page it cannot use. `/healthz` stays
@@ -519,7 +520,7 @@ missing.
 The acceptance harness proves the router end to end against a real binary:
 
 ```sh
-KORI_BIN=./apps/api/src/kori sh acceptance/run-all.sh   # the sixteen cases, A1-A16
+KORI_BIN=./apps/api/src/kori sh acceptance/run-all.sh   # the seventeen cases, A1-A17
 KORI_BIN=./apps/api/src/kori sh acceptance/selftest.sh  # proves the harness itself
 ```
 
@@ -541,6 +542,7 @@ KORI_BIN=./apps/api/src/kori sh acceptance/selftest.sh  # proves the harness its
 | a14 | `cost_usd`, the SIGHUP reload, log rotation and `/metrics` (DEC-15 to DEC-18) |
 | a15 | the System One door: passthrough, its own log line, a bad model, a caller's 400 and an unconfigured door (DEC-19) |
 | a16 | the admin gate: `401` without a credential, `404` with no token file, the cookie flags, the login limit, `429`, and `/healthz` still open (DEC-20) |
+| a17 | the anonymous transport limits: a body over 8 MiB is a `413` before it is buffered, a half-sent request is released at the 30 s read timeout, every JSON read is `no-store` + `nosniff`, and `HEAD` carries no body |
 
 Cases use logical port numbers; `acceptance/lib.sh` resolves each to a free port per run, so a run
 leaves nothing behind and can be repeated immediately.

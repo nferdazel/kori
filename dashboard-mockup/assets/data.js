@@ -175,7 +175,7 @@
     version: "0.1.0",
     started_at: STARTED,
     config: {
-      path: "/Users/sachiel/.config/kori/config.toml",
+      path: "/etc/kori/config.json",
       modified_at: "2026-11-14T16:58:02+07:00"
     },
     balance: true,
@@ -185,7 +185,7 @@
         base_url: "https://opencode.ai/inference/go/openai/v1",
         model: "deepseek-v4.1-flash",
         headers: ["x-opencode-session"],
-        credential: { name: "opencode-go refresh token", state: "set", source: "file", ref: "/Users/sachiel/.config/kori/credentials:7" }
+        credential: { name: "opencode-go refresh token", state: "set", source: "file", ref: "/etc/kori/credentials:7" }
       },
       {
         order: 2, name: "commandcode", role: "primary", weight: 1,
@@ -205,7 +205,7 @@
     timeouts: { connect_ms: 3000, header_ms: 30000, body_ms: 120000 },
     cooldowns: { availability_s: 60, quota_s: 900 },
     log: {
-      path: "/Users/sachiel/Library/Logs/kori/requests.log",
+      path: "/var/log/kori/requests.jsonl",
       append_only: true,
       redacted: true
     }
@@ -215,7 +215,7 @@
     s.gateway = {
       version: "0.1.0",
       started_at: STARTED,
-      log_path: "/Users/sachiel/Library/Logs/kori/requests.log",
+      log_path: "/var/log/kori/requests.jsonl",
       log_lines: s.log.length,
       log_bytes: 128400
     };

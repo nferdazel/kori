@@ -138,7 +138,7 @@ assert_eq "A16g a bearer does not open a gateway with no token file" \
        -H "Authorization: Bearer $TOKEN" "$GW_URL/admin/state")" "404"
 
 echo
-echo "=== A16h: five failed logins, then a global 429 (contract 8)"
+echo "=== A16h: five failed logins fill the window, and the credential still works (DEC-21)"
 # A restart empties the failure counter and the session table, so the five below
 # are the only attempts this window has seen.
 unset ADMIN_TOKEN_FILE ADMIN_TOKEN_WRITE
@@ -148,11 +148,14 @@ while [ $i -lt 5 ]; do
   i=$((i + 1))
   assert_eq "A16h failed login $i is 401" "$(gate_login "$RUN/a16-bad$i" "$WRONG")" "401"
 done
-assert_eq "A16h the sixth attempt is 429" "$(gate_login "$RUN/a16-bad6" "$WRONG")" "429"
-# The counter is global, not per credential: the right token is refused through
-# the same window.
-assert_eq "A16h the right token is 429 inside the same window" \
-  "$(gate_login "$RUN/a16-bad7" "$TOKEN")" "429"
+# DEC-21: the window throttles the failed attempt, never the credential. The
+# sixth *wrong* login is 429, and the right token is still 204 — a lockout an
+# anonymous caller can trigger would keep the owner out of their own dashboard.
+assert_eq "A16h the sixth wrong login is 429" "$(gate_login "$RUN/a16-bad6" "$WRONG")" "429"
+assert_eq "A16h the right token still logs in inside the window" \
+  "$(gate_login "$RUN/a16-good-in-window" "$TOKEN")" "204"
+assert_eq "A16h a wrong login is still 429 after that" \
+  "$(gate_login "$RUN/a16-bad7" "$WRONG")" "429"
 
 echo
 echo "=== A16i: the sentinel, over everything the log saw"
