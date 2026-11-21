@@ -64,6 +64,10 @@ task_nim() {
   nimble test -y
   nim c -d:release --mm:orc --threads:on --hints:off -o:apps/api/src/kori apps/api/src/kori.nim
   KORI_BIN=./apps/api/src/kori sh acceptance/selftest.sh
+  # The selftest proves the harness's own assertions fire both ways; it does not touch the router.
+  # Only run-all does, and CI's `nim` job has always run it — so without this line `./task gate-full`
+  # was green on a laptop while the same tree was red in CI.
+  KORI_BIN=./apps/api/src/kori sh acceptance/run-all.sh
 }
 
 # VERSION is the single source: the binary reads it through the generated module, the nimble
