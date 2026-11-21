@@ -11,6 +11,8 @@ this one, is the answer to "what is live".
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-11-21
+
 ### Fixed
 
 - `acceptance/a18-log-write.sh` now proves the serving leg by counting the stub's dials instead of
