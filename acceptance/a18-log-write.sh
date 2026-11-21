@@ -40,9 +40,14 @@ echo
 echo "=== A18a: the request is served, not failed"
 # The platform's remaining room past the cap is spent here, whatever it is, so
 # the state this case grades starts from the next request.
+dials_before=$(dials leg-a)
 req a18-probe "$RUN/a18-req.json"
 assert_eq "A18a the request answered 200" "$(http_code a18-probe)" "200"
-assert_eq "A18a it was served by the leg" "$(lg '.route')" "leg-a"
+# The route cannot be read off the log, because the log is the thing this case
+# breaks and whether this line lands is platform-specific: BSD still lets one
+# append squeeze past the cap, Linux refuses it outright, and the last line is
+# then a seeded one. The stub's dial count proves the leg served it on both.
+assert_eq "A18a it was served by the leg" "$(dials leg-a)" "$((dials_before + 1))"
 lines_before=$(log_count)
 failures_before=$(log_failures)
 assert_ne "A18b the counter is published" "$failures_before" ""
