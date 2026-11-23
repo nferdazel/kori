@@ -11,6 +11,26 @@ this one, is the answer to "what is live".
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-11-23
+
+### Fixed
+
+- A provider that answers **402** now enters the dead-route class instead of falling through to
+  the passthrough branch. Before, `failureToken` had no 402 branch, so a leg out of credit stayed
+  "healthy" in rotation, no `failover_reason` was written, and the provider's own billing body
+  was handed to the caller unchanged. This is the sinarcloud incident of 2026-11-22 seen from the
+  code side. The new token is `billing_402`; it takes the same 900 s capacity cooldown as
+  `quota_429`, rotates through an API-key pool like a dead credential, and moves the capacity
+  counter rather than the availability one. Covered by `acceptance/a21-billing-402.sh` and two
+  unit assertions, so the branch cannot be dropped silently again.
+
+### Changed
+
+- `acceptance/run-all.sh` refuses a `KORI_BIN` whose embedded version is not `VERSION`. The
+  default binary path is gitignored, so a stale build used to report a green suite for code it
+  was not built from; on 2026-11-23 two readers of this tree described two different binaries
+  and both concluded wrongly from it. The guard is skipped when `strings` is unavailable.
+
 ## [0.9.1] - 2026-11-21
 
 ### Fixed

@@ -163,6 +163,7 @@ const
   TokenHeaderTimeout* = "header_timeout"
   TokenUpstream5xx* = "upstream_5xx"
   TokenQuota429* = "quota_429"
+  TokenBilling402* = "billing_402"
   TokenMidStreamAbort* = "mid_stream_abort"
 
   ## The caller hung up before the answer was finished. It is not a leg failure:
@@ -1323,7 +1324,7 @@ proc startCooldown*(gateway: Gateway, index: int, reason: string) =
   ## §3.1 and §3.2: the cooldown starts at the failure, and the leg's failure
   ## counter moves once for this request (D11.1).
   let cooldown =
-    if reason == TokenQuota429: CapacityCooldownS
+    if reason in [TokenQuota429, TokenBilling402]: CapacityCooldownS
     else: AvailabilityCooldownS
   let now = epochTime()
   var runtime = addr gateway.legs[index]
@@ -1385,7 +1386,7 @@ proc startSystemoneCooldown*(gateway: Gateway, index: int, reason: string) =
   ## The same two cooldowns and the same reason tokens as the chat door, so one
   ## log is readable without knowing which door a line came from.
   let cooldown =
-    if reason == TokenQuota429: CapacityCooldownS
+    if reason in [TokenQuota429, TokenBilling402]: CapacityCooldownS
     else: AvailabilityCooldownS
   let now = epochTime()
   var runtime = addr gateway.systemone[index]
@@ -1640,6 +1641,12 @@ proc failureToken*(status: int, body: string, aliasMapped = false,
     TokenModelGone
   elif status == 429 and isQuotaBody(body):
     TokenQuota429
+  elif status == 402:
+    # A provider that has run out of credit answers 402 with its own billing
+    # body. It is a dead route, not a caller error: leaving it unclassified
+    # handed the provider's billing text to the caller and kept a leg that
+    # cannot serve in rotation (sinarcloud, 2026-11-22).
+    TokenBilling402
   elif status >= 500:
     TokenUpstream5xx
   else:
@@ -2407,7 +2414,7 @@ proc coolKey*(gateway: Gateway, index, keyIndex: int, reason: string): bool =
   if leg.apiKeys.len <= 1:
     return false
   let cooldown =
-    if reason == TokenQuota429: CapacityCooldownS
+    if reason in [TokenQuota429, TokenBilling402]: CapacityCooldownS
     else: AvailabilityCooldownS
   let now = epochTime()
   var runtime = addr gateway.legs[index]
@@ -2859,8 +2866,9 @@ proc handleChat(gateway: Gateway, request: Request): Future[void] {.async.} =
               break legDials
             continue
           # A dead key is a dead credential, not a dead leg: rotate within the pool
-          # until its live entries are spent, and only then blame the leg.
-          if outcome.reason in [TokenAuth401, TokenQuota429] and
+          # until its live entries are spent, and only then blame the leg. A spent
+          # balance is per credential, the same as a spent quota.
+          if outcome.reason in [TokenAuth401, TokenQuota429, TokenBilling402] and
              leg.apiKeys.len > 1 and rotations + 1 < leg.apiKeys.len:
             inc rotations
             if gateway.coolKey(index, keyIndex, outcome.reason):
@@ -2889,7 +2897,7 @@ proc handleChat(gateway: Gateway, request: Request): Future[void] {.async.} =
         if chain.firstReason.len == 0:
           chain.firstReason = outcome.reason
           chain.firstFrom = leg.name
-          if outcome.reason == TokenQuota429:
+          if outcome.reason in [TokenQuota429, TokenBilling402]:
             chain.capacity = true
           else:
             chain.availability = true

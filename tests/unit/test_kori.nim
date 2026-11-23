@@ -288,6 +288,9 @@ check "429 with a quota body is the capacity class",
   failureToken(429, """{"error":{"type":"GoUsageLimitError"}}""") == "quota_429"
 check "429 without a quota body is a client error (D9.3)",
   failureToken(429, """{"error":{"message":"Rate limit reached for requests per minute (RPM).","type":"requests"}}""") == ""
+check "402 is the billing class, whatever the body says",
+  failureToken(402, "") == "billing_402" and
+  failureToken(402, """{"error":{"message":"insufficient balance"}}""") == "billing_402"
 check "503 is upstream_5xx", failureToken(503, "") == "upstream_5xx"
 check "502 with an HTML body is upstream_5xx",
   failureToken(502, "<html>bad gateway</html>") == "upstream_5xx"

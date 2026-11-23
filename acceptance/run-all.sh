@@ -16,7 +16,22 @@ if [ ! -x "$KORI_BIN" ]; then
   exit 1
 fi
 
-CASES="a1-failover a2-dead-socket a3-deadlines a4-capacity a5-client-error a6-stream a7-toolcall a8-fresh a9-all-dead a10-admin a11-refresh a12-model-map a13-parity a14-ops a15-systemone a16-admin-auth a17-transport a18-log-write a19-admin-scan-budget a20-log-reopen"
+# The default KORI_BIN is gitignored, so a stale build sits there and the whole
+# suite reports green against code that is not this tree. Two people read two
+# different binaries on 2026-11-23 and wrote opposite conclusions from it. When
+# `strings` is missing the check is skipped rather than failed: a missing binutils
+# is not evidence about the binary.
+if command -v strings >/dev/null 2>&1; then
+  want=$(tr -d ' \n\r' <"$ACC_DIR/../VERSION")
+  have=$(strings "$KORI_BIN" | sed -n 's/^@\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)$/\1/p' | head -1)
+  if [ "$have" != "$want" ]; then
+    echo "KORI_BIN $KORI_BIN is version '$have', this tree is '$want'" >&2
+    echo "rebuild it, or point KORI_BIN at a fresh build: KORI_BIN=/path/to/kori sh acceptance/run-all.sh" >&2
+    exit 1
+  fi
+fi
+
+CASES="a1-failover a2-dead-socket a3-deadlines a4-capacity a5-client-error a6-stream a7-toolcall a8-fresh a9-all-dead a10-admin a11-refresh a12-model-map a13-parity a14-ops a15-systemone a16-admin-auth a17-transport a18-log-write a19-admin-scan-budget a20-log-reopen a21-billing-402"
 
 red=
 green=0
