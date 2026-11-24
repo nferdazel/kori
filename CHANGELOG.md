@@ -11,6 +11,8 @@ this one, is the answer to "what is live".
 
 ## [Unreleased]
 
+## [0.10.4] - 2026-11-24
+
 ### Changed
 
 - `header_timeout` is the one failure class with a ladder instead of a flat cooldown. The first
