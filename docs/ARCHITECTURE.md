@@ -93,12 +93,16 @@ path, content type and body for the eight files under `apps/web/dist`.
    what the caller actually saw. The same completion feeds the `/metrics` counters, so a scrape
    and the log cannot disagree about how many requests a route answered.
 
-Cooldowns are 60 s for availability failures and 900 s for a quota `429`. A leg whose
-cooldown has expired is eligible again, and the first request that picks it acts as the
-half-open probe: a second failure starts a fresh full cooldown. A pool entry cools on the
-same clock, and the leg itself is only cooled once every entry in the pool is cooling. A leg
-skipped for its effort ceiling or for an unmapped alias was never dialled, so it is not a
-failure and takes no cooldown.
+Cooldowns are 60 s for availability failures and 900 s for a quota `429`, with one exception:
+`header_timeout` starts at the header window that attempt waited, clamped to 5–60 s, and doubles per
+consecutive timeout inside that clamp (`DEC-23`). The streaming door therefore starts at 15 s and the
+90 s non-stream and System One doors start at the 60 s cap: a rung shorter than the window it
+followed would schedule a probe dearer than the cooldown it ends. A leg whose cooldown has expired is
+eligible again, and the first request that picks
+it acts as the half-open probe: a second failure starts a fresh full cooldown. A pool entry cools
+on the same clock, and the leg itself is only cooled once every entry in the pool is cooling. A leg
+skipped for its effort ceiling or for an unmapped alias was never dialled, so it is not a failure
+and takes no cooldown.
 
 ## The System One door
 

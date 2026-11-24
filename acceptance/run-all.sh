@@ -31,7 +31,7 @@ if command -v strings >/dev/null 2>&1; then
   fi
 fi
 
-CASES="a1-failover a2-dead-socket a3-deadlines a4-capacity a5-client-error a6-stream a7-toolcall a8-fresh a9-all-dead a10-admin a11-refresh a12-model-map a13-parity a14-ops a15-systemone a16-admin-auth a17-transport a18-log-write a19-admin-scan-budget a20-log-reopen a21-billing-402"
+CASES="a1-failover a2-dead-socket a3-deadlines a4-capacity a5-client-error a6-stream a7-toolcall a8-fresh a9-all-dead a10-admin a11-refresh a12-model-map a13-parity a14-ops a15-systemone a16-admin-auth a17-transport a18-log-write a19-admin-scan-budget a20-log-reopen a21-billing-402 a22-cooldown-ladder"
 
 red=
 green=0

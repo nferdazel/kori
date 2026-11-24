@@ -54,7 +54,7 @@ With `"balance": true`, the starting leg is picked across the available `primary
 | `404` saying the model does not exist, on a leg the alias table named | `model_gone` | 60 s |
 | connection refused | `conn_refused` | 60 s |
 | dial timeout | `dial_timeout` | 60 s |
-| header timeout | `header_timeout` | 60 s |
+| header timeout | `header_timeout` | 5 s, doubling per repeat, capped at 60 s |
 | `5xx` | `upstream_5xx` | 60 s |
 | `429` carrying a quota body | `quota_429` | 900 s |
 | `402` | `billing_402` | 900 s |
@@ -63,6 +63,17 @@ With `"balance": true`, the starting leg is picked across the available `primary
 `model_gone` is decided only when the alias table named the id this leg was sent. A caller that sent
 a provider id itself keeps its own `404`, because a wrong id a gateway never touched is the caller's
 mistake and failing over would hide it.
+
+`header_timeout` is the one class whose cooldown is not flat. A provider that stops sending headers
+usually blinks: measured on qouver1 across 16–24 Nov 2026, 590 header timeouts, and 90 of the 99
+instant `502`s fell within 90 s of one, because a flat 60 s skip turned a hiccup into a minute with
+no leg to dial. The first one cools for the header window it just waited, clamped to 5–60 s: 15 s on
+the streaming door, the 60 s cap on the 90 s non-stream and System One doors. Each further timeout in
+a row without a served request doubles the rung inside that clamp, and one answered request resets
+the ladder. A rung is never shorter than the window it followed, because probing a dead leg more
+cheaply than the cooldown it ends charges the next caller for the difference. `/admin/config`
+publishes `cooldowns.header_timeout_s` and `cooldowns.header_timeout_max_s` so the rungs are
+computable without the source.
 
 `credential_refresh_failed` and `refresh_timeout` are the two log-only values: they name a request
 that stopped where it was instead of failing over.
