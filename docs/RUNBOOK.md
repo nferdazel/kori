@@ -94,8 +94,26 @@ branch is a *new* ref, so its push succeeded and the permanent tag left with it.
 
 A stale or diverged local `main` fails closed for the same reason, but later: the tag is already
 created locally by `:157` when the branch push is rejected at `:162`, so the script dies with
-"tag vX.Y.Z is local" and leaves that tag behind. Nothing reaches the remote, and the leftover tag
-is local only, so delete it before retrying. Merge, confirm the tip, then tag by hand.
+`push failed; tag vX.Y.Z is local` and leaves that tag behind. Nothing reaches the remote. What
+else it leaves depends on which path you ran, and the two paths need different cleanup.
+
+A bump (`major`, `minor`, `patch`) commits first: `:156` writes `chore(release): vX.Y.Z` and the
+tag from `:157` points at it. Deleting only the tag is not enough, because that commit stays and
+the next run bumps again on top of it. Drop the one commit, not the branch: `git tag -d vX.Y.Z`,
+then `git reset --hard HEAD~1` while the release commit is the tip, then
+`git fetch origin && git rebase origin/main`, then retry.
+
+`--current` usually commits nothing: `git add VERSION` at `:155` stages a file that already holds
+the released number, so `git diff --cached --quiet` at `:156` succeeds, the commit is skipped, and
+the tag from `:157` lands on your own last commit. "Usually" is the whole trap, because `:156` asks
+whether anything is staged, not whether `VERSION` moved: the CHANGELOG cut at `:121-148` rewrites
+the file and runs `git add CHANGELOG.md`, so a non-empty `[Unreleased]` makes `:156` commit after
+all. Read `git log -1 --format=%s vX.Y.Z` before cleaning up. If it prints `chore(release): vX.Y.Z`,
+this is the bump case above and takes the bump cleanup. If it prints your own work, the tag landed
+on your commit and `git reset --hard HEAD~1` would delete what you were releasing, so the cleanup
+is `git tag -d vX.Y.Z` and, only if origin has moved, `git fetch origin && git rebase origin/main`.
+Nothing else. Do not fix either path with `git reset --hard origin/main`; it discards the local
+commits you were releasing. Merge, confirm the tip, then tag by hand.
 
 Running `--no-push` off `main` is allowed and stays local, because a tag for a trial run is
 legitimate. `./task release` drops the shared script's closing line, "Publish with: `git push origin

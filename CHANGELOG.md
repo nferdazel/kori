@@ -11,6 +11,8 @@ this one, is the answer to "what is live".
 
 ## [Unreleased]
 
+## [0.10.3] - 2026-11-24
+
 ### Fixed
 
 - `./task release --push` refuses to publish unless `HEAD` is `main`. A release tag is permanent
