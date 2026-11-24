@@ -94,8 +94,11 @@ branch is a *new* ref, so its push succeeded and the permanent tag left with it.
 
 A stale or diverged local `main` fails closed for the same reason, but later: the tag is already
 created locally by `:157` when the branch push is rejected at `:162`, so the script dies with
-"tag vX.Y.Z is local" and leaves that tag behind. Nothing reaches the remote, and the leftover tag
-is local only, so delete it before retrying. Merge, confirm the tip, then tag by hand.
+`push failed; tag vX.Y.Z is local` and leaves both the tag and the `chore(release): vX.Y.Z` commit
+on your local `main`. Nothing reaches the remote. Deleting only the tag is not enough: the release
+commit stays, so the next run bumps again and leaves a second tag and a second release commit. Once
+`git log origin/main..HEAD` shows that commit and nothing of yours, run `git tag -d vX.Y.Z` and
+`git reset --hard origin/main`, then retry. Merge, confirm the tip, then tag by hand.
 
 Running `--no-push` off `main` is allowed and stays local, because a tag for a trial run is
 legitimate. `./task release` drops the shared script's closing line, "Publish with: `git push origin
