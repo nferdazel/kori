@@ -530,3 +530,41 @@ makes *failed* logins answer `429` instead of `401` — a cheaper answer than be
 the edge rule in `OPS-SHIP §4.4` is still the right place for anything per-IP. `a16` asserts the new
 contract: five failures, then a `429` for a wrong token and a `204` for the right one. The unit test
 and the constant's comment name this record, so a reader following the number finds the reason.
+
+---
+
+## DEC-22 — The streaming first-byte deadline grows with the prompt, and stops at 60 s
+
+**Status:** accepted 2026-11-24; supersedes the fixed number in `SPEC §3b.1`.
+
+**Context.** `HeaderDeadlineStreamMs` was one constant, 15 s, applied to every streamed request
+whatever it carried. Measured on `commandcode` across 24 hours on 2026-11-22: p90 first byte was
+20.8 s for prompts of 50k tokens and above, against 15 s or less for short ones. So the deadline that
+worked for a short prompt fired nine times a day on long ones. Each of those was a failover: the
+request left a healthy leg, and the caller got whatever the next leg answered — which that week was
+`sinarcloud` with an empty balance and a `402`. A deadline tuned for the common case was moving real
+traffic to a worse provider, and the failover log called it a provider failure.
+
+**Decision.** The streaming first-byte window is a floor plus a slope on the outbound body:
+`15_000 + (body.len div 1024) * 100` milliseconds, capped at `60_000`. A short prompt keeps the
+15 s it had; a 50k-token prompt (about 200 KiB) gets about 35 s. The cap is the part that matters
+most: without it a pathological body buys a five-minute failover window and one hung leg stalls the
+request. The non-streaming window stays 90 s, and `attemptSystemone`, which has no streaming path,
+never sees this rule. `/admin/config` publishes `header_ms_stream`, `header_ms_stream_slope_per_kib`
+and `header_ms_stream_max`, so the effective window is computable without reading the source.
+
+**Rejected.** Raising the constant to 30 s: one line, but it only moves the cliff — 50k-token prompts
+still cross it — while doubling the wait on a leg that is really dead. A per-provider table: more
+config for a number that follows from body size, and it would need re-measuring per provider.
+
+**The slope is a first cut.** 100 ms/KiB comes from one measurement at one prompt size on one
+provider, chosen so the 200 KiB case lands near the measured p90 rather than to fit a curve. The
+honest calibration is p50 and p90 at two prompt sizes; until that exists the slope is a named guess,
+not a fitted constant, and the constant's comment says so.
+
+**Consequences.** `a3` changed shape: A3b still proves the 15 s floor with a short body, and two new
+steps prove the rule rather than a number — the same 17 s delay fails a short body and serves a
+200 KiB one, on the same stub, so a pass cannot be the provider being faster. A retry or a failover
+caused by a genuinely slow-but-alive long prompt is now a failure of this rule to be wide enough, not
+of the provider. The cap means a 1 MiB prompt and an 8 MiB prompt get the same window; the 300 s
+non-streaming total still bounds the request as a whole.

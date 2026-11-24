@@ -48,6 +48,14 @@ assert_eq "A13a each named leg model is listed" \
 assert_eq "A13a a POST to /v1/models is refused" \
   "$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 -X POST \
       -H 'Content-Length: 0' "$GW_URL/v1/models")" "405"
+# RFC 9110 §15.5.6: the refusal names the method the surface answers. Before
+# 0.10.0 this one carried no Allow header at all. `GET, HEAD` is the spelling
+# handleStatic already uses for a surface that answers both.
+assert_eq "A13a and it names GET, HEAD" \
+  "$(curl -sS -o /dev/null -D - --max-time 5 -X POST \
+      -H 'Content-Length: 0' "$GW_URL/v1/models" 2>/dev/null \
+      | tr -d '\r' | awk 'tolower($1)=="allow:" {$1=""; sub(/^ /,""); print}')" \
+  "GET, HEAD"
 
 echo
 echo "=== A13b: retries dial the same leg again and never a caller error"

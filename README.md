@@ -57,6 +57,7 @@ With `"balance": true`, the starting leg is picked across the available `primary
 | header timeout | `header_timeout` | 60 s |
 | `5xx` | `upstream_5xx` | 60 s |
 | `429` carrying a quota body | `quota_429` | 900 s |
+| `402` | `billing_402` | 900 s |
 | any other status | not a failure; returned to the caller | none |
 
 `model_gone` is decided only when the alias table named the id this leg was sent. A caller that sent
@@ -138,10 +139,18 @@ Deadlines enforced by the binary, independent of any proxy in front of it:
 |---|---|
 | connect | 2 s |
 | TLS handshake | 3 s |
-| response headers, streaming | 15 s |
+| response headers, streaming | 15 s + 100 ms per KiB of request body, capped at 60 s |
 | response headers, non-streaming | 90 s |
 | idle between chunks | 120 s |
 | whole non-streaming request | 300 s |
+
+The streaming first-byte window is the one limit that is a rule rather than a number. A provider's
+first byte arrives later the more prompt it was handed: measured on `commandcode` on 2026-11-22, p90
+first byte was 20.8 s on 50k-token prompts against 15 s on short ones, so a flat 15 s failed a healthy
+leg about nine times a day and walked real traffic to the fallback. A short prompt is still bounded by
+15 s; a 50k-token prompt (roughly 200 KiB) gets about 35 s; the 60 s cap bounds the wait on a leg that
+is really dead, and stays inside the 90 s non-streaming number. `/admin/config` publishes the floor,
+the slope and the cap, so the effective window can be computed without reading the source.
 
 ### Retry before failover
 

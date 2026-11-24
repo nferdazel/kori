@@ -778,15 +778,6 @@ check "requestModel is empty when the body has none",
 check "requestModel survives a body that is not JSON", requestModel("not json") == ""
 
 block:
-  let cfg = loadConfig(writeConfig("alias-map.json", """
-{"legs":[
- {"name":"leg-a","base_url":"http://127.0.0.1:1/v1","aliases":{"fast":"prov-a-fast"}},
- {"name":"leg-b","base_url":"http://127.0.0.1:2/v1","aliases":{"deep":"prov-b-deep"}}]}
-"""))
-  check "a leg resolves the alias it maps",
-    aliasModel(cfg.legs[0], "fast") == some("prov-a-fast")
-  check "a leg with no mapping resolves to none",
-    aliasModel(cfg.legs[0], "deep").isNone
   check "the unknown-alias body names the alias and the type",
     unknownAliasBody("nope").contains("\"type\":\"unknown_alias\"") and
       unknownAliasBody("nope").contains("nope")
@@ -1396,6 +1387,24 @@ block:
   # acceptance harness measures against.
   check "a caller's body cap is 8 MiB, not the old 32", MaxRequestBytes == 8_388_608
   check "the read timeout is 30 s", ReadTimeoutMs == 30_000
+  # D-2. The streaming first byte is a rule now, so two prompt sizes must get two
+  # different windows. 200 KiB is the 50k-token case that p90'd at 20.8 s; the cap
+  # is what stops a pathological body from buying a five-minute failover window.
+  check "a short streamed body keeps the 15 s floor",
+    streamHeaderDeadlineMs(0) == 15_000 and
+      streamHeaderDeadlineMs(900) == 15_000 and
+      streamHeaderDeadlineMs(200) == 15_000
+  check "a 200 KiB streamed body gets about 35 s, not the floor",
+    streamHeaderDeadlineMs(204_800) == 35_000
+  check "the slope moves with the body, monotonically, between the floor and the cap",
+    streamHeaderDeadlineMs(100 * 1024) > streamHeaderDeadlineMs(10 * 1024) and
+      streamHeaderDeadlineMs(100 * 1024) < HeaderDeadlineStreamMaxMs
+  check "a body past the cap gets the cap, not a five-minute window",
+    streamHeaderDeadlineMs(50 * 1024 * 1024) == HeaderDeadlineStreamMaxMs and
+      streamHeaderDeadlineMs(MaxRequestBytes) == HeaderDeadlineStreamMaxMs
+  check "the cap is 60 s, inside the 90 s non-streaming one",
+    HeaderDeadlineStreamMaxMs == 60_000 and
+      HeaderDeadlineStreamMaxMs < HeaderDeadlineNonStreamMs
   delEnv(AdminTokenEnv)
 
 block:

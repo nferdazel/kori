@@ -69,7 +69,16 @@ function render(config: AdminConfig): void {
         kvList([
           ["connect", config.timeouts.connect_ms + "ms"],
           ["tls", config.timeouts.tls_ms + "ms"],
-          ["header (stream)", config.timeouts.header_ms_stream + "ms"],
+          ["header (stream)", config.timeouts.header_ms_stream + "ms base"],
+          [
+            "header (stream) rule",
+            config.timeouts.header_ms_stream +
+              "ms + " +
+              config.timeouts.header_ms_stream_slope_per_kib +
+              "ms/KiB, max " +
+              config.timeouts.header_ms_stream_max +
+              "ms",
+          ],
           ["header (non-stream)", config.timeouts.header_ms_non_stream + "ms"],
           ["idle between chunks", config.timeouts.idle_ms + "ms"],
           ["total (non-stream)", config.timeouts.total_ms + "ms"],

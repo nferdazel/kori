@@ -228,6 +228,11 @@ def handle(conn, addr, opts):
         capture(opts.capture_file, head + body)
         mode = opts.mode
 
+        # A3d: a provider that takes its time before the first byte, so a case can
+        # prove which deadline the gateway actually applied to that body size.
+        if opts.delay_headers > 0:
+            time.sleep(opts.delay_headers)
+
         # A provider that only accepts one bearer: anything else is a 401, so a
         # case can prove which credential the gateway actually sent (A11).
         if opts.expect_bearer:
@@ -420,6 +425,9 @@ def main():
     ap.add_argument("--content-type", default="application/json")
     ap.add_argument("--ttl", type=float, default=180.0)
     ap.add_argument("--gap", type=float, default=119.0)
+    # A3d: how long the stub waits before its first response byte, so a case can
+    # prove which header deadline the gateway applied to that body size.
+    ap.add_argument("--delay-headers", type=float, default=0.0)
     ap.add_argument("--model", default="")
     ap.add_argument("--after", type=int, default=0)
     # A11: the token endpoint's answer, and the one bearer a provider accepts.

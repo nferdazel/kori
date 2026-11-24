@@ -49,6 +49,10 @@ SENTINEL_CFG_SECRET="sk-acc-SENTINEL-config-credential"
 D2_CONNECT_MS=2000
 D2_TLS_MS=3000
 D2_HDR_STREAM_MS=15000
+# D-2: the streaming first-byte window is a floor plus a slope on the outbound
+# body. The floor is what a short prompt still gets, which is why A3b measures it.
+D2_HDR_STREAM_SLOPE_MS_PER_KIB=100
+D2_HDR_STREAM_MAX_MS=60000
 D2_HDR_NONSTREAM_MS=90000
 D2_CHUNK_IDLE_MS=120000
 D2_TOTAL_NONSTREAM_MS=300000

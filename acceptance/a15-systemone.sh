@@ -170,9 +170,11 @@ patch_systemone typesafe/jev-1.14.0 typesafe/jev-1.14.0
 gw_restart
 assert_eq "A15e a GET on the door is refused" \
   "$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "$GW_URL/v1/systemone")" "405"
+# RFC 9110 §15.5.6: a 405 names the methods it does answer. This used to assert an
+# empty Allow, which pinned the bug the five inlined refusals carried until 0.10.0.
 assert_eq "A15e the refusal names POST only" \
   "$(curl -sS -o /dev/null -D - --max-time 5 "$GW_URL/v1/systemone" 2>/dev/null \
-      | tr -d '\r' | awk 'tolower($1)=="allow:" {print $2}')" ""
+      | tr -d '\r' | awk 'tolower($1)=="allow:" {print $2}')" "POST"
 
 echo
 echo "=== A15f: a priced decision lands in cost_usd and the window total"

@@ -122,6 +122,8 @@ export interface AdminConfig {
     connect_ms: number;
     tls_ms: number;
     header_ms_stream: number;
+    header_ms_stream_slope_per_kib: number;
+    header_ms_stream_max: number;
     header_ms_non_stream: number;
     idle_ms: number;
     total_ms: number;

@@ -75,7 +75,18 @@ const
   # SPEC §3b.1. Every number is a deadline this binary enforces itself.
   ConnectDeadlineMs* = 2_000
   TlsDeadlineMs* = 3_000
+  ## The floor of the streaming first-byte deadline, and its cap. A provider's
+  ## first byte takes longer the more prompt it was handed: measured on
+  ## commandcode, p90 was 20.8 s on 50k-token prompts against 15 s on short ones,
+  ## so a fixed number fails a healthy leg nine times a day and walks real traffic
+  ## to the fallback. The cap matters more than the slope: without it a
+  ## pathological body buys a five-minute failover window.
   HeaderDeadlineStreamMs* = 15_000
+  HeaderDeadlineStreamMaxMs* = 60_000
+  ## Each KiB of outbound body buys this much extra budget. 100 lands a 50k-token
+  ## prompt (~200 KiB) near 35 s; 1 ms/KiB would have bought 200 ms and fixed
+  ## nothing. Re-measure at two prompt sizes before changing it.
+  HeaderDeadlineStreamPerKiBMs* = 100
   HeaderDeadlineNonStreamMs* = 90_000
   ChunkIdleMs* = 120_000
   TotalNonStreamMs* = 300_000
@@ -1439,6 +1450,16 @@ proc remainingMs(deadline: float): int =
 proc deadlineIn(ms: int): float =
   epochTime() + ms.float / 1000.0
 
+proc streamHeaderDeadlineMs*(bodyBytes: int): int =
+  ## SPEC §3b.1 with the size slope of D-2: a provider's first byte arrives later
+  ## the more prompt it was handed, so the streaming header window grows with the
+  ## outbound body from the 15 s floor and stops at the cap. Short prompts keep
+  ## the floor, which is why a3b still measures 15 s.
+  if bodyBytes <= 0:
+    return HeaderDeadlineStreamMs
+  min(HeaderDeadlineStreamMs + (bodyBytes div 1024) * HeaderDeadlineStreamPerKiBMs,
+      HeaderDeadlineStreamMaxMs)
+
 proc awaitRecv(socket: AsyncSocket, maxBytes: int,
                deadline: float): Future[RecvOut] {.async.} =
   let budget = remainingMs(deadline)
@@ -1875,14 +1896,6 @@ proc aliasOf*(model: string): Option[string] =
   ## forwarded as it always was.
   if model.startsWith(AliasPrefix):
     some(model[AliasPrefix.len .. ^1])
-  else:
-    none(string)
-
-proc aliasModel*(leg: Leg, alias: string): Option[string] =
-  ## The provider id this leg sends for an alias. `none` means the leg has no
-  ## mapping for that name and is skipped for that request, never cooled.
-  if leg.aliases.hasKey(alias):
-    some(leg.aliases[alias])
   else:
     none(string)
 
@@ -2512,7 +2525,8 @@ proc attemptLeg(gateway: Gateway, request: Request, leg: Leg, bearer: string,
 
     # ---- response headers: the end of the failover window (§3b.2) ----
     let headerDeadline =
-      deadlineIn(if stream: HeaderDeadlineStreamMs else: HeaderDeadlineNonStreamMs)
+      deadlineIn(if stream: streamHeaderDeadlineMs(body.len)
+                 else: HeaderDeadlineNonStreamMs)
     var raw = ""
     var headDone = false
     while not headDone:
@@ -3754,6 +3768,10 @@ proc configJson*(gateway: Gateway): string =
   timeouts["connect_ms"] = %ConnectDeadlineMs
   timeouts["tls_ms"] = %TlsDeadlineMs
   timeouts["header_ms_stream"] = %HeaderDeadlineStreamMs
+  # D-2: the streaming window is a rule, not a number. The two ends and the slope
+  # are published so a reader can compute what a given body gets without the source.
+  timeouts["header_ms_stream_slope_per_kib"] = %HeaderDeadlineStreamPerKiBMs
+  timeouts["header_ms_stream_max"] = %HeaderDeadlineStreamMaxMs
   timeouts["header_ms_non_stream"] = %HeaderDeadlineNonStreamMs
   timeouts["idle_ms"] = %ChunkIdleMs
   timeouts["total_ms"] = %TotalNonStreamMs
@@ -4337,7 +4355,7 @@ proc routeRequest(gateway: Gateway, request: Request): Future[void] {.async.} =
   let path = request.url.path
   if path == "/healthz":
     if request.reqMethod notin {HttpGet, HttpHead}:
-      await respondJson(request, Http405, "{\"error\":\"method not allowed\"}")
+      await respondMethodNotAllowed(request, allow = "GET, HEAD")
     else:
       # P1: `?deep` is one variant of the health path, not a second path, and it
       # answers from router state without dialling a leg. Presence is what asks
@@ -4357,7 +4375,7 @@ proc routeRequest(gateway: Gateway, request: Request): Future[void] {.async.} =
   elif path == "/v1/models":
     # P0: the model list. GET and HEAD, like every other read-only surface.
     if request.reqMethod notin {HttpGet, HttpHead}:
-      await respondJson(request, Http405, "{\"error\":\"method not allowed\"}")
+      await respondMethodNotAllowed(request, allow = "GET, HEAD")
     else:
       await respondJson(request, Http200, gateway.modelsJson())
   elif path == "/session/login":
@@ -4368,7 +4386,7 @@ proc routeRequest(gateway: Gateway, request: Request): Future[void] {.async.} =
     # Prometheus scrapes a GET and nothing else. Text format, `prometheus` type
     # version 0.0.4, which every scraper in use reads.
     if request.reqMethod notin {HttpGet, HttpHead}:
-      await respondJson(request, Http405, "{\"error\":\"method not allowed\"}")
+      await respondMethodNotAllowed(request, allow = "GET, HEAD")
     else:
       case gateway.adminGate(request)
       of agNoToken: await respondGateMissing(request)
@@ -4403,7 +4421,7 @@ proc routeRequest(gateway: Gateway, request: Request): Future[void] {.async.} =
           await respondJson(request, Http404, notFoundBody())
   elif path == "/v1/chat/completions":
     if request.reqMethod != HttpPost:
-      await respondJson(request, Http405, "{\"error\":\"method not allowed\"}")
+      await respondMethodNotAllowed(request, allow = "POST")
     else:
       await gateway.handleChat(request)
   elif path == "/v1/systemone":
@@ -4413,7 +4431,7 @@ proc routeRequest(gateway: Gateway, request: Request): Future[void] {.async.} =
     if gateway.cfg.systemone.len == 0:
       await respondJson(request, Http404, notFoundBody())
     elif request.reqMethod != HttpPost:
-      await respondJson(request, Http405, "{\"error\":\"method not allowed\"}")
+      await respondMethodNotAllowed(request, allow = "POST")
     else:
       await gateway.handleSystemone(request)
   else:

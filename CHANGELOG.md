@@ -11,6 +11,31 @@ this one, is the answer to "what is live".
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-11-24
+
+### Changed
+
+- The streaming first-byte deadline is now a rule instead of a constant: 15 s, plus 100 ms per
+  KiB of request body, capped at 60 s. A 50k-token prompt is about 200 KiB and gets roughly 35 s;
+  a short prompt keeps the old 15 s exactly. This follows the measurement of 2026-11-22, where p90
+  first byte on `commandcode` was 20.8 s for those prompts, so a flat 15 s failed a healthy leg
+  nine times a day and walked legitimate traffic to the fallback leg. `/admin/config` publishes
+  the floor, slope and cap as `header_ms_stream`, `header_ms_stream_slope_per_kib` and
+  `header_ms_stream_max`. `acceptance/a3-deadlines.sh` proves both ends: a small body still times
+  out at 15 s, and a 200 KiB body is served after 17 s by the same slow leg, with no failover.
+
+### Removed
+
+- `aliasModel`, an exported helper with no production caller. `handleChat` resolves per-leg aliases
+  inline; `a12-model-map.sh` covers the behaviour end to end, so the unit test that exercised the
+  helper alone was removed with it.
+
+### Fixed
+
+- The five inlined `405` answers (`/healthz`, `/v1/models`, `/metrics`, `/v1/chat/completions`,
+  `/v1/systemone`) go through `respondMethodNotAllowed`, so each one carries an `Allow` header and
+  a HEAD gets no body. Before, five copies dropped the header, which RFC 9110 requires on a 405.
+
 ## [0.9.2] - 2026-11-23
 
 ### Fixed

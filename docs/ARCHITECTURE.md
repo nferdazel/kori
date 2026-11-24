@@ -76,11 +76,13 @@ path, content type and body for the eight files under `apps/web/dist`.
    primaries and finally the fallbacks.
 4. `attemptLeg` dials one leg, writes the upstream request, and reads the response. A pooled
    credential is chosen here: an entry on its own cooldown is skipped, and a `401` or a quota
-   `429` cools only the key that failed before the leg is blamed (`DEC-13`). The transport
-   classes get up to `legs[].retries` more dials on the same leg behind a doubling pause
-   (`DEC-12`), which is why a retry leaves `failover_from` empty: the request never left the
-   leg. The failover window ends when response headers arrive: below that line an attempt
-   either serves the caller or aborts.
+   `429` cools only the key that failed before the leg is blamed (`DEC-13`). A `402` does the same
+   and takes the capacity cooldown, because a spent balance is a dead route and not a caller error. The transport classes get up to `legs[].retries` more dials on the same leg behind a
+   doubling pause (`DEC-12`), which is why a retry leaves `failover_from` empty: the request never
+   left the leg. The failover window ends when response headers arrive: below that line an attempt
+   either serves the caller or aborts. On a streamed request that window is not a constant — it is
+   15 s plus 100 ms per KiB of outbound body, capped at 60 s (`DEC-22`), so a long prompt is not
+   failed over for being long.
 5. A failed attempt is classified, put on cooldown, and recorded as a failover event if
    another leg remains. The walk continues. A failed credential refresh is the exception: the
    caller gets `502 credential_refresh_failed` (or `refresh_timeout`) and nothing else is
