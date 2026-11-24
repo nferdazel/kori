@@ -11,6 +11,13 @@ this one, is the answer to "what is live".
 
 ## [Unreleased]
 
+### Fixed
+
+- `./task release --push` refuses to publish unless `HEAD` is `main`. A release tag is permanent
+  under `protect-release-tags`, and a feature branch is a new ref, so before this guard the push
+  succeeded and the undeletable tag left with it. The guard sits in `task`, not in the vendored
+  `task.d/release.sh`, and is exercised by `tests/dryrun-release.sh` against a real bare origin.
+
 ## [0.10.2] - 2026-11-24
 
 ### Fixed

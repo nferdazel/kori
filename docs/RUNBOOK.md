@@ -83,12 +83,16 @@ Both are read from the tagged commit, not from your working tree. A wrong tag me
 CHANGELOG section fixed after the push means deleting and re-creating a protected tag, which is the
 thing this ruleset exists to prevent. Confirm both before `git push`.
 
-`./task release --push` is not a shortcut for the sequence above. It creates the tag first
-(`task.d/release.sh:157`), then pushes the branch you are standing on and the tag (`:160-163`), and
-it carries no check that the branch is `main`; its comment at `:18` says pushing main is what
-deploys, but the script does not verify it. Run on a feature branch it publishes a permanent tag on
-a commit that is not `main`, which `protect-release-tags` then makes undeletable. Merge, then tag by
-hand.
+`./task release --push` still is not a shortcut for the sequence above. It creates the tag first
+(`task.d/release.sh:166`), then pushes the branch you are standing on and the tag (`:169-172`).
+Since 2026-11-24 `./task release` refuses the `--push` flag unless `HEAD` is `main`, before the
+script runs a single command, so a refusal leaves no half-bumped tree and no `chore(release)`
+commit behind (`task:152-170`, exercised by `tests/dryrun-release.sh`; the guard sits in `task`
+rather than in `task.d/release.sh` because that script is vendored byte-identically into seven
+repos and must not carry a rule only kori has). Before that guard the hole was specific: a feature
+branch is a *new* ref, so its push succeeded and the permanent tag left with it. On `main` the same
+path already failed closed, because a stale or diverged local `main` is rejected by the push and the
+script dies before it reaches the tag. Merge, confirm the tip, then tag by hand.
 
 ---
 

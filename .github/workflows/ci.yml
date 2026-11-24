@@ -375,3 +375,9 @@ jobs:
       # its log mode and what it writes to .deployed_rev are asserted here and not in the dark.
       - name: "Rollback dry run (lock, log mode, .deployed_rev)"
         run: bash tests/dryrun-rollback.sh
+
+      # A pushed release tag is permanent under protect-release-tags, so the refusal that stops a
+      # tag being published from a non-main branch has to be exercised, not reasoned about. The
+      # harness runs the script against a real bare origin and asserts nothing reached it.
+      - name: "Release dry run (--push refused off main, publishes on main)"
+        run: bash tests/dryrun-release.sh
