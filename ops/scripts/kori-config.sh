@@ -155,7 +155,10 @@ CONFIG_BAK_KEEP="${KORI_CONFIG_BAK_KEEP:-2}"
 backup_live_config() { # backup_live_config <path>
   local live="$1" bak
   [ -f "$live" ] || return 0
-  bak="$live.bak-$(date '+%Y%m%d-%H%M%S')"
+  # The pid keeps two --force runs in the same second from landing on one name; without it the
+  # second silently overwrote the first backup, so retention "kept two" while holding one
+  # (CI, 2026-11-24). Ordering still comes from mtime, not from this suffix.
+  bak="$live.bak-$(date '+%Y%m%d-%H%M%S')-$$"
   # `cp -p` would carry a wider source mode over; the copy holds the same credentials, so it gets
   # the same 0600 as the original at creation and is renamed into place.
   ( umask 077; cp -- "$live" "$bak.tmp.$$" ) && mv -f "$bak.tmp.$$" "$bak" \

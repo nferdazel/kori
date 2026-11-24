@@ -11,6 +11,17 @@ this one, is the answer to "what is live".
 
 ## [Unreleased]
 
+## [0.10.2] - 2026-11-24
+
+### Fixed
+
+- `ops/scripts/kori-config.sh` keeps both backups when two `--force` runs land in the same second.
+  The copy was named down to the second only, so the second run overwrote the first backup:
+  retention still reported two files while one existed, and the credentials it replaced were gone.
+  The name now carries the pid. `tests/dryrun-config.sh` pins the clock so the old code fails the
+  assertion on a fast runner as well as a slow one; CI caught the original on main at `21b6018`,
+  where the same commit had been green on its pull request minutes earlier.
+
 ## [0.10.1] - 2026-11-24
 
 ### Fixed
