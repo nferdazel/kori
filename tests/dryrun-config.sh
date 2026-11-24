@@ -183,7 +183,22 @@ done
 kept="$(ls -1 "$OUT".bak-* 2>/dev/null | wc -l | tr -d ' ')"
 [ "$kept" = "2" ] && pass "backups are pruned to the newest two (found $kept)" \
   || fail "backup retention kept $kept files, expected 2: $(ls -1 "$OUT".bak-* 2>/dev/null | tr '\n' ' ')"
-grep -qF 'cc-SENTINEL-run-2' "$OUT" && pass "retention did not touch the live config" \
+# Two --force runs inside one second share a timestamp, so the name has to carry something else
+# too: the first version used seconds alone and the second run overwrote the first backup, which
+# CI caught on 2026-11-24 while a laptop was slow enough to miss it. The clock is pinned instead of
+# raced, and the check counts how many backups carry that one second: the fix leaves two, the bug
+# leaves one. A plain total would read 2 either way, because retention prunes to 2 regardless.
+mkdir -p "$ROOT/pinned-bin"
+printf '#!/bin/sh\necho 20261124-000000\n' >"$ROOT/pinned-bin/date"
+chmod +x "$ROOT/pinned-bin/date"
+PATH="$ROOT/pinned-bin:$PATH" bash "$FILL" --values "$ROOT/values-ret-2.env" --out "$OUT" --force \
+  2>"$ROOT/stderr" || fail "a back-to-back --force run failed: $(cat "$ROOT/stderr")"
+PATH="$ROOT/pinned-bin:$PATH" bash "$FILL" --values "$ROOT/values-ret-1.env" --out "$OUT" --force \
+  2>"$ROOT/stderr" || fail "a second --force in the pinned second failed: $(cat "$ROOT/stderr")"
+same_sec="$(ls -1 "$OUT".bak-*20261124-000000* 2>/dev/null | wc -l | tr -d ' ')"
+[ "$same_sec" = "2" ] && pass "two backups in one second keep separate names (found $same_sec)" \
+  || fail "two --force runs in one second left $same_sec backups for that second, expected 2: $(ls -1 "$OUT".bak-* 2>/dev/null | tr '\n' ' ')"
+grep -qF 'cc-SENTINEL-run-1' "$OUT" && pass "retention did not touch the live config" \
   || fail "the live config is not the last run's"
 
 # ── scenario 4: a missing key fails and writes nothing ─────────────────────
