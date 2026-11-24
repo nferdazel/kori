@@ -11,6 +11,15 @@ this one, is the answer to "what is live".
 
 ## [Unreleased]
 
+### Fixed
+
+- `ops/scripts/smoke.sh` matches the nested 405 envelope that 0.10.0 introduced. It still grepped
+  0.9.1's flat `"error":"method not allowed"`, so the deploy of 0.10.0 on qouver1 was rejected by
+  the release gate at `smoke.sh:152` and rolled back to 0.9.1 at 2026-11-24 10:52 WIB, on a host
+  whose binary was answering the new, correct body. `tests/dryrun-smoke.sh` now stubs the same
+  nested body, and `acceptance/a13-parity.sh` asserts the exact body against a real binary, so the
+  next change to the envelope turns CI red instead of the deploy gate.
+
 ## [0.10.0] - 2026-11-24
 
 ### Changed

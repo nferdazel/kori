@@ -57,6 +57,19 @@ assert_eq "A13a and it names GET, HEAD" \
       | tr -d '\r' | awk 'tolower($1)=="allow:" {$1=""; sub(/^ /,""); print}')" \
   "GET, HEAD"
 
+# The exact 405 body, because ops/scripts/smoke.sh greps it at the edge as proof that the
+# answer came from kori and not from a proxy in front of it. The deploy gate rejected a healthy
+# 0.10.0 on 2026-11-24: the envelope moved to nested and smoke still grepped 0.9.1's flat form,
+# and nothing in CI compared the two. `tests/dryrun-smoke.sh` stubs the body, so only this
+# assertion reads it from a real binary. Keep all three in step.
+assert_eq "A13a a GET on the chat path is refused with the body smoke.sh greps" \
+  "$(curl -sS --max-time 5 "$GW_URL/v1/chat/completions" || true)" \
+  '{"error":{"type":"method_not_allowed","message":"POST"}}'
+assert_eq "A13a and the refusal carries Allow: POST" \
+  "$(curl -sS -o /dev/null -D - --max-time 5 "$GW_URL/v1/chat/completions" 2>/dev/null \
+      | tr -d '\r' | awk 'tolower($1)=="allow:" {$1=""; sub(/^ /,""); print}')" \
+  "POST"
+
 echo
 echo "=== A13b: retries dial the same leg again and never a caller error"
 gw_stop; stub_kill leg-a 18081; stub_kill leg-b 18082

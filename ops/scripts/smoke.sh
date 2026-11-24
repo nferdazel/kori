@@ -149,7 +149,11 @@ elif [ -n "${KORI_EDGE_URL:-}" ]; then
     # 405, so the status alone let a foreign 405 go green (gate finding, 2026-11-16). kori's own
     # 405 is a JSON body naming the method, so the body has to match as well.
     edge_body="$(body_auth "$KORI_EDGE_URL/v1/chat/completions" || true)"
-    if printf '%s' "$edge_body" | grep -q '"error":"method not allowed"'; then
+    # The nested envelope `respondMethodNotAllowed` writes, not 0.9.1's flat
+    # `"error":"method not allowed"`. That literal was left behind by the 0.10.0 envelope change
+    # and rejected a healthy release on 2026-11-24; `acceptance/a13-parity.sh` now asserts this
+    # exact body against the real binary, so the next change to it turns CI red instead.
+    if printf '%s' "$edge_body" | grep -q '"type":"method_not_allowed"'; then
       ok "edge with right bearer -> 405 kori JSON on GET /v1/chat/completions"
     else
       bad "edge with right bearer -> 405 but the body is not kori's: $(printf '%s' "$edge_body" | head -c 120)"
