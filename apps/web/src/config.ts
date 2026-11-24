@@ -84,6 +84,13 @@ function render(config: AdminConfig): void {
           ["total (non-stream)", config.timeouts.total_ms + "ms"],
           ["availability cooldown", config.cooldowns.availability_s + "s"],
           ["quota cooldown", config.cooldowns.quota_s + "s"],
+          [
+            "header timeout cooldown",
+            config.cooldowns.header_timeout_s +
+              "s, doubling per repeat, max " +
+              config.cooldowns.header_timeout_max_s +
+              "s",
+          ],
         ]),
       );
     }),

@@ -106,6 +106,15 @@ const
   AvailabilityCooldownS* = 60.0
   CapacityCooldownS* = 900.0
 
+  # DEC-23. A provider that stops sending headers usually blinks rather than dies:
+  # measured on qouver1 2026-11-16..24, 590 header timeouts, and 90 of the 99
+  # instant 502s fell within 90 s of one, because a flat 60 s skip turned a
+  # second-long hiccup into a minute with no leg to dial. The first header timeout
+  # therefore cools for 5 s and each repeat doubles it, capped at
+  # AvailabilityCooldownS, so a leg that is really down reaches the old 60 s after
+  # five failures while a blink costs one request.
+  HeaderTimeoutCooldownS* = 5.0
+
   # Item 5. A leg gets `retries` more dials before it is classed as failed and the
   # walk moves on, with a doubling pause between them. The pause is capped so one
   # leg can never spend the whole request budget waiting: 200, 400, 800, 1600 then
@@ -325,6 +334,9 @@ type
     lastSuccessAt*: string
     servedInWindow*: int
     failedInWindow*: int
+    ## DEC-23: how many header timeouts came in a row without a served request,
+    ## which is what the 5 s ladder doubles on. Any success resets it.
+    headerTimeouts*: int
     latencies*: seq[int]
     ## Key pool state (P1). `keyIndex` is the pool entry in use; a dead key is
     ## skipped by `keyCooling` until its own cooldown expires. Only the index is
@@ -343,6 +355,9 @@ type
     lastFailureClass*: string
     lastFailureAt*: string
     lastSuccessAt*: string
+    ## DEC-23, the same ladder the chat door keeps: consecutive header timeouts
+    ## with no served request in between.
+    headerTimeouts*: int
 
   FailoverEvent* = object
     at*: string
@@ -1331,14 +1346,29 @@ proc pickOrder*(gateway: Gateway): seq[int] =
        gateway.legAvailable(index, now):
       result.add index
 
+proc cooldownSeconds*(reason: string, headerTimeouts: int): float =
+  ## DEC-23: the class decides the width. A header timeout is the one class that
+  ## widens with repetition: 5 s, then 10, 20, 40, and the old 60 s from the fifth
+  ## in a row. `headerTimeouts` is the count before this failure.
+  if reason in [TokenQuota429, TokenBilling402]:
+    return CapacityCooldownS
+  if reason != TokenHeaderTimeout:
+    return AvailabilityCooldownS
+  var cooldown = HeaderTimeoutCooldownS
+  for _ in 1 .. headerTimeouts:
+    cooldown *= 2.0
+    if cooldown >= AvailabilityCooldownS:
+      return AvailabilityCooldownS
+  cooldown
+
 proc startCooldown*(gateway: Gateway, index: int, reason: string) =
   ## §3.1 and §3.2: the cooldown starts at the failure, and the leg's failure
   ## counter moves once for this request (D11.1).
-  let cooldown =
-    if reason in [TokenQuota429, TokenBilling402]: CapacityCooldownS
-    else: AvailabilityCooldownS
   let now = epochTime()
   var runtime = addr gateway.legs[index]
+  let cooldown = cooldownSeconds(reason, runtime.headerTimeouts)
+  if reason == TokenHeaderTimeout:
+    runtime.headerTimeouts.inc
   runtime.attempted = true
   runtime.coolingUntil = now + cooldown
   runtime.probeInFlight = false
@@ -1353,6 +1383,9 @@ proc markServed*(gateway: Gateway, index: int, latencyMs: int) =
   var runtime = addr gateway.legs[index]
   runtime.attempted = true
   runtime.coolingUntil = 0
+  # DEC-23: a leg that answered is a leg that blinked, not one that is going
+  # down, so the header-timeout ladder starts over at 5 s.
+  runtime.headerTimeouts = 0
   runtime.lastSuccessAt = stampAt(now)
   runtime.servedInWindow.inc
   runtime.latencies.add latencyMs
@@ -1396,11 +1429,11 @@ proc systemoneOrder*(gateway: Gateway, now: float): seq[int] =
 proc startSystemoneCooldown*(gateway: Gateway, index: int, reason: string) =
   ## The same two cooldowns and the same reason tokens as the chat door, so one
   ## log is readable without knowing which door a line came from.
-  let cooldown =
-    if reason in [TokenQuota429, TokenBilling402]: CapacityCooldownS
-    else: AvailabilityCooldownS
   let now = epochTime()
   var runtime = addr gateway.systemone[index]
+  let cooldown = cooldownSeconds(reason, runtime.headerTimeouts)
+  if reason == TokenHeaderTimeout:
+    runtime.headerTimeouts.inc
   runtime.attempted = true
   runtime.coolingUntil = now + cooldown
   runtime.lastFailureClass = reason
@@ -1413,6 +1446,7 @@ proc markSystemoneServed(gateway: Gateway, index: int) =
   var runtime = addr gateway.systemone[index]
   runtime.attempted = true
   runtime.coolingUntil = 0
+  runtime.headerTimeouts = 0
   runtime.lastSuccessAt = stampAt(now)
 
 proc systemoneUnsupportedBody*(body: string): bool =
@@ -2057,6 +2091,10 @@ proc dial(uri: Uri): Future[tuple[ok: bool, timedOut: bool,
     if connecting.failed:
       closeQuietly(socket)
       return (false, false, nil)
+    # DEC-24. A gateway request head is a few hundred bytes on a fresh
+    # connection, so Nagle would hold the tail until the ACK: the provider sees
+    # our headers late and the caller pays it before the first token.
+    socket.setSockOpt(OptNoDelay, true, level = IPPROTO_TCP.cint)
     (true, false, socket)
   except CatchableError:
     closeQuietly(socket)
@@ -3780,6 +3818,10 @@ proc configJson*(gateway: Gateway): string =
   var cooldowns = newJObject()
   cooldowns["availability_s"] = %int(AvailabilityCooldownS)
   cooldowns["quota_s"] = %int(CapacityCooldownS)
+  # DEC-23: the header-timeout ladder starts here and doubles per consecutive
+  # timeout, so a reader can compute the second rung without the source.
+  cooldowns["header_timeout_s"] = %int(HeaderTimeoutCooldownS)
+  cooldowns["header_timeout_max_s"] = %int(AvailabilityCooldownS)
   root["cooldowns"] = cooldowns
 
   var logNode = newJObject()
@@ -4444,6 +4486,15 @@ proc dispatch*(gateway: Gateway, request: Request): Future[void] {.async.} =
   ## flight without asking the HTTP layer.
   inc gateway.inFlight
   try:
+    # DEC-24. The listener hands us a socket the HTTP layer accepted, and neither
+    # `asynchttpserver` nor the OS enables NoDelay by default. Every response kori
+    # sends is one head plus one body, so Nagle only ever adds a wait here. The
+    # syscall is per request on a keep-alive connection and costs microseconds
+    # against a completion measured in seconds.
+    try:
+      request.client.setSockOpt(OptNoDelay, true, level = IPPROTO_TCP.cint)
+    except CatchableError:
+      discard
     await gateway.routeRequest(request)
   finally:
     dec gateway.inFlight

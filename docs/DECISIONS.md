@@ -568,3 +568,71 @@ steps prove the rule rather than a number — the same 17 s delay fails a short 
 caused by a genuinely slow-but-alive long prompt is now a failure of this rule to be wide enough, not
 of the provider. The cap means a 1 MiB prompt and an 8 MiB prompt get the same window; the 300 s
 non-streaming total still bounds the request as a whole.
+
+---
+
+## DEC-23 — A header timeout cools for 5 s, and the rung doubles until it is the old 60 s
+
+**Status:** accepted 2026-11-24; narrows the one flat cooldown in `DEC-8`/`DEC-10` for the
+`header_timeout` class only.
+
+**Context.** Every availability failure cooled a leg for 60 s regardless of class. That is right for
+a refused connection or a `401`: those do not fix themselves in five seconds. It is wrong for a
+header timeout, which is what a provider that accepted the request and then went quiet looks like.
+Measured from the request log on qouver1, 2026-11-16 to 11-24 (32,340 lines): 590 requests carried
+`header_timeout` and waited p50 19.5 s before giving up, 582 of them on `commandcode`; 455 were then
+served by a fallback and 133 ended `502`. The damage was not those waits. With `sinarcloud` disabled
+the chain is one leg, so while that leg was cooling `pickOrder` returned an empty list and the
+caller got a `502` in 1–2 ms. Of 99 such instant `502`s, 90 fell within 90 s of a header timeout.
+One blink therefore cost a full minute of downtime, and the request log recorded it as an anonymous
+`502` with no failover reason.
+
+**Decision.** `header_timeout` cools for `HeaderTimeoutCooldownS` = 5 s, and each further header
+timeout in a row without a served request doubles the rung: 5, 10, 20, 40, then `AvailabilityCooldownS`
+(60 s) from the fifth. `markServed` resets the ladder. Every other availability class keeps its flat
+60 s, and `quota_429`/`billing_402` keep 900 s; neither reads the ladder. The same rule applies to
+the System One door, because it shares the reason tokens and an operator reading one log should not
+have to learn two clocks. `/admin/config` publishes `cooldowns.header_timeout_s` and
+`cooldowns.header_timeout_max_s`.
+
+**Rejected.** A flat 5 s for every availability class: a dead socket or a revoked key would be
+re-dialled twelve times a minute, which is a probe loop against a provider rather than a cooldown.
+A per-class config table: more surface for one class that needed it, and the ladder is a property of
+what the class means, not of what this host happens to run. Skipping the cooldown entirely for a
+header timeout and always probing: that is what the ladder converges to anyway, but it puts the
+probe on every request instead of on one, so a provider that is really down sees the full request
+rate.
+
+**Consequences.** A leg that is really down reaches the same 60 s it had before, after five failures
+instead of one. A leg that blinks costs one request instead of a minute. A short cooldown means more
+dials against a dead leg than before, and `legs[].retries` already bounds what one request may
+spend on that. The ladder is per leg, in memory, and survives a config reload by leg name exactly as
+`coolingUntil` does; a restart resets it, which is the same trade every other runtime counter here
+makes. `a22` proves the visible half of it: after one 15 s timeout the leg is skipped for about 5 s,
+then dialled again and serves, where the old code would have walked for 60 s.
+
+## DEC-24 — Nagle is off on both ends of every upstream connection and on every accepted client
+
+**Status:** accepted 2026-11-24.
+
+**Context.** Neither `asynchttpserver` nor the OS default sets `TCP_NODELAY` here. A gateway request
+head is a few hundred bytes written in a few writes, so Nagle's algorithm holds the tail until the
+previous segment is acknowledged; with delayed ACK on the peer that is tens of milliseconds, before
+the provider has been given anything to think about. Measured on qouver1: a full fresh handshake to
+a provider costs about 59 ms (DNS 1.3, TCP 16, TLS 42). The 1 s door JEV pays 4.9% of its wall time
+in that handshake, so a Nagle stall inside it is a larger share than it is on a 7 s chat completion.
+
+**Decision.** `dial()` sets `OptNoDelay` on the upstream socket once the connection is up, which
+covers the chat walk, the System One door and the OAuth token call because all three go through it.
+`dispatch()` sets it on the accepted client socket, because `asynchttpserver` creates that socket
+itself and offers no hook. Both calls ignore failure.
+
+**Rejected.** Building a custom listener to own the accept path: a second HTTP server implementation
+to set one socket option. An nginx or Caddy setting instead: the binary must be bounded by its own
+deadlines and its own socket options, independent of what a proxy in front of it does.
+
+**Consequences.** Nothing about loopback correctness changes; the latency effect is only measurable
+across a real network, so no acceptance case asserts a number. The client-side call is one syscall
+per request on a keep-alive connection, which is microseconds against a completion measured in
+seconds. Nagle's coalescing was never buying anything here: kori writes one head and one body, and
+it uses no pipelined small writes on a connection it wants to be fast on.

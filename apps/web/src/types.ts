@@ -128,7 +128,12 @@ export interface AdminConfig {
     idle_ms: number;
     total_ms: number;
   };
-  cooldowns: { availability_s: number; quota_s: number };
+  cooldowns: {
+    availability_s: number;
+    quota_s: number;
+    header_timeout_s: number;
+    header_timeout_max_s: number;
+  };
   log: { path: string; append_only: boolean; redacted: boolean };
 }
 

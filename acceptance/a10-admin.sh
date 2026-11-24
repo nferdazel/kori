@@ -83,6 +83,10 @@ assert_eq "A10e the log path is the one the config names" \
   "$(jq -r '.log.path' "$RUN/a10-cfg.json")" "$GW_LOG"
 assert_eq "A10e the planted credential is reported as set" \
   "$(jq -r '.legs[0].credential.state' "$RUN/a10-cfg.json")" "set"
+assert_eq "A10e the header-timeout ladder is published, not left to the source" \
+  "$(jq -r '.cooldowns | has("header_timeout_s") and has("header_timeout_max_s")' "$RUN/a10-cfg.json")" "true"
+assert_eq "A10e the ladder starts below the class ceiling it doubles to" \
+  "$(jq -r '.cooldowns.header_timeout_s < .cooldowns.header_timeout_max_s' "$RUN/a10-cfg.json")" "true"
 assert_no_credential "A10e no fragment of the planted credential reaches the payload" \
   "$RUN/a10-cfg.json" "$SENTINEL_CFG_SECRET"
 n=0
