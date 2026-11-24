@@ -11,6 +11,8 @@ this one, is the answer to "what is live".
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-11-24
+
 ### Fixed
 
 - `ops/scripts/smoke.sh` matches the nested 405 envelope that 0.10.0 introduced. It still grepped
