@@ -81,6 +81,16 @@ if [ "$rc" -eq 0 ] && [ "$(tags_here)" = "v0.1.1" ] && [ -z "$(tags_origin)" ]; 
 else
   fail "feature branch --no-push: rc=$rc here=[$(tags_here)] origin=[$(tags_origin)]"
 fi
+# The shared script's closing advice is "Publish with: git push origin HEAD v0.1.1". Following it
+# verbatim publishes a permanent tag on a commit that never reaches main, so it must not survive.
+case "$out" in
+  *"Publish with: git push origin HEAD"*) fail "feature branch --no-push: still tells the operator to publish the branch tag" ;;
+  *) pass "feature branch --no-push: the branch-publishing hint is gone" ;;
+esac
+case "$out" in
+  *"tag main by hand"*) pass "feature branch --no-push: says to tag main by hand instead" ;;
+  *) fail "feature branch --no-push: does not say what to do instead: $out" ;;
+esac
 
 # ── scenario 3: detached HEAD is a name, not main ───────────────────────────
 git checkout -q main
