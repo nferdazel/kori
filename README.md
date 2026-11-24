@@ -645,10 +645,11 @@ gateway is really down, `ops/scripts/rollback.sh` puts the `:prev` image back.
 
 ## Documentation
 
-Two documents, both under `docs/`, indexed at [`docs/README.md`](docs/README.md):
+Three documents, all under `docs/`, indexed at [`docs/README.md`](docs/README.md):
 
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md): the request path, leg state and module boundaries.
 - [`docs/DECISIONS.md`](docs/DECISIONS.md): the decision records this README refers to, including DEC-10.
+- [`docs/RUNBOOK.md`](docs/RUNBOOK.md): how a change reaches `main` (branch plus PR, `enforce_admins`), why a release tag is created after the merge and never before (protected `refs/tags/v*`), the backup-naming rule in `kori-config.sh` and `deploy-vps.sh`, and how to tell a stale smoke assertion from a bad release.
 
 ## Security
 
