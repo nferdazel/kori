@@ -106,7 +106,12 @@ if [ "${url#*"$FAKE_EDGE_URL"}" != "$url" ]; then
     */v1/chat/completions)
       if [ "$hdr" = "Authorization: Bearer $FAKE_GOOD_TOKEN" ]; then
         if [ "$code_only" = "1" ]; then say "${FAKE_V1_CODE:-405}"; exit 0; fi
-        say "${FAKE_V1_BODY-{\"error\":\"method not allowed\"}}"; exit 0
+        # The body the real binary sends for a GET on this path, so the stub cannot keep an
+        # expectation alive that the gateway no longer produces. It said the flat 0.9.1 form
+        # until 2026-11-24 and stayed green while the deploy gate rejected 0.10.0.
+        v1_body="${FAKE_V1_BODY-}"
+        [ -n "$v1_body" ] || v1_body='{"error":{"type":"method_not_allowed","message":"POST"}}'
+        say "$v1_body"; exit 0
       fi
       if [ "${FAKE_EDGE_MODE:-strict}" = "leaky" ] && [ -n "$hdr" ]; then say 200; exit 0; fi
       say 401; exit 0 ;;
