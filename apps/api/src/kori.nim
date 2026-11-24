@@ -110,9 +110,11 @@ const
   # measured on qouver1 2026-11-16..24, 590 header timeouts, and 90 of the 99
   # instant 502s fell within 90 s of one, because a flat 60 s skip turned a
   # second-long hiccup into a minute with no leg to dial. The first header timeout
-  # therefore cools for 5 s and each repeat doubles it, capped at
-  # AvailabilityCooldownS, so a leg that is really down reaches the old 60 s after
-  # five failures while a blink costs one request.
+  # therefore cools for the header window that failure just waited, clamped to this
+  # floor and AvailabilityCooldownS, and each repeat doubles it inside that clamp.
+  # A 15 s window therefore starts at 15 s and a 90 s window starts at the 60 s cap:
+  # a rung shorter than the window it followed would send a probe that is dearer
+  # than the cooldown it ends, and the next caller pays the difference.
   HeaderTimeoutCooldownS* = 5.0
 
   # Item 5. A leg gets `retries` more dials before it is classed as failed and the
