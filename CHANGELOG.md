@@ -11,6 +11,8 @@ this one, is the answer to "what is live".
 
 ## [Unreleased]
 
+## [0.10.2] - 2026-11-24
+
 ### Fixed
 
 - `ops/scripts/kori-config.sh` keeps both backups when two `--force` runs land in the same second.
