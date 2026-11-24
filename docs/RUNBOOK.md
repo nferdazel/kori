@@ -83,9 +83,12 @@ Both are read from the tagged commit, not from your working tree. A wrong tag me
 CHANGELOG section fixed after the push means deleting and re-creating a protected tag, which is the
 thing this ruleset exists to prevent. Confirm both before `git push`.
 
-`./task release --push` does the same in one step from a clean tree, but it pushes `main` and the
-tag directly (`task.d/release.sh:161-163`; the branch push comes first, and it is the one the
-protected `main` refuses), so the merge-then-tag sequence above is the path that works.
+`./task release --push` is not a shortcut for the sequence above. It creates the tag first
+(`task.d/release.sh:157`), then pushes the branch you are standing on and the tag (`:160-163`), and
+it carries no check that the branch is `main`; its comment at `:18` says pushing main is what
+deploys, but the script does not verify it. Run on a feature branch it publishes a permanent tag on
+a commit that is not `main`, which `protect-release-tags` then makes undeletable. Merge, then tag by
+hand.
 
 ---
 
@@ -171,13 +174,16 @@ wrong. Check the assertion before blaming the binary.
   after the image, so the first attempt can lose a race that resolves itself. `verify_signature`
   (`ops/scripts/deploy-vps.sh:482-498`) retries `COSIGN_ATTEMPTS` (default 5, 3s apart) and only
   then gives up; an unverified digest is never tagged and the running container is untouched
-  (`:527`). A later `cosign verify passed on attempt N` is that retry succeeding, not a broken gate.
-  What matters is which attempt passed against `COSIGN_ATTEMPTS`, and whether a `passed` line
-  exists at all.
+  (`:527`). The line `cosign verify passed on attempt N` prints only when `attempt > 1`
+  (`:488-490`), so a first-attempt pass prints nothing and its absence proves nothing. What does
+  prove a verified image is `:536`, `image pulled, digest ... verified and tagged :local`, which
+  cannot print before `verify_signature` returns 0 and cannot print on the `die` path at `:527`.
 - **`nothing to deploy` after a long wait.** The wait loop polls for `sha-<rev>` until its budget
   runs out; if CI never produced the image (a red Nim job, for example) the run ends at
   `ops/scripts/deploy-vps.sh:549` with the container left running rather than restarted into
-  nothing. Check the CI run for that commit before reading it as a deploy fault.
+  nothing. `:549` is reachable only from `PULL_RC=1`; a registry that is down or returns 401 dies
+  earlier at `:542-544` with `is NOT 'not built'`. That wording is the difference between "CI built
+  nothing" and "the pull failed", so read it before checking the CI run.
 
 The running version is authoritative at `/healthz` (`{"status":"ok","version":"0.10.2",
 "revision":"3d1dc1d"}`), not at a path under `/srv/qouver/apps/kori/`; the copy of `VERSION` on the
