@@ -5,9 +5,15 @@ release, where the scripts keep their backups, and what to read before blaming a
 failed deploy. Each item names the file and line it comes from, so a later reader can check it
 against the code instead of trusting this page.
 
-Two facts here live in GitHub repository settings, not in the tree, and no file proves them: the
-`protect-release-tags` ruleset (§2) and `enforce_admins` on `main` (§1). They were reported on
-2026-11-24 and are recorded as reported; confirm them in Settings → Rules before relying on them.
+Two facts here live in GitHub repository settings, not in the tree, so no file in this repository
+proves them: the `protect-release-tags` ruleset (§2) and `enforce_admins` on `main` (§1). Both were
+read back from the API on 2026-11-24, and these two commands are what re-checks them:
+
+```sh
+gh api repos/nferdazel/kori/branches/main/protection --jq '.enforce_admins.enabled, .required_status_checks.contexts'
+gh api repos/nferdazel/kori/rulesets --jq '.[] | {name, target, enforcement}'
+```
+
 Everything else cites a line in this repository.
 
 ---
@@ -16,7 +22,7 @@ Everything else cites a line in this repository.
 
 `main` has `enforce_admins` on. A direct push is rejected for everyone, the owner included, until
 the `Gate` status check is green. `Gate` is the single required status
-(`.github/workflows/ci.yml:139`); a red `Gate` blocks the merge, not just the push.
+(`.github/workflows/ci.yml:142-143`); a red `Gate` blocks the merge, not just the push.
 
 **The only way in is a branch plus a pull request.** That is not a preference. Before this was on,
 two releases reached `main` ahead of their own gate; with `enforce_admins`, that path no longer
@@ -78,8 +84,8 @@ CHANGELOG section fixed after the push means deleting and re-creating a protecte
 thing this ruleset exists to prevent. Confirm both before `git push`.
 
 `./task release --push` does the same in one step from a clean tree, but it pushes `main` and the
-tag directly; on the protected `main` the branch push is refused, so the merge-then-tag sequence
-above is the path that works.
+tag directly (`task.d/release.sh:161-163`; the branch push comes first, and it is the one the
+protected `main` refuses), so the merge-then-tag sequence above is the path that works.
 
 ---
 
@@ -154,3 +160,27 @@ grep -n 'bad "' ops/scripts/smoke.sh               # what each failure message m
 If the failing line quotes a body or status the release deliberately changed, the assertion is
 stale and the gate needs the fix. If the assertion still describes the contract, the release is
 wrong. Check the assertion before blaming the binary.
+
+---
+
+## 6. Reading `deploy.log`: two lines that look like failures and are not
+
+`/srv/qouver/apps/kori/logs/deploy.log` carries the whole run. Two lines there are routine:
+
+- **`cosign verify did not pass ... retrying in 3s`.** The signature is published to the registry
+  after the image, so the first attempt can lose a race that resolves itself. `verify_signature`
+  (`ops/scripts/deploy-vps.sh:482-498`) retries `COSIGN_ATTEMPTS` (default 5, 3s apart) and only
+  then gives up; an unverified digest is never tagged and the running container is untouched
+  (`:527`). A later `cosign verify passed on attempt N` is that retry succeeding, not a broken gate.
+  What matters is which attempt passed against `COSIGN_ATTEMPTS`, and whether a `passed` line
+  exists at all.
+- **`nothing to deploy` after a long wait.** The wait loop polls for `sha-<rev>` until its budget
+  runs out; if CI never produced the image (a red Nim job, for example) the run ends at
+  `ops/scripts/deploy-vps.sh:549` with the container left running rather than restarted into
+  nothing. Check the CI run for that commit before reading it as a deploy fault.
+
+The running version is authoritative at `/healthz` (`{"status":"ok","version":"0.10.2",
+"revision":"3d1dc1d"}`), not at a path under `/srv/qouver/apps/kori/`; the copy of `VERSION` on the
+host sits in `src/VERSION` and is what the source checkout carries. `curl -s
+http://127.0.0.1:8787/healthz` on the host is the one place version and revision are reported
+together by the process that is actually serving.
