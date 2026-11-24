@@ -11,6 +11,21 @@ this one, is the answer to "what is live".
 
 ## [Unreleased]
 
+### Fixed
+
+- `./task release --push` refuses to publish unless `HEAD` is `main`. A release tag is permanent
+  under `protect-release-tags`, and a feature branch is a new ref, so before this guard the push
+  succeeded and the undeletable tag left with it. The guard sits in `task`, not in the vendored
+  `task.d/release.sh`, and is exercised by `tests/dryrun-release.sh` against a real bare origin.
+
+- `./task release --no-push` no longer leaves the shared script's closing advice to publish a
+  branch tag. Off `main` it printed "Publish with: `git push origin HEAD vX.Y.Z`"
+  (`task.d/release.sh:165`), and following that verbatim published a permanent tag on a commit that
+  never reaches `main`: a branch push is a new ref, so `protect-release-tags` never sees it. The
+  line lives in the file vendored byte-identically into seven repos, so `task` drops it and says to
+  tag `main` by hand after the merge instead. `--no-push` off `main` still runs, and the local tag it
+  leaves is still allowed.
+
 ## [0.10.2] - 2026-11-24
 
 ### Fixed

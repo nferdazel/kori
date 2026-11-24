@@ -24,7 +24,8 @@ task — one entry point for the checks CI runs.
   ./task release [major|minor|patch] [--skip-check] [--push] [--current]
                  bump VERSION, sync the module and kori.nimble, move the CHANGELOG
                  Unreleased section, run gate-full, then one local commit and a local
-                 annotated tag. It never pushes unless --push is given.
+                 annotated tag. It never pushes unless --push is given, and --push is
+                 refused unless HEAD is main (a pushed tag is permanent).
   ./task help    this text
 EOF
 }
@@ -40,6 +41,7 @@ task_ops() {
   bash tests/dryrun-preflight.sh
   bash tests/dryrun-rollback.sh
   bash tests/dryrun-config.sh
+  bash tests/dryrun-release.sh
 }
 
 task_web() {
@@ -148,7 +150,40 @@ case "${1:-check}" in
   # every other repo. See task.d/gate.sh and task.d/release.sh.
   gate) shift; exec sh task.d/gate.sh gate "$@" ;;
   gate-full) shift; exec sh task.d/gate.sh gate-full "$@" ;;
-  release) shift; exec sh task.d/release.sh "$@" ;;
+  release)
+    shift
+    b=$(git rev-parse --abbrev-ref HEAD)
+    # --push publishes a tag that protect-release-tags then makes permanent, so it may only run
+    # from main. The guard lives here and not in task.d/release.sh because that file is vendored
+    # byte-identically into seven repos and must not carry a rule only kori has. A feature branch
+    # is a new ref, so its push would succeed and the tag would leave with it; checked before the
+    # script runs a single command, so a refusal leaves no half-bumped tree.
+    case " $* " in
+      *" --push "*)
+        if [ "$b" != main ]; then
+          echo "release: --push runs only from main, but HEAD is '$b'. Nothing was written." >&2
+          echo "release: merge first, then tag by hand (docs/RUNBOOK.md)." >&2
+          exit 1
+        fi
+        ;;
+    esac
+    [ "$b" = main ] && exec sh task.d/release.sh "$@"
+    # Off main the shared script closes a --no-push run with "Publish with: git push origin HEAD
+    # v$NEW" (task.d/release.sh:165). Following that line verbatim publishes a tag that
+    # protect-release-tags then makes permanent, on a commit that never reaches main; a branch push
+    # is a new ref, so nothing stops it. The line lives in the vendored file, which must stay
+    # byte-identical in seven repos, so it cannot be made branch-aware there. --no-push off main
+    # stays allowed (a local tag for a trial run is legitimate), so run it, drop that one line from
+    # the output, and say what to do instead.
+    tmp=$(mktemp "${TMPDIR:-/tmp}/kori-release.XXXXXX")
+    if sh task.d/release.sh "$@" >"$tmp" 2>&1; then rc=0; else rc=$?; fi
+    grep -v 'Publish with: git push origin HEAD' "$tmp" || true
+    rm -f "$tmp"
+    printf 'release: HEAD is "%s", not main, so tag v* stays local on purpose. Do not publish it from\n' "$b" >&2
+    printf 'release: here: a permanent tag on a branch commit cannot be moved or deleted. Merge first,\n' >&2
+    printf 'release: then tag main by hand (docs/RUNBOOK.md).\n' >&2
+    exit "$rc"
+    ;;
   help | -h | --help) usage ;;
   *) echo "unknown target: $1 (try ./task help)" >&2; exit 2 ;;
 esac

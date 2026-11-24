@@ -83,12 +83,25 @@ Both are read from the tagged commit, not from your working tree. A wrong tag me
 CHANGELOG section fixed after the push means deleting and re-creating a protected tag, which is the
 thing this ruleset exists to prevent. Confirm both before `git push`.
 
-`./task release --push` is not a shortcut for the sequence above. It creates the tag first
-(`task.d/release.sh:157`), then pushes the branch you are standing on and the tag (`:160-163`), and
-it carries no check that the branch is `main`; its comment at `:18` says pushing main is what
-deploys, but the script does not verify it. Run on a feature branch it publishes a permanent tag on
-a commit that is not `main`, which `protect-release-tags` then makes undeletable. Merge, then tag by
-hand.
+`./task release --push` still is not a shortcut for the sequence above. It creates the tag first
+(`task.d/release.sh:157`), then pushes the branch you are standing on and the tag (`:162-163`).
+Since 2026-11-24 `./task release` refuses the `--push` flag unless `HEAD` is `main`, before the
+script runs a single command, so a refusal leaves no half-bumped tree and no `chore(release)`
+commit behind (`task:161-169`, exercised by `tests/dryrun-release.sh`; the guard sits in `task`
+rather than in `task.d/release.sh` because that script is vendored byte-identically into seven
+repos and must not carry a rule only kori has). Before that guard the hole was specific: a feature
+branch is a *new* ref, so its push succeeded and the permanent tag left with it.
+
+A stale or diverged local `main` fails closed for the same reason, but later: the tag is already
+created locally by `:157` when the branch push is rejected at `:162`, so the script dies with
+"tag vX.Y.Z is local" and leaves that tag behind. Nothing reaches the remote, and the leftover tag
+is local only, so delete it before retrying. Merge, confirm the tip, then tag by hand.
+
+Running `--no-push` off `main` is allowed and stays local, because a tag for a trial run is
+legitimate. `./task release` drops the shared script's closing line, "Publish with: `git push origin
+HEAD vX.Y.Z`" (`task.d/release.sh:165`), because following it from a branch publishes a permanent
+tag on a commit that never reaches `main`. What it prints instead is to tag `main` by hand after the
+merge.
 
 ---
 
