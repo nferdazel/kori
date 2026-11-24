@@ -14,12 +14,15 @@ this one, is the answer to "what is live".
 ### Changed
 
 - `header_timeout` is the one failure class with a ladder instead of a flat cooldown. The first
-  timeout cools the leg for 5 s, each further timeout in a row without a served request doubles it
-  (10, 20, 40 s), and from the fifth it is the old 60 s. Measured on qouver1, 16–24 Nov: 90 of the
-  99 instant `502`s fell inside 90 s of a header timeout, because one blink on the only enabled leg
-  meant a minute with nothing to dial. `/admin/config` publishes `cooldowns.header_timeout_s` and
-  `cooldowns.header_timeout_max_s`. `a22` proves it end to end: after a 15 s timeout the leg is
-  skipped for about 5 s, then dialled and serves. `DEC-23`.
+  timeout cools the leg for the header window it just waited, clamped to 5–60 s: 15 s on the
+  streaming door, the 60 s cap on the 90 s non-stream and System One doors. Each further timeout in a
+  row without a served request doubles the rung inside the same clamp, and a served request resets it.
+  Measured on qouver1, 16–24 Nov: 90 of the 99 instant `502`s fell inside 90 s of a header timeout,
+  because one blink on the only enabled leg meant a minute with nothing to dial. `/admin/config`
+  publishes `cooldowns.header_timeout_s` and `cooldowns.header_timeout_max_s`. `a22` proves it end to
+  end against a real binary, all three door shapes: a 15 s rung on the streaming door, the leg
+  dialled again and serving once it is over, and the 60 s cap kept on the 90 s non-stream door so a
+  probe can never cost more than the cooldown it waited out. `DEC-23`.
 
 - `TCP_NODELAY` is set on every upstream dial and on every accepted client socket (`DEC-24`). A
   request head is a few small writes, so Nagle held the tail until an ACK before the provider was

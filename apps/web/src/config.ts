@@ -86,10 +86,11 @@ function render(config: AdminConfig): void {
           ["quota cooldown", config.cooldowns.quota_s + "s"],
           [
             "header timeout cooldown",
-            config.cooldowns.header_timeout_s +
-              "s, doubling per repeat, max " +
+            "the header window, clamped to " +
+              config.cooldowns.header_timeout_s +
+              "s-" +
               config.cooldowns.header_timeout_max_s +
-              "s",
+              "s, doubling per repeat",
           ],
         ]),
       );

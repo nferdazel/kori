@@ -571,7 +571,7 @@ non-streaming total still bounds the request as a whole.
 
 ---
 
-## DEC-23 — A header timeout cools for 5 s, and the rung doubles until it is the old 60 s
+## DEC-23 — A header timeout cools for the header window it just waited, doubling to the 60 s cap
 
 **Status:** accepted 2026-11-24; narrows the one flat cooldown in `DEC-8`/`DEC-10` for the
 `header_timeout` class only.
@@ -587,29 +587,46 @@ caller got a `502` in 1–2 ms. Of 99 such instant `502`s, 90 fell within 90 s o
 One blink therefore cost a full minute of downtime, and the request log recorded it as an anonymous
 `502` with no failover reason.
 
-**Decision.** `header_timeout` cools for `HeaderTimeoutCooldownS` = 5 s, and each further header
-timeout in a row without a served request doubles the rung: 5, 10, 20, 40, then `AvailabilityCooldownS`
-(60 s) from the fifth. `markServed` resets the ladder. Every other availability class keeps its flat
-60 s, and `quota_429`/`billing_402` keep 900 s; neither reads the ladder. The same rule applies to
-the System One door, because it shares the reason tokens and an operator reading one log should not
-have to learn two clocks. `/admin/config` publishes `cooldowns.header_timeout_s` and
-`cooldowns.header_timeout_max_s`.
+**Decision.** `header_timeout` cools for the header window that failure just waited, clamped to
+`[HeaderTimeoutCooldownS, AvailabilityCooldownS]` (5 s to 60 s), and each further header timeout in a
+row without a served request doubles the rung inside the same clamp. `markServed` resets the ladder.
+Every other availability class keeps its flat 60 s, and `quota_429`/`billing_402` keep 900 s; neither
+reads the ladder. The same rule applies to the System One door, because it shares the reason tokens
+and an operator reading one log should not have to learn two clocks. `/admin/config` publishes
+`cooldowns.header_timeout_s` and `cooldowns.header_timeout_max_s`.
+
+**The rung is measured in the door's own window, not in a constant.** The first version of this
+decision used a flat 5 s first rung. Laras's release gate rejected it, and the code agrees: the
+header window is 15 s on the streaming door but `HeaderDeadlineNonStreamMs` = 90 s on the
+non-stream chat door and on `POST /v1/systemone` (`kori.nim:90`, `:3131`, `:3143`). A 5 s rung
+therefore told the walk to re-probe a dead leg every five seconds and charge the next caller the
+full 90 s each time: six back-to-back requests measured 180 s of stall with two of them, against
+90 s with one under the old flat 60 s, and on the System One door a second request paid 90 s where
+the old code served it in 1.6 ms. A rung shorter than the window it followed is a probe loop paid
+for by callers, whatever the class means. `AttemptOutcome.headerWindowMs` now carries the deadline
+that attempt actually waited and `startCooldown`/`startSystemoneCooldown` pass it in, so a 15 s door
+gets 15, 30, 60 and a 90 s door gets the 60 s cap from the first failure. A window below the floor
+still cools 5 s.
 
 **Rejected.** A flat 5 s for every availability class: a dead socket or a revoked key would be
 re-dialled twelve times a minute, which is a probe loop against a provider rather than a cooldown.
-A per-class config table: more surface for one class that needed it, and the ladder is a property of
-what the class means, not of what this host happens to run. Skipping the cooldown entirely for a
-header timeout and always probing: that is what the ladder converges to anyway, but it puts the
-probe on every request instead of on one, so a provider that is really down sees the full request
-rate.
+A flat 60 s as before: that is the bug this decision exists to fix, and it cost 90 of 99 instant
+`502`s. A separate 5 s rung only on the streaming door: two ladders on one clock, and the non-stream
+callers are the ones who can least afford a probe. A per-class config table: more surface for one
+class that needed it, and the ladder is a property of what the class means, not of what this host
+happens to run. Skipping the cooldown entirely for a header timeout and always probing: that is what
+the ladder converges to anyway, but it puts the probe on every request instead of on one, so a
+provider that is really down sees the full request rate.
 
-**Consequences.** A leg that is really down reaches the same 60 s it had before, after five failures
-instead of one. A leg that blinks costs one request instead of a minute. A short cooldown means more
-dials against a dead leg than before, and `legs[].retries` already bounds what one request may
-spend on that. The ladder is per leg, in memory, and survives a config reload by leg name exactly as
-`coolingUntil` does; a restart resets it, which is the same trade every other runtime counter here
-makes. `a22` proves the visible half of it: after one 15 s timeout the leg is skipped for about 5 s,
-then dialled again and serves, where the old code would have walked for 60 s.
+**Consequences.** A leg that is really down reaches the same 60 s it had before, after one failure on
+a door whose window is already a minute and after three on the streaming door. A leg that blinks
+costs one request instead of a minute. A short cooldown means more dials against a dead leg than
+before, and `legs[].retries` already bounds what one request may spend on that. The ladder is per
+leg, in memory, and survives a config reload by leg name exactly as `coolingUntil` does; a restart
+resets it, which is the same trade every other runtime counter here makes. `a22` proves all three
+cases against a real binary: 15 s on the streaming door, the leg dialled again and serving once that
+rung is over, and the 60 s cap on the 90 s non-stream door. The half-open latch (`probeInFlight`) is
+taken after every skip that dials nothing, so a leg with a cooling key pool cannot leave it on.
 
 ## DEC-24 — Nagle is off on both ends of every upstream connection and on every accepted client
 
@@ -625,7 +642,9 @@ in that handshake, so a Nagle stall inside it is a larger share than it is on a 
 **Decision.** `dial()` sets `OptNoDelay` on the upstream socket once the connection is up, which
 covers the chat walk, the System One door and the OAuth token call because all three go through it.
 `dispatch()` sets it on the accepted client socket, because `asynchttpserver` creates that socket
-itself and offers no hook. Both calls ignore failure.
+itself and offers no hook. Both calls ignore failure: the upstream socket is already connected and
+usable by then, and a socket option that cannot be set is not a reason to cool a healthy leg for 60 s,
+so it is caught inside `dial()` rather than escaping into the caller's `conn_refused` path.
 
 **Rejected.** Building a custom listener to own the accept path: a second HTTP server implementation
 to set one socket option. An nginx or Caddy setting instead: the binary must be bounded by its own

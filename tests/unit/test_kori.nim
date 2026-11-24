@@ -583,35 +583,39 @@ block:
 
 # DEC-23: the header-timeout ladder.
 block:
-  check "a header timeout cools 5 s first",
-    cooldownSeconds(TokenHeaderTimeout, 0) == 5.0
-  check "a second header timeout in a row doubles to 10 s",
-    cooldownSeconds(TokenHeaderTimeout, 1) == 10.0
+  check "a header timeout on the 15 s streaming window cools 15 s, not 60",
+    cooldownSeconds(TokenHeaderTimeout, 0, HeaderDeadlineStreamMs) == 15.0
+  check "a second header timeout in a row doubles it",
+    cooldownSeconds(TokenHeaderTimeout, 1, HeaderDeadlineStreamMs) == 30.0
   check "the ladder stops at the plain availability cooldown",
-    cooldownSeconds(TokenHeaderTimeout, 4) == 60.0
-  check "a fifth header timeout in a row is still 60 s, not 80",
-    cooldownSeconds(TokenHeaderTimeout, 5) == 60.0
+    cooldownSeconds(TokenHeaderTimeout, 2, HeaderDeadlineStreamMs) == 60.0
+  check "a fourth header timeout in a row is still 60 s, not 120",
+    cooldownSeconds(TokenHeaderTimeout, 5, HeaderDeadlineStreamMs) == 60.0
+  check "a rung is never shorter than the window it followed: the 90 s door keeps 60 s",
+    cooldownSeconds(TokenHeaderTimeout, 0, HeaderDeadlineNonStreamMs) == 60.0
+  check "a window below the floor still cools the floor",
+    cooldownSeconds(TokenHeaderTimeout, 0, 1_000) == 5.0
   check "every other availability class keeps its flat 60 s",
-    cooldownSeconds(TokenConnRefused, 0) == 60.0 and
-      cooldownSeconds(TokenUpstream5xx, 3) == 60.0
+    cooldownSeconds(TokenConnRefused, 0, HeaderDeadlineStreamMs) == 60.0 and
+      cooldownSeconds(TokenUpstream5xx, 3, HeaderDeadlineStreamMs) == 60.0
   check "quota and billing keep 900 s whatever the ladder says",
-    cooldownSeconds(TokenQuota429, 0) == 900.0 and
-      cooldownSeconds(TokenBilling402, 4) == 900.0
+    cooldownSeconds(TokenQuota429, 0, HeaderDeadlineNonStreamMs) == 900.0 and
+      cooldownSeconds(TokenBilling402, 4, HeaderDeadlineStreamMs) == 900.0
 
 block:
   let gateway = makeGateway(@[legSpec("a", lrPrimary)], balance = true)
-  gateway.startCooldown(0, TokenHeaderTimeout)
-  check "the first dropped header cools the leg for about 5 s, not 60",
-    gateway.legs[0].coolingUntil - epochTime() <= 5.0
+  gateway.startCooldown(0, TokenHeaderTimeout, HeaderDeadlineStreamMs)
+  check "the first dropped header on the streaming door cools for about 15 s",
+    gateway.legs[0].coolingUntil - epochTime() <= 15.0
   check "the ladder counter moved once", gateway.legs[0].headerTimeouts == 1
-  gateway.startCooldown(0, TokenHeaderTimeout)
-  check "the second one cools for about 10 s",
-    gateway.legs[0].coolingUntil - epochTime() > 9.0
+  gateway.startCooldown(0, TokenHeaderTimeout, HeaderDeadlineStreamMs)
+  check "the second one doubles it",
+    gateway.legs[0].coolingUntil - epochTime() > 29.0
   gateway.markServed(0, 5)
   check "a served request resets the ladder", gateway.legs[0].headerTimeouts == 0
-  gateway.startCooldown(0, TokenHeaderTimeout)
-  check "so the next timeout is back to 5 s",
-    gateway.legs[0].coolingUntil - epochTime() <= 5.0
+  gateway.startCooldown(0, TokenHeaderTimeout, HeaderDeadlineStreamMs)
+  check "so the next timeout is back to the first rung",
+    gateway.legs[0].coolingUntil - epochTime() <= 15.0
   gateway.startCooldown(0, TokenUpstream5xx)
   check "a class that is not a header timeout leaves the ladder alone",
     gateway.legs[0].headerTimeouts == 1
@@ -619,8 +623,8 @@ block:
 block:
   let gateway = makeGateway(@[legSpec("a", lrPrimary)], balance = true)
   for _ in 1 .. 6:
-    gateway.startCooldown(0, TokenHeaderTimeout)
-  check "a leg that keeps dropping headers reaches the full 60 s by the fifth",
+    gateway.startCooldown(0, TokenHeaderTimeout, HeaderDeadlineStreamMs)
+  check "a leg that keeps dropping headers reaches the full 60 s by the third",
     gateway.legs[0].coolingUntil - epochTime() > 55.0
   gateway.legs[0].coolingUntil = epochTime() - 1.0
   check "and it is still eligible after the cooldown, never permanently dead",

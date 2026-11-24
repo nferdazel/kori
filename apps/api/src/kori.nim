@@ -458,6 +458,7 @@ type
     reason: string
     tokensIn: Option[int]
     tokensOut: Option[int]
+    headerWindowMs: int      ## the header deadline this attempt actually waited
 
   Chain = object
     firstFrom: string
@@ -1346,27 +1347,43 @@ proc pickOrder*(gateway: Gateway): seq[int] =
        gateway.legAvailable(index, now):
       result.add index
 
-proc cooldownSeconds*(reason: string, headerTimeouts: int): float =
+proc cooldownSeconds*(reason: string, headerTimeouts: int,
+                      headerWindowMs: int): float =
   ## DEC-23: the class decides the width. A header timeout is the one class that
-  ## widens with repetition: 5 s, then 10, 20, 40, and the old 60 s from the fifth
-  ## in a row. `headerTimeouts` is the count before this failure.
+  ## widens with repetition, and its first rung is the header window that failure
+  ## just cost, clamped to [HeaderTimeoutCooldownS, AvailabilityCooldownS].
+  ##
+  ## The window is the floor because a rung shorter than the wait it followed
+  ## schedules a probe that is more expensive than the cooldown it ends: on the
+  ## non-stream door the window is 90 s, so a 5 s rung would hand one caller 90 s
+  ## of stall every five seconds of a real outage. A door whose window already
+  ## costs a minute keeps the old flat 60 s, by construction.
+  ##
+  ## `headerTimeouts` is the count before this failure, so 0 is the first rung.
   if reason in [TokenQuota429, TokenBilling402]:
     return CapacityCooldownS
   if reason != TokenHeaderTimeout:
     return AvailabilityCooldownS
-  var cooldown = HeaderTimeoutCooldownS
+  var cooldown = float(headerWindowMs) / 1000.0
+  if cooldown < HeaderTimeoutCooldownS:
+    cooldown = HeaderTimeoutCooldownS
+  if cooldown >= AvailabilityCooldownS:
+    return AvailabilityCooldownS
   for _ in 1 .. headerTimeouts:
     cooldown *= 2.0
     if cooldown >= AvailabilityCooldownS:
       return AvailabilityCooldownS
   cooldown
 
-proc startCooldown*(gateway: Gateway, index: int, reason: string) =
+proc startCooldown*(gateway: Gateway, index: int, reason: string,
+                    headerWindowMs = HeaderDeadlineNonStreamMs) =
   ## §3.1 and §3.2: the cooldown starts at the failure, and the leg's failure
-  ## counter moves once for this request (D11.1).
+  ## counter moves once for this request (D11.1). `headerWindowMs` is the header
+  ## deadline this attempt actually waited, so the ladder's first rung can never
+  ## be cheaper than the probe that would follow it (DEC-23).
   let now = epochTime()
   var runtime = addr gateway.legs[index]
-  let cooldown = cooldownSeconds(reason, runtime.headerTimeouts)
+  let cooldown = cooldownSeconds(reason, runtime.headerTimeouts, headerWindowMs)
   if reason == TokenHeaderTimeout:
     runtime.headerTimeouts.inc
   runtime.attempted = true
@@ -1426,12 +1443,13 @@ proc systemoneOrder*(gateway: Gateway, now: float): seq[int] =
       continue
     result.add index
 
-proc startSystemoneCooldown*(gateway: Gateway, index: int, reason: string) =
+proc startSystemoneCooldown*(gateway: Gateway, index: int, reason: string,
+                             headerWindowMs = HeaderDeadlineNonStreamMs) =
   ## The same two cooldowns and the same reason tokens as the chat door, so one
   ## log is readable without knowing which door a line came from.
   let now = epochTime()
   var runtime = addr gateway.systemone[index]
-  let cooldown = cooldownSeconds(reason, runtime.headerTimeouts)
+  let cooldown = cooldownSeconds(reason, runtime.headerTimeouts, headerWindowMs)
   if reason == TokenHeaderTimeout:
     runtime.headerTimeouts.inc
   runtime.attempted = true
@@ -2093,8 +2111,13 @@ proc dial(uri: Uri): Future[tuple[ok: bool, timedOut: bool,
       return (false, false, nil)
     # DEC-24. A gateway request head is a few hundred bytes on a fresh
     # connection, so Nagle would hold the tail until the ACK: the provider sees
-    # our headers late and the caller pays it before the first token.
-    socket.setSockOpt(OptNoDelay, true, level = IPPROTO_TCP.cint)
+    # our headers late and the caller pays it before the first token. A failure
+    # here is ignored on purpose: the socket is connected and usable, and turning
+    # a failed socket option into `conn_refused` would cool a healthy leg for 60 s.
+    try:
+      socket.setSockOpt(OptNoDelay, true, level = IPPROTO_TCP.cint)
+    except CatchableError:
+      discard
     (true, false, socket)
   except CatchableError:
     closeQuietly(socket)
@@ -2562,9 +2585,10 @@ proc attemptLeg(gateway: Gateway, request: Request, leg: Leg, bearer: string,
         return
 
     # ---- response headers: the end of the failover window (§3b.2) ----
-    let headerDeadline =
-      deadlineIn(if stream: streamHeaderDeadlineMs(body.len)
-                 else: HeaderDeadlineNonStreamMs)
+    result.headerWindowMs =
+      if stream: streamHeaderDeadlineMs(body.len)
+      else: HeaderDeadlineNonStreamMs
+    let headerDeadline = deadlineIn(result.headerWindowMs)
     var raw = ""
     var headDone = false
     while not headDone:
@@ -2850,9 +2874,6 @@ proc handleChat(gateway: Gateway, request: Request): Future[void] {.async.} =
           hardStopDetail = ready.detail
           route = leg.name
           break
-      let probing = gateway.legs[index].coolingUntil > 0
-      if probing:
-        gateway.legs[index].probeInFlight = true
       gateway.markAttempted(index)
       inc dials
       route = leg.name
@@ -2898,6 +2919,12 @@ proc handleChat(gateway: Gateway, request: Request): Future[void] {.async.} =
       var rotations = 0
       var oauthRetried = false
       var retriesUsed = 0
+      # §3.2 half-open probe: exactly one dial may leave for a cooling leg, and the
+      # latch is taken here, after every skip that dials nothing, so no `continue`
+      # above it can leave the latch on with no reset behind it.
+      let probing = gateway.legs[index].coolingUntil > 0
+      if probing:
+        gateway.legs[index].probeInFlight = true
       var outcome: AttemptOutcome
       block legDials:
         while true:
@@ -2944,7 +2971,7 @@ proc handleChat(gateway: Gateway, request: Request): Future[void] {.async.} =
 
       case outcome.kind
       of akFailed:
-        gateway.startCooldown(index, outcome.reason)
+        gateway.startCooldown(index, outcome.reason, outcome.headerWindowMs)
         chain.lastReason = outcome.reason
         if chain.firstReason.len == 0:
           chain.firstReason = outcome.reason
@@ -3122,6 +3149,7 @@ proc attemptSystemone(gateway: Gateway, request: Request, leg: SystemoneLeg,
         return
 
     let headerDeadline = deadlineIn(HeaderDeadlineNonStreamMs)
+    result.headerWindowMs = HeaderDeadlineNonStreamMs
     var raw = ""
     var headDone = false
     while not headDone:
@@ -3277,7 +3305,8 @@ proc handleSystemone(gateway: Gateway, request: Request): Future[void] {.async.}
       let outcome = await gateway.attemptSystemone(request, leg, legBody,
                                                   totalDeadline)
       if outcome.kind == akFailed:
-        gateway.startSystemoneCooldown(index, outcome.reason)
+        gateway.startSystemoneCooldown(index, outcome.reason,
+                                       outcome.headerWindowMs)
         if firstReason.len == 0:
           firstReason = outcome.reason
           firstFrom = leg.name
