@@ -413,7 +413,8 @@ not a config edit.
 
 ## DEC-19 — `/v1/systemone` is a second door with its own legs, not a second protocol path
 
-**Status:** accepted 2026-11-18.
+**Status:** accepted 2026-11-18, amended 2026-11-25 by DEC-28 (the first pick is weighted when
+`balance` is on).
 
 **Context.** Jev — the model that decides which bot answers a message in a group chat — is not a
 chat model. On commandcode it is served at `POST /provider/v1/systemone` with a body of `state`,
@@ -753,6 +754,15 @@ also carry `X-Kori-Write: 1` — a header a cross-site form cannot set. A bearer
 header. Refusing to switch the last serving provider off is `409 last_leg` unless the body says
 `confirm_last_leg: true`.
 
+**Amended 2026-11-25.** The write token is a superset of the read one, so it is accepted as a bearer on
+every read GET (`/admin/state`, `/admin/config`, `/admin/log`) as well as on `PUT /admin/overrides`.
+The first cut of the gate compared a bearer only against the read token, which answered `401` to a
+script holding the write token even though the same credential could mint a write session and read
+every page with it (and §6.5 of the plan already said "read endpoints with a write token: allowed").
+That was an inconsistency, not a boundary: nothing gets wider, because the same caller could already
+read through the cookie. The read token stays read-only, and a bearer of neither token is still
+`401`.
+
 **Rejected.** A general config editor, `PATCH` on arbitrary keys, and accepting credentials or
 timeouts through the same door: each widens what a compromised process can rewrite. Also rejected:
 waiting for `inFlight == 0` before applying a boolean.
@@ -762,3 +772,29 @@ in the container template, `:rw,Z`, uid 10001). Every write writes a `.bak`, so 
 credentials exists on the same protected volume — accepted, one generation only, and Galih's review
 (Phase 8) is what signs off on it. `state.admin_writes` and a stderr line record that a write
 happened, never what the token was.
+
+## DEC-28 — `balance` picks the System One leg too, with the chat door's weighted pick
+
+**Status:** accepted 2026-11-25.
+
+**Context.** DEC-19 made `systemone.legs` a fallback chain walked in config order, and deliberately not
+a load balancer. That was written when jev had one usable endpoint. Since 2026-11-25 the gateway runs on
+two plans that both serve jev (`opencode-go` and `commandcode`, DEC-25) and the chat door splits traffic
+between them 1:1, so jev traffic — the highest-volume caller kori has — piled onto the first leg while
+the second sat idle until a failure. The owner asked for one switch to mean the same thing on both
+doors.
+
+**Decision.** `systemone.legs[].weight` is a 1-1000 share with the same default (1) and the same refusal
+of 0 as a chat leg. When `balance` is true, the first pick is the chat door's smooth weighted
+round-robin over the enabled System One legs that are not cooling; the rest of the walk stays config
+order, so failover is still deterministic and the second leg is still the one that answers when the
+first dies. When `balance` is false the walk is exactly what DEC-19 wrote and the weight is inert. A
+cooling leg leaves the pool; one eligible leg is always the pick.
+
+**Rejected.** A separate switch for the System One door: two knobs for one intent is how a config drifts.
+Rejected a weighted pick per dial rather than per request: a decision request is one call, and a
+per-dial pick would move the model id mid-request.
+
+**Consequences.** `/admin/config` reports `weight` per System One leg, like a chat leg. The SWRR state
+lives in memory per leg and resets on restart, which is harmless at this volume. `balance: true` with
+`systemone` absent changes nothing.

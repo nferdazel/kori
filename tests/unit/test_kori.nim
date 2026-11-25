@@ -638,6 +638,34 @@ block:
       "https://opencode.ai/inference/go/openai/v1"
   check "redactUrl drops a query that carries a key",
     redactUrl("https://example.test/v1?api_key=abc") == "https://example.test/v1"
+  check "redactUrl drops userinfo from the authority",
+    redactUrl("https://user:s3cret@api.example.test/v1") ==
+      "https://api.example.test/v1"
+  check "the redacted URL carries no character of the password",
+    not redactUrl("https://user:s3cret@api.example.test/v1").contains("s3cret")
+  check "userinfo goes even when the query would keep the rest",
+    redactUrl("https://user:pw@h.test/v1?mode=fast") == "https://h.test/v1?mode=fast"
+  check "a base with no scheme loses its userinfo too",
+    redactUrl("user:pw@h.test/v1") == "h.test/v1"
+  check "an '@' in the path is not userinfo",
+    redactUrl("https://h.test/v1/a@b") == "https://h.test/v1/a@b"
+
+block:
+  # §5.4 at the surface that prints it: /admin/config never carries the credential
+  # a base URL was configured with.
+  var cfg = Config(listenHost: "127.0.0.1", listenPort: 4011,
+                   logPath: scratch / "redact.jsonl")
+  cfg.legs = @[legSpec("leg-a", lrPrimary)]
+  cfg.legs[0].baseUrl = "https://user:s3cret@api.example.test/v1"
+  cfg.systemone = @[SystemoneLeg(name: "jev", baseUrl: "https://u:pw@x.test/v1",
+                                 model: "m", enabled: true, weight: 1)]
+  let gateway = newGateway(cfg, RequestLog(fd: -1), "127.0.0.1:4011")
+  let printed = gateway.configJson()
+  check "/admin/config prints no part of a base_url credential",
+    not printed.contains("s3cret") and not printed.contains("u:pw@")
+  check "/admin/config still prints the host, minus the userinfo",
+    printed.contains("https://api.example.test/v1") and
+      printed.contains("https://x.test/v1")
 
 block:
   check "parseRfc3339 reads a +07:00 offset",
@@ -1195,6 +1223,32 @@ block:
 """))
 
 block:
+  # DEC-28: the System One weight is the chat leg's share, with the same default
+  # and the same refusal of 0.
+  let weighted = loadConfig(writeConfig("systemone-weight.json", """
+{"legs":[{"name":"leg-a","base_url":"http://127.0.0.1:1/v1","api_key":"k"}],
+ "systemone":{"legs":[
+   {"name":"jev","base_url":"https://x.test/v1","api_key":"k","model":"m"},
+   {"name":"jev-heavy","base_url":"https://y.test/v1","api_key":"k","model":"m",
+    "weight":7}]}}
+"""))
+  check "a systemone leg with no weight gets 1, so old configs balance evenly",
+    weighted.systemone[0].weight == 1
+  check "a named weight is kept", weighted.systemone[1].weight == 7
+  checkRaises "a systemone weight of 0 is refused", ConfigError:
+    discard loadConfig(writeConfig("systemone-weight-zero.json", """
+{"legs":[{"name":"leg-a","base_url":"http://127.0.0.1:1/v1","api_key":"k"}],
+ "systemone":{"legs":[{"name":"jev","base_url":"https://x.test/v1",
+                       "api_key":"k","model":"m","weight":0}]}}
+"""))
+  checkRaises "a systemone weight above the ceiling is refused", ConfigError:
+    discard loadConfig(writeConfig("systemone-weight-max.json", """
+{"legs":[{"name":"leg-a","base_url":"http://127.0.0.1:1/v1","api_key":"k"}],
+ "systemone":{"legs":[{"name":"jev","base_url":"https://x.test/v1",
+                       "api_key":"k","model":"m","weight":1001}]}}
+"""))
+
+block:
   # The one edit this door makes, and the usage shape it reads.
   let caller = """{"state":"who answers?","model":"jev-latest","questions":{}}"""
   check "the model id is replaced and nothing else is",
@@ -1236,6 +1290,38 @@ block:
     parseJson(gateway.configJson()){"systemone"}.len == 3
   check "the config reports the block beside the chat legs",
     parseJson(gateway.configJson()){"legs"}.len == 1
+
+block:
+  # DEC-28: with `balance` on, the first System One pick is weighted and the rest
+  # of the walk stays config order. Same SWRR as DEC-11, so equal weights alternate
+  # and a cooling leg leaves the pool instead of taking its share to nobody.
+  var cfg = Config(listenHost: "127.0.0.1", listenPort: 4011,
+                   logPath: scratch / "so-balance.jsonl", balance: true)
+  cfg.legs = @[legSpec("leg-a", lrPrimary)]
+  cfg.systemone = @[
+    SystemoneLeg(name: "jev-a", baseUrl: "https://a.test/v1", model: "m",
+                 enabled: true, weight: 1),
+    SystemoneLeg(name: "jev-b", baseUrl: "https://b.test/v1", model: "m",
+                 enabled: true, weight: 1)]
+  let gateway = newGateway(cfg, RequestLog(fd: -1), "127.0.0.1:4011")
+  var picks: seq[int]
+  for _ in 0 ..< 4:
+    picks.add gateway.systemoneOrder(epochTime())[0]
+  check "equal weights alternate the System One first pick",
+    picks == @[0, 1, 0, 1]
+  check "the walk after the pick is config order",
+    gateway.systemoneOrder(epochTime()) == @[0, 1]
+  gateway.startSystemoneCooldown(0, TokenAuth401)
+  check "a cooling leg leaves the System One pool",
+    gateway.systemoneOrder(epochTime()) == @[1]
+
+  cfg.systemone[0].weight = 3
+  let heavy = newGateway(cfg, RequestLog(fd: -1), "127.0.0.1:4011")
+  var counts: array[2, int]
+  for _ in 0 ..< 8:
+    inc counts[heavy.systemoneOrder(epochTime())[0]]
+  check "a 3:1 config gives the heavy leg six of eight picks",
+    counts[0] == 6 and counts[1] == 2
 
 # ------------------------------------------------------------- the admin gate ---
 #
@@ -1377,6 +1463,19 @@ block:
                             headers: newHttpHeaders([("Authorization",
                               "Bearer gate-token")]))
   check "the right bearer opens the gate", gateway.adminGate(rightBearer) == agOk
+
+  # DEC-27, amended: the write token reads. It can already mint a write session,
+  # which reads every GET, so the bearer form is not a wider door.
+  let writeTokenFile = scratch / "gate-write.token"
+  putEnv(AdminWriteTokenEnv, writeTokenFile)
+  writeFile(writeTokenFile, "write-token\n")
+  let writeBearer = Request(reqMethod: HttpGet,
+                            headers: newHttpHeaders([("Authorization",
+                              "Bearer write-token")]))
+  check "the write bearer opens the read gate",
+    gateway.adminGate(writeBearer) == agOk
+  check "the write bearer is still not the read token",
+    gateway.adminGate(rightBearer) == agOk
 
   # Fail closed: no token file means the gated surface does not exist, for every
   # request, and a bearer of any value is not a way around it.

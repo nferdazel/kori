@@ -11,6 +11,29 @@ this one, is the answer to "what is live".
 
 ## [Unreleased]
 
+### Added
+
+- `balance: true` now selects the System One leg as well: the first `systemone.legs` pick is the chat
+  door's smooth weighted round-robin over the eligible legs, and the rest of the walk stays config
+  order for failover (DEC-28). `systemone.legs[].weight` (1-1000, default 1) is the share, published
+  in `/admin/config`. `balance: false` leaves the System One walk exactly as DEC-19 wrote it, and a
+  config that names no weight balances evenly.
+
+- `./task phase2 <requests.jsonl>`: the phase 2 measurement. Per prompt-size bucket (`<=32`, `33-128`,
+  `129-512`, `>512` KiB) it prints n and the p50/p90/p99 of `prompt_kib` and `header_ms`, nearest
+  rank, plus how many lines it skipped for lacking the two fields. No production log carries them
+  until 0.10.5 is deployed, so it reads a file and stays out of `check`; `tests/dryrun-phase2.sh`
+  proves the arithmetic on a fixed sample.
+
+### Fixed
+
+- `redactUrl` strips `user:pass@` from the authority, so a `base_url` configured with a credential is
+  printed as `https://host/…` in `/admin/config` instead of in full. An `@` in the path is left alone.
+
+- A write token now works as a bearer on the read GETs (`/admin/state`, `/admin/config`,
+  `/admin/log`) (DEC-27, amended). It could already read through a write session; the bearer form
+  answered `401`. The read token stays read-only, and a bearer of neither token is still `401`.
+
 ## [0.10.5] - 2026-11-25
 
 ### Added

@@ -201,6 +201,11 @@ A cooling leg leaves the pool, so its share is redistributed instead of halving 
 `balance: false` the weight is inert and the order is the config order. `DEC-11` supersedes the
 older rule that refused every weight but 1.
 
+The same switch decides the System One door (`DEC-28`): with `balance: true` the first
+`systemone.legs` entry is a weighted pick over the eligible legs, using `systemone.legs[].weight`
+(also 1-1000, default 1), and the rest of that list stays config order for failover. With
+`balance: false` the System One walk is config order and nothing else.
+
 ### Credential refresh
 
 A leg with an `oauth` block holds an access token that expires. kori refreshes it itself; a leg
@@ -325,6 +330,11 @@ counters; the log is the durable record, not a source of router state.
 The admin surface is one shared token (`DEC-20`). A script or a scrape sends it as
 `Authorization: Bearer <token>`; a browser gets the `kori_admin` session cookie from the login form.
 Either one is enough, and the token is compared against the file in constant time.
+
+The write credential is a second file, `KORI_ADMIN_WRITE_TOKEN_FILE` (`DEC-27`): it is accepted as a
+bearer on `PUT /admin/overrides` and on every gated GET, so a script that holds it does not have to
+trade it for a cookie first. The read token stays read-only, and a session minted from the write token
+lasts 12 hours and must carry `X-Kori-Write: 1` to write.
 
 `POST /session/login` takes `{"token":"<token>"}` and answers `204` with `Set-Cookie: kori_admin=…;
 HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=2592000`. `POST /session/logout` drops the entry
@@ -494,6 +504,7 @@ repository, in an image or in a log.
 | `systemone.legs[].model` | yes, with `systemone` | the provider id that replaces the caller's `model`; unlike a chat leg this is required, because the whole reason the door exists is that the caller's name is not the provider's |
 | `systemone.legs[].api_key` | no | sent as `Authorization: Bearer …` unless `headers` already sets one |
 | `systemone.legs[].headers` | no | extra request headers |
+| `systemone.legs[].weight` | no | 1-1000, default `1`: the leg's share of the first pick when `balance` is `true` (DEC-28) |
 | `systemone.legs[].enabled` | no | `true` or `false`, default `true` |
 | `log.rotate_bytes` | no | rotate the live log at this size in bytes; `0`, the default, keeps one growing file (DEC-17) |
 | `log.keep` | no | how many rotated files stay beside the live one, `1`-`20`, default `2` |

@@ -324,6 +324,7 @@ type
     apiKey*: string
     model*: string            ## the provider id sent upstream; "" forwards the caller's
     headers*: seq[(string, string)]
+    weight*: int              ## DEC-28: its share of the pick when `balance` is on
     enabled*: bool
 
   Config* = object
@@ -389,9 +390,9 @@ type
     weightCurrent*: int
 
   SystemoneRuntime* = object
-    ## DEC-19. The same two facts the chat router keeps per leg, minus everything
-    ## that only means something to a weighted pick: a System One list is walked
-    ## in config order, so there is no weight, no cursor and no key pool.
+    ## DEC-19. The same two facts the chat router keeps per leg, minus the things
+    ## only a chat walk needs: no cursor, no key pool. DEC-28 adds the weighted
+    ## pick's credit, because `balance` now selects the first System One leg.
     attempted*: bool
     coolingUntil*: float
     lastFailureClass*: string
@@ -400,6 +401,8 @@ type
     ## DEC-23, the same ladder the chat door keeps: consecutive header timeouts
     ## with no served request in between.
     headerTimeouts*: int
+    ## DEC-28: smooth weighted round-robin credit, never negative.
+    weightCurrent*: int
 
   FailoverEvent* = object
     at*: string
@@ -1022,6 +1025,18 @@ proc loadConfigText*(raw, path: string): Config =
         if enabledNode.kind != JBool:
           failConfig(ctx & ".enabled must be true or false")
         leg.enabled = enabledNode.getBool()
+      # DEC-28. The same 1-1000 share as a chat leg, and the same reason for
+      # refusing 0: it would silently remove a leg from the split. Absent means 1,
+      # so every config written before this key existed balances evenly.
+      let weightNode = item{"weight"}
+      if weightNode != nil and weightNode.kind != JNull:
+        if weightNode.kind != JInt:
+          failConfig(ctx & ".weight must be an integer")
+        leg.weight = weightNode.getInt()
+        if leg.weight < 1 or leg.weight > MaxWeight:
+          failConfig(ctx & ".weight must be 1-" & $MaxWeight)
+      else:
+        leg.weight = 1
       result.systemone.add leg
     if result.systemone.len == 0:
       failConfig("systemone.legs must not be empty when the block is present")
@@ -1501,12 +1516,14 @@ proc modelDisabled*(gateway: Gateway, alias: string): bool =
   gateway.cfg.overridesModels.hasKey(alias) and
     not gateway.cfg.overridesModels[alias]
 
-proc pickWeighted(legs: seq[Leg], pool: seq[int],
-                  currents: var seq[int]): int =
+proc pickWeighted[T](legs: seq[T], pool: seq[int],
+                     currents: var seq[int]): int =
   ## DEC-11's smooth weighted round-robin, the nginx algorithm: every turn each
   ## candidate gains its weight, the largest current wins, and the winner pays the
   ## total back. One call per request, no durable state, and a weight of 1 on
   ## every leg degenerates to plain round-robin. `currents` is indexed by leg.
+  ## Generic since DEC-28: the chat legs and the System One legs both carry a
+  ## `weight`, and the same pick decides both doors.
   var total = 0
   for index in pool:
     total += legs[index].weight
@@ -1677,15 +1694,32 @@ proc recordEvent(gateway: Gateway, fromRoute, toRoute, reason: string) =
 # ------------------------------------------------------- systemone router ---
 
 proc systemoneOrder*(gateway: Gateway, now: float): seq[int] =
-  ## DEC-19. Config order, nothing else: this list is a fallback chain, not a
-  ## load balancer. A cooling leg is skipped without a dial exactly as a chat leg
-  ## is, and a leg the config switched off keeps its place in the order.
+  ## DEC-19 as amended by DEC-28. With `balance: false` this is config order and
+  ## nothing else: a fallback chain, not a load balancer. With `balance: true` the
+  ## first pick is the same smooth weighted round-robin the chat door uses, over
+  ## the legs that are enabled and not cooling, and the rest of the walk stays
+  ## config order. A cooling leg is skipped without a dial exactly as a chat leg is.
+  var pool: seq[int]
   for index, leg in gateway.cfg.systemone:
     if not leg.enabled:
       continue
     if gateway.systemone[index].coolingUntil > now:
       continue
-    result.add index
+    pool.add index
+  if pool.len == 0:
+    return @[]
+  if not gateway.cfg.balance:
+    return pool
+  var currents = newSeq[int](gateway.cfg.systemone.len)
+  for index in 0 ..< gateway.cfg.systemone.len:
+    currents[index] = gateway.systemone[index].weightCurrent
+  let chosen = pickWeighted(gateway.cfg.systemone, pool, currents)
+  for index in 0 ..< gateway.cfg.systemone.len:
+    gateway.systemone[index].weightCurrent = currents[index]
+  result.add chosen
+  for index in pool:
+    if index != chosen:
+      result.add index
 
 proc startSystemoneCooldown*(gateway: Gateway, index: int, reason: string,
                              headerWindowMs = HeaderDeadlineNonStreamMs,
@@ -4028,19 +4062,31 @@ proc badRequestBody(parameter: string): string =
 
 proc redactUrl*(value: string): string =
   ## §5.4: a base URL is printed in full only when it carries no credential.
-  let query = value.find('?')
-  let fragment = value.find('#')
+  ## `user:pass@host` is one: the authority before the first `/` after the scheme
+  ## is stripped when it holds an `@`, and the query/fragment rules follow.
+  var url = value
+  let schemeAt = url.find("://")
+  let authStart = if schemeAt >= 0: schemeAt + 3 else: 0
+  var authEnd = url.find('/', authStart)
+  if authEnd < 0:
+    authEnd = url.len
+  let at = url.find('@', authStart)
+  if at >= 0 and at < authEnd:
+    let tail = if at + 1 < url.len: url[at + 1 .. ^1] else: ""
+    url = url[0 ..< authStart] & tail
+  let query = url.find('?')
+  let fragment = url.find('#')
   if query < 0:
     if fragment >= 0:
-      return value[0 ..< fragment]
-    return value
-  let tail = value[query + 1 .. ^1].toLowerAscii()
+      return url[0 ..< fragment]
+    return url
+  let tail = url[query + 1 .. ^1].toLowerAscii()
   if tail.contains("key") or tail.contains("token") or tail.contains("secret") or
      tail.contains("api"):
-    return value[0 ..< query]
+    return url[0 ..< query]
   if fragment >= 0 and fragment > query:
-    return value[0 ..< fragment]
-  value
+    return url[0 ..< fragment]
+  url
 
 proc credentialRefs*(configPath: string, legCount: int): seq[string] =
   ## `<path>:<line>` for each leg's api_key, never the value. If the file cannot
@@ -4342,6 +4388,7 @@ proc configJson*(gateway: Gateway): string =
       node["name"] = %leg.name
       node["base_url"] = %redactUrl(leg.baseUrl)
       node["model"] = %leg.model
+      node["weight"] = %leg.weight
       node["enabled"] = %leg.enabled
       var headers = newJArray()
       for (headerName, _) in leg.headers:
@@ -4785,6 +4832,13 @@ proc adminGate*(gateway: Gateway, request: Request): AdminGate =
       return agOk
   let bearer = bearerValue(request)
   if bearer.len > 0 and constantTimeEquals(token.get, bearer):
+    return agOk
+  # DEC-27, amended: the write token is a superset of the read one. It can already
+  # mint a write session, and a write session reads every GET; refusing the same
+  # credential as a bearer only forced a script to trade it for a cookie first.
+  let writeToken = readAdminWriteToken()
+  if bearer.len > 0 and writeToken.isSome and
+     constantTimeEquals(writeToken.get, bearer):
     return agOk
   agDenied
 
