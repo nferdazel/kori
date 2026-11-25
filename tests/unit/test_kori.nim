@@ -1501,6 +1501,31 @@ block:
   check "the new keys follow the nine",
     measured.find("\"prompt_kib\"") > measured.find("\"stream\"")
 
+block:
+  # DEC-26: the deadline numbers are config, not compile-time constants, and the
+  # one rule that reads them answers the same shape as before.
+  let path = writeConfig("tuned.json", """
+{"timeouts":{"header_ms_stream_base":9000,"header_ms_stream_slope_per_kib":25,
+ "header_ms_stream_max":30000,"header_ms_non_stream":45000},
+ "legs":[{"name":"a","base_url":"http://127.0.0.1:1/v1"}]}
+""")
+  let cfg = loadConfig(path)
+  check "config reads the four timeout numbers",
+    cfg.headerStreamBaseMs == 9000 and cfg.headerStreamPerKiBMs == 25 and
+    cfg.headerStreamMaxMs == 30_000 and cfg.headerNonStreamMs == 45_000
+  check "the tuned rule gives a 256 KiB body 15.4 s",
+    streamHeaderDeadlineMs(cfg.headerStreamBaseMs, cfg.headerStreamPerKiBMs,
+                           cfg.headerStreamMaxMs, 256 * 1024) == 15_400
+  check "a body of zero bytes still gets the floor",
+    streamHeaderDeadlineMs(9000, 25, 30_000, 0) == 9000
+  check "the slope is capped",
+    streamHeaderDeadlineMs(9000, 25, 30_000, 4 * 1024 * 1024) == 30_000
+
+checkRaises "a base above the max is refused", ConfigError:
+  discard loadConfigText("""{"timeouts":{"header_ms_stream_base":30000,
+    "header_ms_stream_max":15000},"legs":[{"name":"a",
+    "base_url":"http://127.0.0.1:1/v1"}]}""", "timeouts.json")
+
 # --------------------------------------------------------------------- report ---
 
 removeDir(scratch)

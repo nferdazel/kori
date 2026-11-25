@@ -38,7 +38,7 @@ caller ──POST /v1/chat/completions──► kori
 | Section | Holds |
 |---|---|
 | CLI flags | flag parsing, precedence over config, exit `2` on bad input |
-| config | JSON loading, leg defaults, prices, the log rotation policy, and every refusal: a pool that cannot also be the bearer, an unranked effort, a `weight` outside 1-1000, a `retries` outside 0-5, a negative price |
+| config | JSON loading, leg defaults, the four header-deadline numbers, prices, the log rotation policy, and every refusal: a pool that cannot also be the bearer, an unranked effort, a `weight` outside 1-1000, a `retries` outside 0-5, a negative price |
 | log writer | the fourteen-key line (nine keys always; `alias`, `effort_clamped` and `cost_usd`, then `prompt_kib` and `header_ms`, only when the request earned them), the single append, size rotation with `keep`, the descriptor held for the process |
 | time | RFC 3339 stamps used by the log and the admin GETs |
 | router | leg availability, pick order, smooth weighted round-robin (`DEC-11`), leg and key cooldowns, served/attempted counters, the latency ring |

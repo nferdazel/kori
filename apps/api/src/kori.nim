@@ -307,6 +307,17 @@ type
     legs*: seq[Leg]
     prices*: Table[string, Price]  ## by model id, plus "*" for the fallback
     systemone*: seq[SystemoneLeg]  ## `POST /v1/systemone` upstreams, in config order
+    # DEC-26. The streaming header deadline is a rule, and its three numbers are
+    # data: an operator tunes them from the config, not from a rebuild.
+    headerStreamBaseMs*: int
+    headerStreamPerKiBMs*: int
+    headerStreamMaxMs*: int
+    headerNonStreamMs*: int
+    # DEC-27. The dashboard's switches, kept in their own block so the leg objects
+    # (and every credential byte among them) are never rewritten by a toggle.
+    overridesLegs*: Table[string, bool]
+    overridesModels*: Table[string, bool]
+    overridesUpdatedAt*: string
 
   CliOptions* = object
     configPath*: string
@@ -582,12 +593,15 @@ proc effortRank*(effort: string): int =
       return index
   -1
 
-proc loadConfig*(path: string): Config =
-  var raw: string
-  try:
-    raw = readFile(path)
-  except CatchableError as e:
-    failConfig("cannot read config '" & path & "': " & e.msg)
+proc loadConfigText*(raw, path: string): Config =
+  ## The parse of one config document, separated from the read so the write path
+  ## can validate a patched document before it replaces the file on disk.
+  result.headerStreamBaseMs = HeaderDeadlineStreamMs
+  result.headerStreamPerKiBMs = HeaderDeadlineStreamPerKiBMs
+  result.headerStreamMaxMs = HeaderDeadlineStreamMaxMs
+  result.headerNonStreamMs = HeaderDeadlineNonStreamMs
+  result.overridesLegs = initTable[string, bool]()
+  result.overridesModels = initTable[string, bool]()
   var root: JsonNode
   try:
     root = parseJson(raw)
@@ -631,6 +645,40 @@ proc loadConfig*(path: string): Config =
       if keep.getInt() < 1 or keep.getInt() > MaxLogKeep:
         failConfig("log.keep must be 1-" & $MaxLogKeep)
       result.logKeep = keep.getInt()
+
+  # DEC-26. The four deadline numbers, with the compiled defaults. A value the
+  # config does not name keeps the number this binary shipped with.
+  let timeouts = root{"timeouts"}
+  if timeouts != nil and timeouts.kind != JNull:
+    if timeouts.kind != JObject:
+      failConfig("timeouts must be an object")
+    for key, spec in timeouts:
+      if key notin ["header_ms_stream_base", "header_ms_stream_slope_per_kib",
+                    "header_ms_stream_max", "header_ms_non_stream"]:
+        failConfig("timeouts." & key & " is not a known timeout")
+      if spec.kind != JInt:
+        failConfig("timeouts." & key & " must be an integer")
+      let value = spec.getInt()
+      case key
+      of "header_ms_stream_base":
+        if value < 100 or value > 600_000:
+          failConfig("timeouts.header_ms_stream_base must be 100-600000")
+        result.headerStreamBaseMs = value
+      of "header_ms_stream_slope_per_kib":
+        if value < 0 or value > 1_000:
+          failConfig("timeouts.header_ms_stream_slope_per_kib must be 0-1000")
+        result.headerStreamPerKiBMs = value
+      of "header_ms_stream_max":
+        if value < 100 or value > 600_000:
+          failConfig("timeouts.header_ms_stream_max must be 100-600000")
+        result.headerStreamMaxMs = value
+      of "header_ms_non_stream":
+        if value < 100 or value > 600_000:
+          failConfig("timeouts.header_ms_non_stream must be 100-600000")
+        result.headerNonStreamMs = value
+      else: discard
+  if result.headerStreamBaseMs > result.headerStreamMaxMs:
+    failConfig("timeouts.header_ms_stream_base must not exceed header_ms_stream_max")
 
   # Prices are money, so they are data in the config and never a constant in the
   # binary. USD per million tokens, both directions, keyed by the model id that is
@@ -875,6 +923,14 @@ proc loadConfig*(path: string): Config =
       result.systemone.add leg
     if result.systemone.len == 0:
       failConfig("systemone.legs must not be empty when the block is present")
+
+proc loadConfig*(path: string): Config =
+  var raw: string
+  try:
+    raw = readFile(path)
+  except CatchableError as e:
+    failConfig("cannot read config '" & path & "': " & e.msg)
+  loadConfigText(raw, path)
 
 proc applyCli*(cfg: var Config, cli: CliOptions) =
   ## CLI > config > built-in default, in that order (CONTRACT §2).
@@ -1519,15 +1575,18 @@ proc remainingMs(deadline: float): int =
 proc deadlineIn(ms: int): float =
   epochTime() + ms.float / 1000.0
 
+proc streamHeaderDeadlineMs*(baseMs, perKiBMs, maxMs, bodyBytes: int): int =
+  ## SPEC §3b.1 with the size slope of D-2, with the numbers passed in so the
+  ## config owns them (DEC-26). A body of zero bytes still gets the floor.
+  if bodyBytes <= 0 or perKiBMs <= 0:
+    return baseMs
+  min(baseMs + (bodyBytes div 1024) * perKiBMs, maxMs)
+
 proc streamHeaderDeadlineMs*(bodyBytes: int): int =
-  ## SPEC §3b.1 with the size slope of D-2: a provider's first byte arrives later
-  ## the more prompt it was handed, so the streaming header window grows with the
-  ## outbound body from the 15 s floor and stops at the cap. Short prompts keep
-  ## the floor, which is why a3b still measures 15 s.
-  if bodyBytes <= 0:
-    return HeaderDeadlineStreamMs
-  min(HeaderDeadlineStreamMs + (bodyBytes div 1024) * HeaderDeadlineStreamPerKiBMs,
-      HeaderDeadlineStreamMaxMs)
+  ## The compiled defaults, kept for callers that have no config in hand and for
+  ## the unit tests that pin the shipped numbers.
+  streamHeaderDeadlineMs(HeaderDeadlineStreamMs, HeaderDeadlineStreamPerKiBMs,
+                         HeaderDeadlineStreamMaxMs, bodyBytes)
 
 proc awaitRecv(socket: AsyncSocket, maxBytes: int,
                deadline: float): Future[RecvOut] {.async.} =
@@ -2590,7 +2649,7 @@ proc attemptLeg(gateway: Gateway, request: Request, leg: Leg, bearer: string,
     # The head send drives the TLS handshake, so its deadline is the TLS one.
     let handshakeDeadline =
       if isTls: deadlineIn(TlsDeadlineMs)
-      else: deadlineIn(HeaderDeadlineNonStreamMs)
+      else: deadlineIn(gateway.cfg.headerNonStreamMs)
     if not await client.awaitSend(head, handshakeDeadline):
       result.kind = akFailed
       result.reason = if isTls: TokenDialTimeout else: TokenConnRefused
@@ -2603,8 +2662,10 @@ proc attemptLeg(gateway: Gateway, request: Request, leg: Leg, bearer: string,
 
     # ---- response headers: the end of the failover window (§3b.2) ----
     result.headerWindowMs =
-      if stream: streamHeaderDeadlineMs(body.len)
-      else: HeaderDeadlineNonStreamMs
+      if stream: streamHeaderDeadlineMs(gateway.cfg.headerStreamBaseMs,
+                                        gateway.cfg.headerStreamPerKiBMs,
+                                        gateway.cfg.headerStreamMaxMs, body.len)
+      else: gateway.cfg.headerNonStreamMs
     let headerSentAt = epochTime()
     let headerDeadline = deadlineIn(result.headerWindowMs)
     var raw = ""
@@ -3182,7 +3243,7 @@ proc attemptSystemone(gateway: Gateway, request: Request, leg: SystemoneLeg,
 
     let handshakeDeadline =
       if isTls: deadlineIn(TlsDeadlineMs)
-      else: deadlineIn(HeaderDeadlineNonStreamMs)
+      else: deadlineIn(gateway.cfg.headerNonStreamMs)
     if not await client.awaitSend(head, handshakeDeadline):
       result.kind = akFailed
       result.reason = if isTls: TokenDialTimeout else: TokenConnRefused
@@ -3193,8 +3254,8 @@ proc attemptSystemone(gateway: Gateway, request: Request, leg: SystemoneLeg,
         result.reason = TokenConnRefused
         return
 
-    let headerDeadline = deadlineIn(HeaderDeadlineNonStreamMs)
-    result.headerWindowMs = HeaderDeadlineNonStreamMs
+    let headerDeadline = deadlineIn(gateway.cfg.headerNonStreamMs)
+    result.headerWindowMs = gateway.cfg.headerNonStreamMs
     let headerSentAt = epochTime()
     var raw = ""
     var headDone = false
@@ -3906,12 +3967,12 @@ proc configJson*(gateway: Gateway): string =
   var timeouts = newJObject()
   timeouts["connect_ms"] = %ConnectDeadlineMs
   timeouts["tls_ms"] = %TlsDeadlineMs
-  timeouts["header_ms_stream"] = %HeaderDeadlineStreamMs
+  timeouts["header_ms_stream"] = %gateway.cfg.headerStreamBaseMs
   # D-2: the streaming window is a rule, not a number. The two ends and the slope
   # are published so a reader can compute what a given body gets without the source.
-  timeouts["header_ms_stream_slope_per_kib"] = %HeaderDeadlineStreamPerKiBMs
-  timeouts["header_ms_stream_max"] = %HeaderDeadlineStreamMaxMs
-  timeouts["header_ms_non_stream"] = %HeaderDeadlineNonStreamMs
+  timeouts["header_ms_stream_slope_per_kib"] = %gateway.cfg.headerStreamPerKiBMs
+  timeouts["header_ms_stream_max"] = %gateway.cfg.headerStreamMaxMs
+  timeouts["header_ms_non_stream"] = %gateway.cfg.headerNonStreamMs
   timeouts["idle_ms"] = %ChunkIdleMs
   timeouts["total_ms"] = %TotalNonStreamMs
   root["timeouts"] = timeouts
