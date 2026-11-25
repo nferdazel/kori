@@ -286,8 +286,8 @@ check "403 is a client error and never fails over", failureToken(403, "") == ""
 check "404 is a client error and never fails over", failureToken(404, "") == ""
 check "429 with a quota body is the capacity class",
   failureToken(429, """{"error":{"type":"GoUsageLimitError"}}""") == "quota_429"
-check "429 without a quota body is a client error (D9.3)",
-  failureToken(429, """{"error":{"message":"Rate limit reached for requests per minute (RPM).","type":"requests"}}""") == ""
+check "429 without a quota body is the rate-limit class (DEC-26)",
+  failureToken(429, """{"error":{"message":"Rate limit reached for requests per minute (RPM).","type":"requests"}}""") == "rate_limited_429"
 check "402 is the billing class, whatever the body says",
   failureToken(402, "") == "billing_402" and
   failureToken(402, """{"error":{"message":"insufficient balance"}}""") == "billing_402"
@@ -1525,6 +1525,26 @@ checkRaises "a base above the max is refused", ConfigError:
   discard loadConfigText("""{"timeouts":{"header_ms_stream_base":30000,
     "header_ms_stream_max":15000},"legs":[{"name":"a",
     "base_url":"http://127.0.0.1:1/v1"}]}""", "timeouts.json")
+
+block:
+  # DEC-26: the new cooldown shapes. A one-leg gateway caps a header rung at 15 s,
+  # a capacity 429 is believed between 60 s and 900 s, and a plain rate limit is a
+  # short class of its own.
+  check "a single leg caps a header rung at 15 s",
+    cooldownSeconds(TokenHeaderTimeout, 0, HeaderDeadlineNonStreamMs, true) == 15.0
+  check "a single leg still cools at least the floor",
+    cooldownSeconds(TokenHeaderTimeout, 0, 1_000, true) == 5.0
+  check "two legs keep the 60 s cap on the 90 s door",
+    cooldownSeconds(TokenHeaderTimeout, 0, HeaderDeadlineNonStreamMs, false) == 60.0
+  check "a quota 429 believes a short Retry-After only down to 60 s",
+    cooldownSeconds(TokenQuota429, 0, HeaderDeadlineStreamMs, false, 42) == 60.0
+  check "a quota 429 caps a long Retry-After at 900 s",
+    cooldownSeconds(TokenQuota429, 0, HeaderDeadlineStreamMs, false, 1200) == 900.0
+  check "a rate-limit 429 defaults to 30 s",
+    cooldownSeconds(TokenRateLimited, 0, HeaderDeadlineStreamMs) == 30.0
+  check "a rate-limit 429 clamps to 5-120 s",
+    cooldownSeconds(TokenRateLimited, 0, HeaderDeadlineStreamMs, false, 3) == 5.0 and
+    cooldownSeconds(TokenRateLimited, 0, HeaderDeadlineStreamMs, false, 600) == 120.0
 
 # --------------------------------------------------------------------- report ---
 

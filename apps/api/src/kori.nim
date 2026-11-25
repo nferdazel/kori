@@ -116,6 +116,19 @@ const
   # a rung shorter than the window it followed would send a probe that is dearer
   # than the cooldown it ends, and the next caller pays the difference.
   HeaderTimeoutCooldownS* = 5.0
+  ## DEC-26. A header-timeout rung exists to stop the walk re-probing a dead leg
+  ## more often than the window it just paid for. With one enabled leg there is no
+  ## other leg to protect, so the rung only decides how long the caller is told to
+  ## wait: 15 s, the streaming window's own floor, and no higher.
+  SingleLegHeaderMaxMs* = 15_000
+  ## DEC-26. A capacity failure keeps its 900 s in every shape, but an upstream
+  ## that names its own Retry-After is believed between these bounds.
+  CapacityRetryAfterMinS* = 60.0
+  ## DEC-26. A plain 429 is a rate limit, not a spent balance: cool briefly and try
+  ## the next leg. A provider that names no number gets the default.
+  RateLimitRetryAfterMinS* = 5.0
+  RateLimitRetryAfterMaxS* = 120.0
+  RateLimitDefaultS* = 30.0
 
   # Item 5. A leg gets `retries` more dials before it is classed as failed and the
   # walk moves on, with a doubling pause between them. The pause is capped so one
@@ -186,6 +199,9 @@ const
   TokenUpstream5xx* = "upstream_5xx"
   TokenQuota429* = "quota_429"
   TokenBilling402* = "billing_402"
+  ## DEC-26. A 429 whose body is not a quota: a rate limit that may clear in
+  ## seconds. It is its own class so it never inherits the 900 s capacity rung.
+  TokenRateLimited* = "rate_limited_429"
   TokenMidStreamAbort* = "mid_stream_abort"
 
   ## The caller hung up before the answer was finished. It is not a leg failure:
@@ -1350,6 +1366,55 @@ proc legAvailable*(gateway: Gateway, index: int, now: float): bool =
     return false
   not runtime.probeInFlight
 
+proc enabledLegCount*(gateway: Gateway): int =
+  ## DEC-26. The number that decides whether a header rung exists to protect
+  ## another leg or only to tell the caller how long to wait. Overrides are already
+  ## folded into `enabled` at load.
+  for leg in gateway.cfg.legs:
+    if leg.enabled:
+      inc result
+
+proc systemoneEnabledCount*(gateway: Gateway): int =
+  for leg in gateway.cfg.systemone:
+    if leg.enabled:
+      inc result
+
+proc coolingSummary*(gateway: Gateway,
+                     now: float): tuple[enabled, cooling, retryAfterS: int] =
+  ## Every enabled leg is cooling: how many, and how long until the first of them
+  ## is eligible again. `retryAfterS` is the ceiling of that wait, so a caller is
+  ## never told to retry before the gateway will dial.
+  for index, leg in gateway.cfg.legs:
+    if not leg.enabled:
+      continue
+    inc result.enabled
+    let untilAt = gateway.legs[index].coolingUntil
+    if untilAt > now:
+      inc result.cooling
+      let wait = int(untilAt - now) + 1
+      if result.retryAfterS == 0 or wait < result.retryAfterS:
+        result.retryAfterS = wait
+
+proc systemoneCoolingSummary*(gateway: Gateway,
+                              now: float): tuple[enabled, cooling,
+                                                 retryAfterS: int] =
+  for index, leg in gateway.cfg.systemone:
+    if not leg.enabled:
+      continue
+    inc result.enabled
+    let untilAt = gateway.systemone[index].coolingUntil
+    if untilAt > now:
+      inc result.cooling
+      let wait = int(untilAt - now) + 1
+      if result.retryAfterS == 0 or wait < result.retryAfterS:
+        result.retryAfterS = wait
+
+proc modelDisabled*(gateway: Gateway, alias: string): bool =
+  ## DEC-27. Only an explicit `false` switches an alias off; a missing key keeps
+  ## the alias serving.
+  gateway.cfg.overridesModels.hasKey(alias) and
+    not gateway.cfg.overridesModels[alias]
+
 proc pickWeighted(legs: seq[Leg], pool: seq[int],
                   currents: var seq[int]): int =
   ## DEC-11's smooth weighted round-robin, the nginx algorithm: every turn each
@@ -1421,7 +1486,8 @@ proc pickOrder*(gateway: Gateway): seq[int] =
       result.add index
 
 proc cooldownSeconds*(reason: string, headerTimeouts: int,
-                      headerWindowMs: int): float =
+                      headerWindowMs: int, singleLeg = false,
+                      retryAfterS = -1): float =
   ## DEC-23: the class decides the width. A header timeout is the one class that
   ## widens with repetition, and its first rung is the header window that failure
   ## just cost, clamped to [HeaderTimeoutCooldownS, AvailabilityCooldownS].
@@ -1433,30 +1499,49 @@ proc cooldownSeconds*(reason: string, headerTimeouts: int,
   ## costs a minute keeps the old flat 60 s, by construction.
   ##
   ## `headerTimeouts` is the count before this failure, so 0 is the first rung.
+  ##
+  ## DEC-26 adds two shapes: a rate-limited 429 cools for its Retry-After inside
+  ## [5, 120] s, and a one-leg gateway caps a header rung at 15 s because there is
+  ## no other leg a longer skip could protect.
   if reason in [TokenQuota429, TokenBilling402]:
-    return CapacityCooldownS
+    var capacity = CapacityCooldownS
+    if retryAfterS > 0:
+      capacity = min(max(float(retryAfterS), CapacityRetryAfterMinS),
+                     CapacityCooldownS)
+    return capacity
+  if reason == TokenRateLimited:
+    if retryAfterS > 0:
+      return min(max(float(retryAfterS), RateLimitRetryAfterMinS),
+                 RateLimitRetryAfterMaxS)
+    return RateLimitDefaultS
   if reason != TokenHeaderTimeout:
     return AvailabilityCooldownS
   var cooldown = float(headerWindowMs) / 1000.0
   if cooldown < HeaderTimeoutCooldownS:
     cooldown = HeaderTimeoutCooldownS
   if cooldown >= AvailabilityCooldownS:
-    return AvailabilityCooldownS
-  for _ in 1 .. headerTimeouts:
-    cooldown *= 2.0
-    if cooldown >= AvailabilityCooldownS:
-      return AvailabilityCooldownS
+    cooldown = AvailabilityCooldownS
+  else:
+    for _ in 1 .. headerTimeouts:
+      cooldown *= 2.0
+      if cooldown >= AvailabilityCooldownS:
+        cooldown = AvailabilityCooldownS
+        break
+  if singleLeg:
+    cooldown = min(cooldown, SingleLegHeaderMaxMs.float / 1000.0)
   cooldown
 
 proc startCooldown*(gateway: Gateway, index: int, reason: string,
-                    headerWindowMs = HeaderDeadlineNonStreamMs) =
+                    headerWindowMs = HeaderDeadlineNonStreamMs,
+                    singleLeg = false, retryAfterS = -1) =
   ## §3.1 and §3.2: the cooldown starts at the failure, and the leg's failure
   ## counter moves once for this request (D11.1). `headerWindowMs` is the header
   ## deadline this attempt actually waited, so the ladder's first rung can never
   ## be cheaper than the probe that would follow it (DEC-23).
   let now = epochTime()
   var runtime = addr gateway.legs[index]
-  let cooldown = cooldownSeconds(reason, runtime.headerTimeouts, headerWindowMs)
+  let cooldown = cooldownSeconds(reason, runtime.headerTimeouts, headerWindowMs,
+                                 singleLeg, retryAfterS)
   if reason == TokenHeaderTimeout:
     runtime.headerTimeouts.inc
   runtime.attempted = true
@@ -1517,12 +1602,14 @@ proc systemoneOrder*(gateway: Gateway, now: float): seq[int] =
     result.add index
 
 proc startSystemoneCooldown*(gateway: Gateway, index: int, reason: string,
-                             headerWindowMs = HeaderDeadlineNonStreamMs) =
+                             headerWindowMs = HeaderDeadlineNonStreamMs,
+                             singleLeg = false, retryAfterS = -1) =
   ## The same two cooldowns and the same reason tokens as the chat door, so one
   ## log is readable without knowing which door a line came from.
   let now = epochTime()
   var runtime = addr gateway.systemone[index]
-  let cooldown = cooldownSeconds(reason, runtime.headerTimeouts, headerWindowMs)
+  let cooldown = cooldownSeconds(reason, runtime.headerTimeouts, headerWindowMs,
+                                 singleLeg, retryAfterS)
   if reason == TokenHeaderTimeout:
     runtime.headerTimeouts.inc
   runtime.attempted = true
@@ -1790,6 +1877,10 @@ proc failureToken*(status: int, body: string, aliasMapped = false,
     TokenModelGone
   elif status == 429 and isQuotaBody(body):
     TokenQuota429
+  elif status == 429:
+    ## DEC-26. A 429 that is not a quota is a rate limit: it may clear in seconds,
+    ## so it is its own class rather than inheriting the 900 s capacity rung.
+    TokenRateLimited
   elif status == 402:
     # A provider that has run out of credit answers 402 with its own billing
     # body. It is a dead route, not a caller error: leaving it unclassified
@@ -2150,6 +2241,27 @@ proc sseErrorEvent(reason: string, message: string): string =
 proc allLegsFailedBody(message: string): string =
   "{\"error\":{\"type\":\"all_legs_failed\",\"message\":" &
     jsonEscape(message) & "}}"
+
+proc allLegsCoolingBody(retryAfterS: int): string =
+  ## DEC-26. The gateway never dialled: the code is 503, the body names the state
+  ## and the wait, and no leg name reaches the caller.
+  "{\"error\":{\"type\":\"all_legs_cooling\",\"message\":" &
+    jsonEscape("no leg can serve this request now; retry in " & $retryAfterS &
+               "s") &
+    ",\"retry_after_s\":" & $retryAfterS & "}}"
+
+proc noLegEnabledBody(): string =
+  "{\"error\":{\"type\":\"no_leg_enabled\",\"message\":" &
+    jsonEscape("every provider is switched off in the gateway") & "}}"
+
+proc sendErrorBodyWithHeaders(request: Request, code: int, payload: string,
+                              extra: seq[(string, string)]): Future[void] {.async.} =
+  var headers = @[("Content-Type", "application/json"),
+                  ("Content-Length", $payload.len),
+                  ("Cache-Control", "no-store")]
+  for pair in extra:
+    headers.add pair
+  await request.client.send(buildHead(code, headers) & payload)
 
 proc credentialRefreshBody(reason, detail: string): string =
   ## §4: the type is the reason token, so a caller can tell a credential problem
@@ -2746,6 +2858,11 @@ proc attemptLeg(gateway: Gateway, request: Request, leg: Leg, bearer: string,
       if token.len > 0:
         result.kind = akFailed
         result.reason = token
+        # DEC-26: a rate limit is the one failure whose own words are useful to
+        # the caller. Keep them so the last leg can pass the 429 through.
+        if token == TokenRateLimited:
+          result.passthroughBody = errorBody
+          result.status = status
         return
       # §3.3: any other 4xx is the caller's problem. Returned unchanged.
       let contentType = headerValue(headers, "content-type")
@@ -2904,6 +3021,7 @@ proc handleChat(gateway: Gateway, request: Request): Future[void] {.async.} =
   var lastRateBody = ""
   var lastRateStatus = 429
   var lastRateS = -1
+  let singleLeg = gateway.enabledLegCount() == 1
   let promptKib = forwardBody.len div 1024
 
   var aliasKnown = false
@@ -2929,10 +3047,22 @@ proc handleChat(gateway: Gateway, request: Request): Future[void] {.async.} =
 
   let order = gateway.pickOrder()
   if not answered and order.len == 0:
-    # Every leg is cooling: no dial at all (D12.3's third sentence).
-    route = gateway.cfg.legs[^1].name
-    await request.sendErrorBody(502, allLegsFailedBody("all_legs_cooling"))
+    # DEC-26. No dial at all (D12.3's third sentence), and an honest answer: what
+    # the caller can do (wait) and for how long. Nothing here names a leg.
+    let summary = gateway.coolingSummary(epochTime())
+    route = ""
+    status = 503
     answered = true
+    if summary.enabled == 0:
+      terminalReason = "no_leg_enabled"
+      legsCooling = 0
+      await request.sendErrorBody(503, noLegEnabledBody())
+    else:
+      terminalReason = "all_legs_cooling"
+      legsCooling = summary.cooling
+      retryAfterS = max(summary.retryAfterS, 1)
+      await request.sendErrorBodyWithHeaders(503,
+        allLegsCoolingBody(retryAfterS), @[("Retry-After", $retryAfterS)])
 
   if not answered:
     for position, index in order:
@@ -3071,7 +3201,8 @@ proc handleChat(gateway: Gateway, request: Request): Future[void] {.async.} =
 
       case outcome.kind
       of akFailed:
-        gateway.startCooldown(index, outcome.reason, outcome.headerWindowMs)
+        gateway.startCooldown(index, outcome.reason, outcome.headerWindowMs,
+                              singleLeg, outcome.retryAfterS)
         chain.lastReason = outcome.reason
         if chain.firstReason.len == 0:
           chain.firstReason = outcome.reason
@@ -3080,6 +3211,12 @@ proc handleChat(gateway: Gateway, request: Request): Future[void] {.async.} =
             chain.capacity = true
           else:
             chain.availability = true
+        if outcome.reason == TokenRateLimited and outcome.passthroughBody.len > 0:
+          # DEC-26. Keep the last 429 in the walk. If no leg serves, the caller
+          # gets the provider's own 429 back instead of a fabricated 502.
+          lastRateBody = outcome.passthroughBody
+          lastRateStatus = outcome.status
+          lastRateS = outcome.retryAfterS
         if position + 1 < order.len:
           gateway.recordEvent(leg.name, gateway.cfg.legs[order[position + 1]].name,
                               outcome.reason)
@@ -3126,6 +3263,20 @@ proc handleChat(gateway: Gateway, request: Request): Future[void] {.async.} =
     tokensOut = none(int)
     answered = true
 
+  if not answered and lastRateBody.len > 0:
+    # DEC-26. The walk ended on a plain 429: return the provider's own body and
+    # its own Retry-After, not an all-legs-failed 502.
+    var extra: seq[(string, string)]
+    if lastRateS >= 0:
+      extra.add ("Retry-After", $lastRateS)
+    await request.sendErrorBodyWithHeaders(lastRateStatus, lastRateBody, extra)
+    status = lastRateStatus
+    retryAfterS = lastRateS
+    terminalReason = TokenRateLimited
+    tokensIn = none(int)
+    tokensOut = none(int)
+    answered = true
+
   if not answered:
     # §5.5: one 502 whatever the legs returned, carrying the terminal reason.
     let message = if chain.lastReason.len > 0: chain.lastReason else: "all_legs_failed"
@@ -3161,6 +3312,7 @@ proc handleChat(gateway: Gateway, request: Request): Future[void] {.async.} =
     if hardStop.len > 0: hardStop
     elif terminalAbort and abortReason.len > 0: abortReason
     elif terminalAbort: TokenMidStreamAbort
+    elif terminalReason.len > 0: terminalReason
     else: chain.firstReason
 
   let latencyMs = int((epochTime() - started) * 1000.0)
@@ -3406,14 +3558,27 @@ proc handleSystemone(gateway: Gateway, request: Request): Future[void] {.async.}
   var lastRateBody = ""
   var lastRateStatus = 429
   var lastRateS = -1
+  let singleLeg = gateway.systemoneEnabledCount() == 1
   let promptKib = body.len div 1024
 
   let order = gateway.systemoneOrder(epochTime())
   if order.len == 0:
-    # Every configured System One leg is cooling: no dial at all, same as chat.
-    route = gateway.cfg.systemone[^1].name
-    await request.sendErrorBody(502, allLegsFailedBody("all_legs_cooling"))
+    # DEC-26. Same honest answer as the chat door: no leg is dialled, so the code
+    # is 503 and the body says how long to wait. Nothing here names a leg.
+    let summary = gateway.systemoneCoolingSummary(epochTime())
+    route = ""
+    status = 503
     answered = true
+    if summary.enabled == 0:
+      terminalReason = "no_leg_enabled"
+      legsCooling = 0
+      await request.sendErrorBody(503, noLegEnabledBody())
+    else:
+      terminalReason = "all_legs_cooling"
+      legsCooling = summary.cooling
+      retryAfterS = max(summary.retryAfterS, 1)
+      await request.sendErrorBodyWithHeaders(503,
+        allLegsCoolingBody(retryAfterS), @[("Retry-After", $retryAfterS)])
 
   if not answered and body.strip().len == 0:
     route = gateway.cfg.systemone[0].name
@@ -3433,10 +3598,15 @@ proc handleSystemone(gateway: Gateway, request: Request): Future[void] {.async.}
                                                   totalDeadline)
       if outcome.kind == akFailed:
         gateway.startSystemoneCooldown(index, outcome.reason,
-                                       outcome.headerWindowMs)
+                                       outcome.headerWindowMs, singleLeg,
+                                       outcome.retryAfterS)
         if firstReason.len == 0:
           firstReason = outcome.reason
           firstFrom = leg.name
+        if outcome.reason == TokenRateLimited and outcome.passthroughBody.len > 0:
+          lastRateBody = outcome.passthroughBody
+          lastRateStatus = outcome.status
+          lastRateS = outcome.retryAfterS
         if position + 1 < order.len:
           gateway.recordEvent(leg.name,
                               gateway.cfg.systemone[order[position + 1]].name,
@@ -3448,10 +3618,24 @@ proc handleSystemone(gateway: Gateway, request: Request): Future[void] {.async.}
         abortReason = outcome.reason
       tokensIn = outcome.tokensIn
       tokensOut = outcome.tokensOut
+      if outcome.headerMs >= 0:
+        headerMs = outcome.headerMs
       if outcome.kind != akTerminal:
         gateway.markSystemoneServed(index)
       answered = true
       break
+
+  if not answered and lastRateBody.len > 0:
+    var extra: seq[(string, string)]
+    if lastRateS >= 0:
+      extra.add ("Retry-After", $lastRateS)
+    await request.sendErrorBodyWithHeaders(lastRateStatus, lastRateBody, extra)
+    status = lastRateStatus
+    retryAfterS = lastRateS
+    terminalReason = TokenRateLimited
+    tokensIn = none(int)
+    tokensOut = none(int)
+    answered = true
 
   if not answered:
     let message = if firstReason.len > 0: firstReason else: "all_legs_failed"
@@ -3472,6 +3656,7 @@ proc handleSystemone(gateway: Gateway, request: Request): Future[void] {.async.}
   let logReason =
     if terminalAbort and abortReason.len > 0: abortReason
     elif terminalAbort: TokenMidStreamAbort
+    elif terminalReason.len > 0: terminalReason
     else: firstReason
 
   let latencyMs = int((epochTime() - started) * 1000.0)
@@ -3984,6 +4169,9 @@ proc configJson*(gateway: Gateway): string =
   # timeout, so a reader can compute the second rung without the source.
   cooldowns["header_timeout_s"] = %int(HeaderTimeoutCooldownS)
   cooldowns["header_timeout_max_s"] = %int(AvailabilityCooldownS)
+  # DEC-26: a one-leg gateway caps the header rung here, because there is no other
+  # leg a longer skip could protect.
+  cooldowns["single_leg_header_max_s"] = %int(SingleLegHeaderMaxMs div 1000)
   root["cooldowns"] = cooldowns
 
   var logNode = newJObject()

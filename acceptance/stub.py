@@ -220,6 +220,12 @@ def send(conn, status, content_type, body, extra=b""):
     conn.sendall(head + b"\r\n" + body)
 
 
+def retry_extra(opts):
+    if opts.retry_after >= 0:
+        return b"Retry-After: " + str(opts.retry_after).encode() + b"\r\n"
+    return b""
+
+
 def handle(conn, addr, opts):
     try:
         log_conn(opts.count_file, "%s:%d" % addr[:2])
@@ -350,9 +356,9 @@ def handle(conn, addr, opts):
         elif mode == "502":
             send(conn, 502, "text/html", b"<html>bad gateway</html>")
         elif mode == "429-quota":
-            send(conn, 429, "application/json", dumps(GO_QUOTA_BODY))
+            send(conn, 429, "application/json", dumps(GO_QUOTA_BODY), retry_extra(opts))
         elif mode == "429-plain":
-            send(conn, 429, "application/json", dumps(PLAIN_429_BODY))
+            send(conn, 429, "application/json", dumps(PLAIN_429_BODY), retry_extra(opts))
         elif mode == "stream-2-then-die":
             conn.sendall(
                 b"HTTP/1.1 200 OK\r\n"
@@ -430,6 +436,9 @@ def main():
     ap.add_argument("--delay-headers", type=float, default=0.0)
     ap.add_argument("--model", default="")
     ap.add_argument("--after", type=int, default=0)
+    # DEC-26: an upstream that names its own Retry-After, so a case can prove the
+    # gateway believed the number instead of applying a flat 900 s.
+    ap.add_argument("--retry-after", type=int, default=-1)
     # A11: the token endpoint's answer, and the one bearer a provider accepts.
     ap.add_argument("--token", default="STUB-ACCESS-TOKEN")
     ap.add_argument("--token-ttl", type=int, default=3600)
