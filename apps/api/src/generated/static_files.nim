@@ -9,10 +9,10 @@ type StaticFile* = object
 type StaticEntry* = tuple[path: string, contentType: string, body: string]
 
 const staticEntries* = [
-  (path: "/assets/dom-BSVISWy4.css", contentType: "text/css; charset=utf-8", body: staticRead("../../../web/dist/assets/dom-BSVISWy4.css")),
-  (path: "/assets/dom-BrCwduW3.js", contentType: "text/javascript; charset=utf-8", body: staticRead("../../../web/dist/assets/dom-BrCwduW3.js")),
-  (path: "/assets/login-ChqqaDrF.js", contentType: "text/javascript; charset=utf-8", body: staticRead("../../../web/dist/assets/login-ChqqaDrF.js")),
-  (path: "/assets/main-D7GDtyUO.js", contentType: "text/javascript; charset=utf-8", body: staticRead("../../../web/dist/assets/main-D7GDtyUO.js")),
+  (path: "/assets/dom-CyOwnlRu.css", contentType: "text/css; charset=utf-8", body: staticRead("../../../web/dist/assets/dom-CyOwnlRu.css")),
+  (path: "/assets/dom-Dv8Nv8us.js", contentType: "text/javascript; charset=utf-8", body: staticRead("../../../web/dist/assets/dom-Dv8Nv8us.js")),
+  (path: "/assets/login-BTyVOKMI.js", contentType: "text/javascript; charset=utf-8", body: staticRead("../../../web/dist/assets/login-BTyVOKMI.js")),
+  (path: "/assets/main-C84U-ipY.js", contentType: "text/javascript; charset=utf-8", body: staticRead("../../../web/dist/assets/main-C84U-ipY.js")),
   (path: "/config.html", contentType: "text/html; charset=utf-8", body: staticRead("../../../web/dist/config.html")),
   (path: "/favicon.svg", contentType: "image/svg+xml", body: staticRead("../../../web/dist/favicon.svg")),
   (path: "/fonts/inter-latin-var.woff2", contentType: "font/woff2", body: staticRead("../../../web/dist/fonts/inter-latin-var.woff2")),

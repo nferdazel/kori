@@ -252,6 +252,7 @@ function switchRow(opts: {
   stateText: string;
   stateId: string;
   labelledBy: string;
+  describedBy: string;
 }): HTMLElement {
   const wrap = el("div", "leg-switch");
 
@@ -261,7 +262,7 @@ function switchRow(opts: {
   input.checked = opts.checked;
   input.dataset.switch = opts.key;
   input.setAttribute("aria-labelledby", opts.labelledBy);
-  input.setAttribute("aria-describedby", opts.stateId);
+  input.setAttribute("aria-describedby", opts.describedBy);
   input.addEventListener("click", (event) => {
     event.preventDefault();
     void submit(opts.key, opts.kind, opts.name, !opts.checked, opts.name);
@@ -389,6 +390,9 @@ function render(config: AdminConfig): void {
       row.appendChild(el("span", "ord", String(leg.order)));
       const name = el("span", "nm", leg.name);
       name.id = `leg-name-${index}`;
+      // The visible name says which provider; the clipped word says what kind of switch this is, so
+      // the accessible name is "opencode-go provider" and not a bare "opencode-go primary".
+      name.appendChild(el("span", "sr-only", " provider"));
       row.appendChild(name);
       const role = el("span", "role " + leg.role, leg.role);
       role.id = `leg-role-${index}`;
@@ -408,7 +412,8 @@ function render(config: AdminConfig): void {
           override: flags.override,
           stateText,
           stateId: `leg-state-${index}`,
-          labelledBy: `leg-name-${index} leg-role-${index}`,
+          labelledBy: `leg-name-${index}`,
+          describedBy: `leg-role-${index} leg-state-${index}`,
         }),
       );
       panel.appendChild(row);
@@ -445,6 +450,7 @@ function render(config: AdminConfig): void {
       const row = el("div", "modelrow");
       const name = el("span", "nm", alias);
       name.id = `model-name-${index}`;
+      name.appendChild(el("span", "sr-only", " model alias"));
       row.appendChild(name);
       row.appendChild(el("span", "provider", (aliasIds.get(alias) ?? []).join(", ")));
       row.appendChild(
@@ -457,6 +463,7 @@ function render(config: AdminConfig): void {
           stateText: modelStateText(override),
           stateId: `model-state-${index}`,
           labelledBy: `model-name-${index}`,
+          describedBy: `model-state-${index}`,
         }),
       );
       panel.appendChild(row);
