@@ -27,10 +27,19 @@ this one, is the answer to "what is live".
   them until 0.10.5 is deployed, so it reads a file and stays out of `check`;
   `tests/dryrun-phase2.sh` proves the arithmetic on a fixed sample.
 
+### Changed
+
+- The Config page's provider and model-alias checkboxes now carry accessible names that say what
+  they control (`opencode-go provider`, `deep model alias`), with the role and state moved into
+  `aria-describedby`. No layout or behaviour change: the 360 px and 1280 px passes and the keyboard
+  focus order stay as they were.
+
 ### Fixed
 
 - `redactUrl` strips `user:pass@` from the authority, so a `base_url` configured with a credential is
-  printed as `https://host/…` in `/admin/config` instead of in full. An `@` in the path is left alone.
+  printed as `https://host/…` in `/admin/config` instead of in full. The authority ends at the first
+  of `/`, `?` or `#` and the split takes the last `@` in it, so a password containing `@` is removed
+  and an `@` in a path or a query is left alone.
 
 - A write token now works as a bearer on the read GETs (`/admin/state`, `/admin/config`,
   `/admin/log`) (DEC-27, amended). It could already read through a write session; the bearer form
