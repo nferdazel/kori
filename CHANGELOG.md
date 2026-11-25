@@ -11,8 +11,45 @@ this one, is the answer to "what is live".
 
 ## [Unreleased]
 
+### Added
+
+- `prompt_kib` and `header_ms` on the request log line (DEC-26), both optional and last, so an older
+  line still parses and a reader that knows only the nine keys sees the same row. `prompt_kib` is the
+  prompt body in KiB; `header_ms` is body-sent to first response byte, recorded only on the leg that
+  answered. `A23` and the two new log keys are proved end to end.
+
+- The four header-deadline numbers are config, not compiled constants: `timeouts.header_ms_stream_base`,
+  `header_ms_stream_slope_per_kib`, `header_ms_stream_max` and `header_ms_non_stream`, with the
+  current numbers as defaults, validated at load and published under `timeouts` in `/admin/config`
+  (DEC-26). A config that names nothing behaves exactly as before.
+
+- `PUT /admin/overrides` (DEC-27): the dashboard's only write. Two switch maps and one confirm flag,
+  patched into `config.json` by text so no credential byte is re-serialised, validated by the boot
+  loader, written `.bak`-first at 0600, and applied in memory at once with a reload requested. Its own
+  token file (`KORI_ADMIN_WRITE_TOKEN_FILE`); a missing file answers 404, the read token answers 403,
+  a write session lives 12 h and must carry `X-Kori-Write: 1`; switching the last serving provider off
+  is 409 without `confirm_last_leg`; a size or mtime change between read and write is 409.
+  `/admin/config` reports `enabled`, `serving` and `override` per leg, `overrides`, and
+  `admin_writes`.
+
+- The Overview's latency-by-prompt-size table (p50/p90/p99 over `<32`, `32-64`, `64-128`, `128-256`,
+  `>=256` KiB, nearest rank, sample size in the caption) and a prompt-size filter on Requests. The
+  config page gains one switch per leg and one per model alias, a `no provider is serving` banner, the
+  router's own `skipped`/`cooling`/`serving` word from `/admin/state`, and a modal confirm for the
+  last leg.
+
 ### Changed
 
+- When no leg can serve, the answer is `503 all_legs_cooling` with `Retry-After` equal to the body's
+  `retry_after_s` instead of a `502` labelled with a leg that was never dialled; zero enabled legs
+  answers `503 no_leg_enabled` (DEC-26). A request that dialled and failed keeps its `502`.
+- A gateway with one enabled leg caps a header-timeout rung at 15 s instead of 60 s.
+- A quota `429` that names `Retry-After` is believed, clamped to 60–900 s. A `429` that is not a quota
+  is `rate_limited_429` on a 5–120 s clock, fails over, and the last leg's own body and `Retry-After`
+  reach the caller.
+- Verified against the real client before shipping: opencode v2.4.1 retries a `503` exactly as it
+  retries a `502` and honours `Retry-After`, so the all-cooling answer stays `503`. jev is not
+  installed on the build host, so its retry policy stays unverified.
 - The committed `ops/etc/config.json.example` chains `opencode-go-jev` ahead of `commandcode-jev` on
   the System One door, and takes a fourth value, `KORI_OPENCODE_GO_API_KEY`, in
   `ops/scripts/kori-config.sh` (DEC-25). No binary behaviour changed: the door already sends each
