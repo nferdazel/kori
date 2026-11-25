@@ -37,8 +37,10 @@ req a14a "$RUN/req-basic.json"
 assert_eq "A14a the priced request answered" "$(http_code a14a)" "200"
 assert_eq "A14a the answering route is the priced leg" "$(lg '.route')" "leg-a"
 assert_eq "A14a cost_usd is price x reported tokens" "$(lg '.cost_usd')" "$priced_expected"
-assert_eq "A14a cost_usd is the twelfth key, last" \
-  "$(log_line | jq -c 'keys_unsorted | last')" '"cost_usd"'
+# DEC-26: the measurement keys are appended after cost_usd, so the contract is
+# "cost_usd before prompt_kib", no longer "cost_usd last".
+assert_eq "A14a cost_usd still precedes the measurement keys" \
+  "$(log_line | jq -r 'keys_unsorted | (index("cost_usd")) < (index("prompt_kib"))')" "true"
 
 # The unpriced leg answers only after the priced one fails, so the log line for
 # that request must carry no cost key at all.

@@ -110,9 +110,11 @@ assert_eq "A15b the row carries the provider's input tokens" "$(lg '.tokens_in')
 assert_eq "A15b the row carries the provider's output tokens" "$(lg '.tokens_out')" "43"
 assert_eq "A15b a decision is never a stream" "$(lg '.stream')" "false"
 assert_eq "A15b no failover on a served decision" "$(lg '.failover_from')" ""
-assert_eq "A15b a one-line answer keeps the nine keys when unpriced" \
+# DEC-26: an unpriced decision carries no alias and no cost, but a served request
+# always carries the two measurement keys, so the row is the nine plus two.
+assert_eq "A15b an unpriced one-line answer keeps the nine keys and the two measurements" \
   "$(log_line | jq -c 'keys_unsorted | join(",")')" \
-  '"ts,route,status,latency_ms,tokens_in,tokens_out,failover_from,failover_reason,stream"'
+  '"ts,route,status,latency_ms,tokens_in,tokens_out,failover_from,failover_reason,stream,prompt_kib,header_ms"'
 assert_eq "A15b the door is counted in /metrics" \
   "$(curl -sS --max-time 5 -H "$(admin_token_header)" "$GW_URL/metrics" \
      | awk '/^kori_requests_total\{route="jev-a"\}/ {print $2}')" \
@@ -194,8 +196,10 @@ gw_start
 req_so a15f "$RUN/so-req.json"
 assert_eq "A15f the priced decision answered" "$(http_code a15f)" "200"
 assert_eq "A15f cost_usd is price x reported tokens" "$(lg '.cost_usd')" "0.000408"
-assert_eq "A15f cost_usd is still the last key" \
-  "$(log_line | jq -c 'keys_unsorted | last')" '"cost_usd"'
+# DEC-26: the measurement keys are appended after cost_usd, so the contract is
+# "cost_usd before prompt_kib", no longer "cost_usd last".
+assert_eq "A15f cost_usd still precedes the measurement keys" \
+  "$(log_line | jq -r 'keys_unsorted | (index("cost_usd")) < (index("prompt_kib"))')" "true"
 assert_eq "A15f the window total carries it" \
   "$(admin_get "$RUN/a15f-state.json" '/admin/state' >/dev/null; \
      jq -r '.window.cost_usd' "$RUN/a15f-state.json")" "0.000408"
