@@ -63,6 +63,10 @@ BEGIN {
   count[b]++
   kib[b, count[b]] = pk + 0
   ms[b, count[b]] = hm + 0
+  if (index($0, "\"failover_reason\":\"header_timeout\"") > 0) {
+    timeouts[b]++
+    timeouts_all++
+  }
 }
 END {
   printf "%-9s %6s %8s %8s %8s %9s %9s %9s\n",
@@ -75,6 +79,23 @@ END {
       pct(kib, b, m, 0.50), pct(kib, b, m, 0.90), pct(kib, b, m, 0.99),
       pct(ms, b, m, 0.50), pct(ms, b, m, 0.90), pct(ms, b, m, 0.99)
   }
+  measured = NR - skipped
   printf "\nlines read %d, skipped without prompt_kib/header_ms %d\n", NR, skipped + 0
+  # Where the header deadline actually bit. A header_timeout is the one failure the
+  # base/slope/cap numbers exist to reduce, so its shape by body size is the second
+  # half of the measurement: a timeout only in the big buckets says the slope is
+  # short, a timeout in <=32 says the base is.
+  printf "\nheader_timeout %d of %d measured", timeouts_all + 0, measured + 0
+  if (measured > 0) printf " (%.1f%%)", 100.0 * timeouts_all / measured
+  printf "\n"
+  for (b = 0; b < 4; b++) {
+    n = timeouts[b] + 0
+    if (count[b] + 0 > 0) {
+      printf "  %-9s %4d of %4d (%5.1f%%)\n", label[b], n, count[b],
+        100.0 * n / count[b]
+    } else {
+      printf "  %-9s %4d of %4d\n", label[b], n, 0
+    }
+  }
 }
 ' "$log"

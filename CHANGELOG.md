@@ -22,9 +22,10 @@ this one, is the answer to "what is live".
 
 - `./task phase2 <requests.jsonl>`: the phase 2 measurement. Per prompt-size bucket (`<=32`, `33-128`,
   `129-512`, `>512` KiB) it prints n and the p50/p90/p99 of `prompt_kib` and `header_ms`, nearest
-  rank, plus how many lines it skipped for lacking the two fields. No production log carries them
-  until 0.10.5 is deployed, so it reads a file and stays out of `check`; `tests/dryrun-phase2.sh`
-  proves the arithmetic on a fixed sample.
+  rank, plus how many lines it skipped for lacking the two fields and the share of requests whose
+  first leg hit its header deadline (`failover_reason: header_timeout`). No production log carries
+  them until 0.10.5 is deployed, so it reads a file and stays out of `check`;
+  `tests/dryrun-phase2.sh` proves the arithmetic on a fixed sample.
 
 ### Fixed
 

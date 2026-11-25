@@ -17,7 +17,8 @@ task — one entry point for the checks CI runs.
   ./task nim     nim check, nimble test, acceptance harness against a real binary
   ./task secrets gitleaks over the whole history, the same scan CI's security job runs
   ./task phase2 <requests.jsonl>
-                 prompt-size buckets for phase 2: n and p50/p90/p99 of prompt_kib and header_ms
+                 prompt-size buckets for phase 2: n and p50/p90/p99 of prompt_kib
+                 and header_ms, plus the header_timeout share per bucket
   ./task version print VERSION, the single source for the binary and the nimble package
   ./task version-check
                  fail when VERSION, kori.nimble, the generated module or CHANGELOG disagree

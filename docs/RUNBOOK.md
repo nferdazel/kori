@@ -259,8 +259,9 @@ switches. The read token remains read-only: a `PUT` with it is `403 write_scope_
 
 `./task phase2 <requests.jsonl>` reads a copy of the request log and prints, per prompt-size bucket
 (`<=32`, `33-128`, `129-512`, `>512` KiB), `n` plus nearest-rank p50/p90/p99 of `prompt_kib` and
-`header_ms`, and how many lines it skipped for lacking those two fields. It reads a file and never
-dials a provider:
+`header_ms`, how many lines it skipped for lacking those two fields, and the share of requests whose
+first leg hit its header deadline (`failover_reason: header_timeout`) in each bucket. It reads a file
+and never dials a provider:
 
 ```sh
 scp qouver1:/srv/qouver/apps/kori/logs/requests.jsonl /tmp/req.jsonl
@@ -269,5 +270,6 @@ scp qouver1:/srv/qouver/apps/kori/logs/requests.jsonl /tmp/req.jsonl
 
 The fields exist from 0.10.5 on, so a log written by 0.10.4 skips every line and the table is empty
 with a skipped count equal to the file's line count. That is not a clean measurement; it means the
-log predates the release. The numbers are what set `header.stream_base_ms`, the slope and the cap in
-the config.
+log predates the release. The numbers are what set `timeouts.header_ms_stream_base`,
+`header_ms_stream_slope_per_kib` and `header_ms_stream_max` in the config: a timeout concentrated in
+the big buckets argues for the slope, one in `<=32` for the base.
