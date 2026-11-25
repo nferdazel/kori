@@ -4080,11 +4080,11 @@ proc redactUrl*(value: string): string =
   let schemeAt = url.find("://")
   let authStart = if schemeAt >= 0: schemeAt + 3 else: 0
 
-  # A separator inside the password, `https://user:pa/ss@host/v1`, ends the
-  # authority early and leaves the rest of the credential in what is now the
-  # path. That URL cannot dial, but it must not print a credential either. A
-  # colon in the authority that is not the start of a port is the tell, and a
-  # bracketed IPv6 host is not one.
+  # A URL's authority is `[userinfo@]host[:port]`, and userinfo may not contain an
+  # unescaped `/`, `?` or `#`: when one is used, the rest of the credential lands
+  # in what now looks like the path, the query or the fragment. A colon in the
+  # authority that does not begin an all-digit port is the tell; a bracketed IPv6
+  # host is never userinfo.
   block:
     var sep = url.len
     for stop in ['/', '?', '#']:
@@ -4092,19 +4092,53 @@ proc redactUrl*(value: string): string =
       if hit >= 0 and hit < sep:
         sep = hit
     let bracketed = authStart < url.len and url[authStart] == '['
-    let colon = url.find(':', authStart)
-    if url.rfind('@', authStart, sep - 1) < 0 and not bracketed and
-       colon >= 0 and colon < sep and
-       (colon + 1 >= url.len or not isDigit(url[colon + 1])):
-      var stop = url.len
-      for mark in ['?', '#']:
-        let hit = url.find(mark, authStart)
-        if hit >= 0 and hit < stop:
-          stop = hit
-      let lateAt = url.rfind('@', authStart, stop - 1)
-      if lateAt >= 0:
+    # Judge the port by the LAST colon in the span. `host:`, `host:443` and
+    # `host:443:` all have to land in the right bucket, and the first colon in
+    # `127.0.0.1:8090:` is the real port, not the tell.
+    let span = if authStart < sep: url[authStart ..< sep] else: ""
+    let colon = span.rfind(':')
+    var credential = false
+    var emptyPort = false
+    if not bracketed and colon >= 0:
+      let after = span[colon + 1 .. ^1]
+      # `host:` with nothing after the colon is an empty port, not userinfo.
+      # Digits that fill the rest are a port; anything else is a password
+      # (`user:pa/ss`, `user:1pa/ss`, `user:pa?ss`).
+      emptyPort = after.len == 0
+      if not emptyPort:
+        var allDigits = true
+        for ch in after:
+          if not isDigit(ch):
+            allDigits = false
+            break
+        credential = not allDigits
+    # An empty port with an '@' behind it is the shape that keeps printing a
+    # query or a path value as the host. Nothing in `host:` is a credential, so
+    # there is no terminator to find and nothing safe to print.
+    if emptyPort and url.find('@', authStart) >= 0:
+      return url[0 ..< authStart] & "<redacted>"
+    let atInSpan = url.rfind('@', authStart, sep - 1)
+    if credential:
+      # The credential was split by `sep`, so its terminator is the last `@`
+      # past it. It cannot be further than the next separator: an `@` beyond
+      # that is query or fragment data, and taking it would print the query as
+      # the new authority (`?x=a@b&api_key=S` once printed `https://b&api_key=S`).
+      var nextSep = url.len
+      for stop in ['/', '?', '#']:
+        let hit = url.find(stop, sep + 1)
+        if hit >= 0 and hit < nextSep:
+          nextSep = hit
+      var at = url.rfind('@', authStart, nextSep - 1)
+      # `=`/`&` before the `@` is query or form data, not the rest of a password.
+      if at >= sep and (url[sep ..< at].contains('=') or url[sep ..< at].contains('&')):
+        at = -1
+      if at >= sep:
         url = url[0 ..< authStart] &
-              (if lateAt + 1 < url.len: url[lateAt + 1 .. ^1] else: "")
+              (if at + 1 < url.len: url[at + 1 .. ^1] else: "")
+      elif atInSpan < 0 and url.find('@', authStart) >= 0:
+        # An `@` exists but nothing proves where the credential ends. Print no
+        # host rather than guess one out of the middle of a password.
+        return url[0 ..< authStart] & "<redacted>"
 
   var authEnd = url.len
   for stop in ['/', '?', '#']:
@@ -4115,6 +4149,19 @@ proc redactUrl*(value: string): string =
   if at >= 0:
     let tail = if at + 1 < url.len: url[at + 1 .. ^1] else: ""
     url = url[0 ..< authStart] & tail
+  # Whatever survived has to be a host[:port] and nothing else. A '=', '&' or
+  # '@' here means the split stopped inside data and the "host" is really a
+  # query or a path fragment. Only checked when the value carried a credential
+  # at all, so a plain base URL is never rewritten.
+  if value.find('@', authStart) >= 0:
+    var hostEnd = url.len
+    for stop in ['/', '?', '#']:
+      let hit = url.find(stop, authStart)
+      if hit >= 0 and hit < hostEnd:
+        hostEnd = hit
+    let host = url[authStart ..< hostEnd]
+    if host.len == 0 or host.contains('=') or host.contains('&') or host.contains('@'):
+      return url[0 ..< authStart] & "<redacted>"
   let query = url.find('?')
   let fragment = url.find('#')
   if query < 0:

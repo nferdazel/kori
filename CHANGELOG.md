@@ -11,6 +11,8 @@ this one, is the answer to "what is live".
 
 ## [Unreleased]
 
+## [0.10.6] - 2026-11-26
+
 ### Added
 
 - `systemone_balance: true` (new, default `false`) gives the System One door the chat door's weighted
@@ -37,11 +39,21 @@ this one, is the answer to "what is live".
 ### Fixed
 
 - `redactUrl` strips `user:pass@` from the authority, so a `base_url` configured with a credential is
-  printed as `https://host/…` in `/admin/config` instead of in full. The authority ends at the first
-  of `/`, `?` or `#` and the split takes the last `@` in it, so a password containing `@` is removed
-  and an `@` in a path or a query is left alone. A `/`, `?` or `#` inside the password is covered too:
-  an authority whose colon is not the start of a port is treated as userinfo, so the rest of that
-  credential is not printed.
+  printed as `https://host/…` in `/admin/config` instead of in full. When the authority itself is
+  well formed, the split takes the last `@` before the first `/`, `?` or `#`, so a password that
+  contains `@` is removed and an `@` in a path or a query is left alone. A separator inside the
+  password is covered as well (`user:pa/ss@host`, `user:pa?ss@host`, `user:pa#ss@host`,
+  `user:1pa/ss@host`, `user:p@ss/word@host`): an authority whose colon is not followed by digits up to
+  its end is treated as userinfo, and its `@` terminator is searched only up to the next separator.
+  `host:` with nothing after the colon is an empty port, not userinfo, so an `@` behind it is never
+  taken as a credential terminator. Where the authority cannot be read unambiguously the URL prints
+  as `scheme://<redacted>` with no host, which loses the host in `/admin/config` but never prints a
+  credential.
+  Not covered, tracked as F1c: a password whose digit run fills the port slot itself
+  (`user:8443/rest@host`), and userinfo that follows a path (`https://host/user:pw@h2/v1`). Those
+  still print, and `parseUri` reads `user`/`host` as the host, so `dial()` connects to that host
+  rather than the one written in the string: the credential does not reach the intended leg, but it
+  is not hidden either.
 
 - A write token now works as a bearer on the read GETs (`/admin/state`, `/admin/config`,
   `/admin/log`) (DEC-27, amended). It could already read through a write session; the bearer form

@@ -666,11 +666,67 @@ block:
     not redactUrl("https://user:pa/ss@h.test/v1").contains("pa/ss")
   check "the query after such a password is kept",
     redactUrl("https://user:pa/ss@h.test/v1?mode=fast") == "https://h.test/v1?mode=fast"
+  # F1b: the same class for '?' and '#', and for a password that begins with a
+  # digit (which must not be mistaken for a port).
+  check "'?' inside the password does not print it",
+    redactUrl("https://user:pa?ss@h.test/v1") == "https://h.test/v1"
+  check "'#' inside the password does not print it",
+    redactUrl("https://user:pa#ss@h.test/v1") == "https://h.test/v1"
+  check "a password starting with a digit is not a port",
+    redactUrl("https://user:1pa/ss@h.test/v1") == "https://h.test/v1"
+  check "a digit-leading password does not survive either",
+    not redactUrl("https://user:1pa/ss@h.test/v1").contains("1pa")
+  # A normal userinfo plus an '@' inside a query keeps the query: the credential
+  # is inside the authority, which is the ordinary rule's job.
+  check "an '@' in the query survives with userinfo present",
+    redactUrl("https://user:pw@h.test/v1?x=a@b") == "https://h.test/v1?x=a@b"
   # The rule must not eat a legitimate port, nor an '@' that is really a path.
   check "a port is not mistaken for userinfo",
     redactUrl("https://h.test:8443/v1/a@b") == "https://h.test:8443/v1/a@b"
   check "a bracketed IPv6 host is left intact",
     redactUrl("https://[::1]:8443/v1") == "https://[::1]:8443/v1"
+  # F1c, known and named in the CHANGELOG: the rule cannot tell these from a real
+  # port or a real path, so the credential is printed. They are pinned here so a
+  # future widening of the rule has to say so out loud, and so the changelog
+  # sentence cannot drift from the code again. Neither reaches the host named in
+  # the string: parseUri reads `user`/`corp` as the host and dial() connects there.
+  check "F1c: a digit run reaching the separator still prints",
+    redactUrl("https://user:8443/rest@h.test/v1") == "https://user:8443/rest@h.test/v1"
+  check "F1c: userinfo after a path still prints",
+    redactUrl("https://corp/user:pw@h.test/v1") == "https://corp/user:pw@h.test/v1"
+  # F1d: the '@' that ends a split credential is the one past the separator, and
+  # never one past the next separator. An '@' in a query or a fragment is data,
+  # and taking it printed the query value as the base URL.
+  check "F1d: an '@' in the query is not the end of a split credential",
+    redactUrl("https://h.test:/v1?x=a@b&api_key=SECRET7") == "https://<redacted>"
+  check "F1d: a '?api_key=@' does not become the base URL",
+    not redactUrl("https://h.test:/v1?api_key=@SECRET9").contains("SECRET9")
+  check "F1d: the empty-port URL without an '@' still prints its host",
+    redactUrl("https://h.test:/v1") == "https://h.test:/v1"
+  check "F1d: a non-numeric port with an '@' in the query prints nothing it cannot place",
+    redactUrl("https://h.test:abc/v1?api_key=@TAILSECRET") == "https://<redacted>"
+  check "F1d: an '@' in a path after a bad port is not the base URL",
+    redactUrl("https://h.test:abc/v1/a@b") == "https://<redacted>"
+  # A password that carries an '@' before a separator used to print the rest of
+  # the password as the host.
+  check "an '@' inside the password before a separator does not survive",
+    redactUrl("https://user:p@ssword/1@h.test/v1") == "https://h.test/v1"
+  check "the same with '?' and '#'",
+    redactUrl("https://user:p@ss?word@h.test/v1") == "https://h.test/v1"
+  check "a query value never becomes the authority",
+    not redactUrl("https://user:pa/ss@h.test/v1?api_key=@SECRET9").contains("SECRET9")
+  # F1e: `host:` is an empty port, not userinfo, so the '@' behind it is query,
+  # path or fragment data. Every one of these printed that data as the host.
+  check "F1e: an '@' behind an empty port is not a credential",
+    redactUrl("https://h.test:#x@F1E7") == "https://<redacted>"
+  check "F1e: a query value behind an empty port does not print",
+    not redactUrl("https://h.test:@b&api_key=SECRET7").contains("SECRET7")
+  check "F1e: an '@' in the path behind an empty port prints nothing",
+    redactUrl("https://h.test:/a@SECRET") == "https://<redacted>"
+  check "F1e: the empty-port URL without an '@' is untouched",
+    redactUrl("https://h.test:/v1") == "https://h.test:/v1"
+  check "F1e: a real empty port with a query is untouched",
+    redactUrl("http://127.0.0.1:8090/v1") == "http://127.0.0.1:8090/v1"
 
 block:
   # §5.4 at the surface that prints it: /admin/config never carries the credential
