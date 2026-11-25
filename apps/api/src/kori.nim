@@ -4079,6 +4079,33 @@ proc redactUrl*(value: string): string =
   var url = value
   let schemeAt = url.find("://")
   let authStart = if schemeAt >= 0: schemeAt + 3 else: 0
+
+  # A separator inside the password, `https://user:pa/ss@host/v1`, ends the
+  # authority early and leaves the rest of the credential in what is now the
+  # path. That URL cannot dial, but it must not print a credential either. A
+  # colon in the authority that is not the start of a port is the tell, and a
+  # bracketed IPv6 host is not one.
+  block:
+    var sep = url.len
+    for stop in ['/', '?', '#']:
+      let hit = url.find(stop, authStart)
+      if hit >= 0 and hit < sep:
+        sep = hit
+    let bracketed = authStart < url.len and url[authStart] == '['
+    let colon = url.find(':', authStart)
+    if url.rfind('@', authStart, sep - 1) < 0 and not bracketed and
+       colon >= 0 and colon < sep and
+       (colon + 1 >= url.len or not isDigit(url[colon + 1])):
+      var stop = url.len
+      for mark in ['?', '#']:
+        let hit = url.find(mark, authStart)
+        if hit >= 0 and hit < stop:
+          stop = hit
+      let lateAt = url.rfind('@', authStart, stop - 1)
+      if lateAt >= 0:
+        url = url[0 ..< authStart] &
+              (if lateAt + 1 < url.len: url[lateAt + 1 .. ^1] else: "")
+
   var authEnd = url.len
   for stop in ['/', '?', '#']:
     let hit = url.find(stop, authStart)

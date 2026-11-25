@@ -39,7 +39,9 @@ this one, is the answer to "what is live".
 - `redactUrl` strips `user:pass@` from the authority, so a `base_url` configured with a credential is
   printed as `https://host/…` in `/admin/config` instead of in full. The authority ends at the first
   of `/`, `?` or `#` and the split takes the last `@` in it, so a password containing `@` is removed
-  and an `@` in a path or a query is left alone.
+  and an `@` in a path or a query is left alone. A `/`, `?` or `#` inside the password is covered too:
+  an authority whose colon is not the start of a port is treated as userinfo, so the rest of that
+  credential is not printed.
 
 - A write token now works as a bearer on the read GETs (`/admin/state`, `/admin/config`,
   `/admin/log`) (DEC-27, amended). It could already read through a write session; the bearer form

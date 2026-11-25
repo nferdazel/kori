@@ -657,6 +657,20 @@ block:
     redactUrl("https://user:p@ss@h.test/v1") == "https://h.test/v1"
   check "the credential never survives even with an '@' in the password",
     not redactUrl("https://user:p@ss@h.test/v1").contains("p@ss")
+  # F1: a separator inside the password ends the authority early, so the '@' is
+  # no longer in what looks like the authority. That URL cannot dial, but it still
+  # must not print the credential.
+  check "a slash inside the password does not leave the credential printed",
+    redactUrl("https://user:pa/ss@h.test/v1") == "https://h.test/v1"
+  check "the password does not survive a slash in it",
+    not redactUrl("https://user:pa/ss@h.test/v1").contains("pa/ss")
+  check "the query after such a password is kept",
+    redactUrl("https://user:pa/ss@h.test/v1?mode=fast") == "https://h.test/v1?mode=fast"
+  # The rule must not eat a legitimate port, nor an '@' that is really a path.
+  check "a port is not mistaken for userinfo",
+    redactUrl("https://h.test:8443/v1/a@b") == "https://h.test:8443/v1/a@b"
+  check "a bracketed IPv6 host is left intact",
+    redactUrl("https://[::1]:8443/v1") == "https://[::1]:8443/v1"
 
 block:
   # §5.4 at the surface that prints it: /admin/config never carries the credential

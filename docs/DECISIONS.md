@@ -755,7 +755,10 @@ header. Refusing to switch the last serving provider off is `409 last_leg` unles
 `confirm_last_leg: true`.
 
 **Amended 2026-11-25.** The write token is a superset of the read one, so it is accepted as a bearer on
-every read GET (`/admin/state`, `/admin/config`, `/admin/log`) as well as on `PUT /admin/overrides`.
+every read GET (`/admin/state`, `/admin/config`, `/admin/log`) as well as on `PUT /admin/overrides`,
+**on a host that has a read-token file**: with no read token the gated paths answer `404` before any
+credential is compared (`DEC-20`'s fail-closed rule), so the write token reaches only the host whose
+read surface exists at all.
 The first cut of the gate compared a bearer only against the read token, which answered `401` to a
 script holding the write token even though the same credential could mint a write session and read
 every page with it (and §6.5 of the plan already said "read endpoints with a write token: allowed").

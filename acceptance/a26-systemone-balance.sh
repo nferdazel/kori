@@ -6,8 +6,10 @@
 # b  on: the first pick is weighted; a 3:1 config serves about three of every
 #    four decisions on the heavy leg, and the greedy smooth weighted round-robin
 #    makes that exact over a whole number of rounds.
-# c  a disabled leg is never picked and never dialled.
-# d  /admin/config publishes the flag and each share, and still no credential.
+# c  a disabled leg is never picked and never dialled. Its weight is the ceiling
+#    and it has a live stub port, so both a pick and a dial would show up.
+# d  /admin/config publishes the flag and each share, and still no credential,
+#    including from a disabled leg's `user:pass@` base URL.
 set -u
 ACC_DIR=$(cd "$(dirname "$0")" && pwd)
 . "$ACC_DIR/lib.sh"
@@ -36,10 +38,10 @@ JSON
 # Two live System One legs and one disabled leg whose base URL carries userinfo.
 # The disabled leg is never dialled, so its credential can only leak through
 # /admin/config, which is exactly what the last assertion reads.
-patch_systemone() { # patch_systemone <systemone_balance true|false> <weight-a> <weight-b>
-  python3 - "$GW_CFG" "$1" "$2" "$3" <<'PY'
+patch_systemone() { # patch_systemone <systemone_balance true|false> <weight-a> <weight-b> <off-port>
+  python3 - "$GW_CFG" "$1" "$2" "$3" "$4" <<'PY'
 import json, sys
-path, flag, weight_a, weight_b = sys.argv[1:5]
+path, flag, weight_a, weight_b, off_port = sys.argv[1:6]
 cfg = json.load(open(path))
 port_a = cfg["legs"][0]["base_url"].split(":")[2].split("/")[0]
 port_b = cfg["legs"][1]["base_url"].split(":")[2].split("/")[0]
@@ -47,30 +49,38 @@ cfg["systemone_balance"] = flag == "true"
 # The chat door balances in both phases, so A26a proves the System One walk
 # ignores it.
 cfg["balance"] = True
+# jev-off points at a live stub port that it must never dial, so the "never
+# dialled" assertion has a counter behind it instead of a missing file. It also
+# carries userinfo, because a disabled leg's credential can only leak through
+# /admin/config.
 cfg["systemone"] = {"legs": [
     {"name": "jev-a", "base_url": "http://127.0.0.1:%s/provider/v1" % port_a,
      "api_key": "jev-key-a", "model": "typesafe/jev-1.14.0", "weight": int(weight_a)},
     {"name": "jev-b", "base_url": "http://127.0.0.1:%s/provider/v1" % port_b,
      "api_key": "jev-key-b", "model": "typesafe/jev-1.14.0", "weight": int(weight_b)},
-    {"name": "jev-off", "base_url": "https://user:s3cret@disabled.test/provider/v1",
-     "api_key": "jev-key-off", "model": "typesafe/jev-1.14.0", "enabled": False},
+    {"name": "jev-off",
+     "base_url": "http://user:s3cret@127.0.0.1:%s/provider/v1" % off_port,
+     "api_key": "jev-key-off", "model": "typesafe/jev-1.14.0", "enabled": False,
+     "weight": 1000},
 ]}
 json.dump(cfg, open(path, "w"), indent=2)
 PY
   chmod 600 "$GW_CFG"
 }
 
-gw_stop; stub_kill leg-a 18081; stub_kill leg-b 18082
+gw_stop; stub_kill leg-a 18081; stub_kill leg-b 18082; stub_kill leg-off 18083
 stub leg-a 18081 systemone-ok --model typesafe/jev-1.14.0
 stub leg-b 18082 systemone-ok --model typesafe/jev-1.14.0
+stub leg-off 18083 systemone-ok --model typesafe/jev-1.14.0
 write_config "leg-a|http://127.0.0.1:18081/v1|key-a|" \
              "leg-b|http://127.0.0.1:18082/v1|key-b|"
+off_port=$(port_of 18083)
 
 echo
 echo "=== A26a: off is DEC-19, even with the chat door balancing"
-patch_systemone false 1 1
+patch_systemone false 1 1 "$off_port"
 gw_start
-stub_touch leg-a; stub_touch leg-b
+stub_touch leg-a; stub_touch leg-b; stub_touch leg-off
 : >"$GW_LOG"
 n=0
 while [ "$n" -lt 10 ]; do
@@ -80,17 +90,19 @@ while [ "$n" -lt 10 ]; do
 done
 assert_eq "A26a off keeps every decision on the first leg" "$(so_routes)" "jev-a=10 "
 assert_eq "A26a the second leg was never dialled" "$(dials leg-b)" "0"
+assert_eq "A26a the disabled leg's live stub was never dialled" "$(dials leg-off)" "0"
 
 echo
 echo "=== A26b: on picks weighted, three to one"
 # gw_restart kills every pid this run started, stubs included, so they come back
 # on the same resolved ports before the gateway does.
-gw_stop; stub_kill leg-a 18081; stub_kill leg-b 18082
+gw_stop; stub_kill leg-a 18081; stub_kill leg-b 18082; stub_kill leg-off 18083
 stub leg-a 18081 systemone-ok --model typesafe/jev-1.14.0
 stub leg-b 18082 systemone-ok --model typesafe/jev-1.14.0
-patch_systemone true 3 1
+stub leg-off 18083 systemone-ok --model typesafe/jev-1.14.0
+patch_systemone true 3 1 "$off_port"
 gw_start
-stub_touch leg-a; stub_touch leg-b
+stub_touch leg-a; stub_touch leg-b; stub_touch leg-off
 : >"$GW_LOG"
 n=0
 while [ "$n" -lt 40 ]; do
@@ -103,6 +115,7 @@ assert_eq "A26b a 3:1 config splits 30:10 over forty decisions" \
 assert_eq "A26b both live legs were dialled" \
   "$(dials leg-a):$(dials leg-b)" "30:10"
 assert_eq "A26b the disabled leg was never dialled" "$(dials leg-off)" "0"
+assert_absent "A26b the disabled leg never appears as a route" "$GW_LOG" "jev-off"
 
 echo
 echo "=== A26c: /admin/config publishes the flag and the shares"
@@ -111,7 +124,7 @@ assert_eq "A26c the config read is 200" \
 assert_eq "A26c the flag is published" \
   "$(jq -r '.systemone_balance' "$RUN/a26-config.json")" "true"
 assert_eq "A26c the shares are published" \
-  "$(jq -r '[.systemone[].weight] | join(",")' "$RUN/a26-config.json")" "3,1,1"
+  "$(jq -r '[.systemone[].weight] | join(",")' "$RUN/a26-config.json")" "3,1,1000"
 assert_eq "A26c the disabled leg is reported off" \
   "$(jq -r '[.systemone[] | select(.name=="jev-off") | .enabled] | .[0]' "$RUN/a26-config.json")" "false"
 assert_absent "A26c no part of the disabled leg's userinfo is printed" \
@@ -119,7 +132,7 @@ assert_absent "A26c no part of the disabled leg's userinfo is printed" \
 assert_absent "A26c no userinfo form is printed at all" \
   "$RUN/a26-config.json" "user:"
 assert_present "A26c the host is still printed" \
-  "$RUN/a26-config.json" "https://disabled.test/provider/v1"
+  "$RUN/a26-config.json" "http://127.0.0.1:$off_port/provider/v1"
 
 kill_stubs
 finish

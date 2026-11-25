@@ -334,7 +334,8 @@ Either one is enough, and the token is compared against the file in constant tim
 
 The write credential is a second file, `KORI_ADMIN_WRITE_TOKEN_FILE` (`DEC-27`): it is accepted as a
 bearer on `PUT /admin/overrides` and on every gated GET, so a script that holds it does not have to
-trade it for a cookie first. The read token stays read-only, and a session minted from the write token
+trade it for a cookie first. That holds where a read-token file exists: with none, the gated GETs
+answer `404` before any credential is compared. The read token stays read-only, and a session minted from the write token
 lasts 12 hours and must carry `X-Kori-Write: 1` to write.
 
 `POST /session/login` takes `{"token":"<token>"}` and answers `204` with `Set-Cookie: kori_admin=…;

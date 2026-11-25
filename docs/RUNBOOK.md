@@ -251,7 +251,9 @@ To split jev across two plans, in `config.json` on the host:
 
 The write token (`KORI_ADMIN_WRITE_TOKEN_FILE`, DEC-27) is accepted as a bearer on the gated GETs as
 well as on `PUT /admin/overrides`, so one script credential can read `/admin/state` and write the
-switches. The read token remains read-only: a `PUT` with it is `403 write_scope_required`.
+switches. That holds on a host that has a read-token file; with no read token the gated paths are
+`404` before any credential is compared, and `PUT` still answers `200` because it needs only the
+write file. The read token remains read-only: a `PUT` with it is `403 write_scope_required`.
 
 ---
 
