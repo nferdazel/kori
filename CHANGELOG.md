@@ -11,6 +11,8 @@ this one, is the answer to "what is live".
 
 ## [Unreleased]
 
+## [0.10.5] - 2026-11-25
+
 ### Added
 
 - `prompt_kib` and `header_ms` on the request log line (DEC-26), both optional and last, so an older
