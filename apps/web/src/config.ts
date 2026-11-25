@@ -72,13 +72,20 @@ function legFlags(leg: ConfigLeg): LegFlags {
   return { enabled, serving, override };
 }
 
-function legStateText(flags: LegFlags): string {
-  const parts = [flags.enabled ? "file on" : "file off", flags.serving ? "serving" : "not serving"];
+function legStateText(flags: LegFlags, name: string): string {
+  // The router's own word first: an enabled leg that is cooling is still serving as far as the
+  // config goes, and only /admin/state knows it is not answering right now.
+  const router = routeState.get(name);
+  const word = !flags.serving ? "skipped" : router === "cooling" ? "cooling" : "serving";
+  const parts = [flags.enabled ? "file on" : "file off", word];
   parts.push(flags.override === null ? "no override" : "override " + (flags.override ? "on" : "off"));
   if (flags.serving && !flags.enabled) parts.push("switched on from the dashboard");
   if (!flags.serving && flags.enabled) parts.push("switched off from the dashboard");
   return parts.join(" \u00B7 ");
 }
+
+// Filled from /admin/state on every tick, so a cooling leg is named as cooling.
+const routeState = new Map<string, string>();
 
 function modelStateText(override: boolean | null): string {
   if (override === null) return "no override \u00B7 serving";
@@ -308,6 +315,14 @@ function render(config: AdminConfig): void {
   lastConfig = config;
   const nowMs = Date.now();
 
+  // Plan 6.6: when nothing serves, say it once at the top instead of letting the reader add up
+  // every row. The 503 is what the caller gets, so the banner says 503.
+  if (!config.legs.some((leg) => leg.serving)) {
+    root.appendChild(
+      el("p", "notice provider-down", "No provider is serving; every request answers 503."),
+    );
+  }
+
   root.appendChild(
     cfgBlock("Listener", "loopback \u00B7 reads and the override write", (panel) => {
       const rows: Array<[string, string, string?]> = [
@@ -369,7 +384,7 @@ function render(config: AdminConfig): void {
   const legs = cfgBlock("Legs", "config order \u00B7 role and weight", (panel) => {
     config.legs.forEach((leg, index) => {
       const flags = legFlags(leg);
-      const stateText = legStateText(flags);
+      const stateText = legStateText(flags, leg.name);
       const row = el("div", "legrow");
       row.appendChild(el("span", "ord", String(leg.order)));
       const name = el("span", "nm", leg.name);
@@ -506,6 +521,8 @@ async function refresh(): Promise<boolean> {
   // one would show the state it replaced.
   if (writing) return true;
   if (stateRes.ok) {
+    routeState.clear();
+    for (const route of stateRes.data.routes) routeState.set(route.name, route.state);
     setUp(stateRes.data.gateway.started_at);
     const w = stateRes.data.window;
     setSentence(`config loaded \u00B7 gateway ${stateRes.data.gateway.listen}, ${w.requests} requests in the current window`, false);

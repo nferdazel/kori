@@ -896,6 +896,13 @@ tr.detail-row .sep { display: none; }
   font-size: 12px;
   color: var(--dead);
 }
+/* The one banner: nothing serves. Ink on the paper surface, a rule above and below, so it reads
+   as a state of the page and not as an error toast. */
+.notice.provider-down {
+  border-top: 1px solid var(--hairline);
+  color: var(--ink);
+  font-weight: 400;
+}
 
 /* ---------------------------------------------------------------- switches */
 
