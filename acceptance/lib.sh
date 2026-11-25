@@ -428,6 +428,16 @@ admin_json() { # admin_json <outfile>
 # field-level shapes come from DASHBOARD-surface.md §5, not from a numbered
 # decision yet (D11 is pending), so the readers below are the one place a shape
 # change touches (OPEN-10).
+gw_pid() { # gw_pid -> the pid of the gateway this run started last
+  if [ -f "$RUN/pids" ] && [ -s "$RUN/pids" ]; then tail -n 1 "$RUN/pids"; fi
+}
+
+gw_hup() { # gw_hup -> SIGHUP the running gateway, the reload the runbook uses
+  _hup=$(gw_pid)
+  [ -n "$_hup" ] || { fail "gw_hup" "no gateway pid"; return 1; }
+  kill -HUP "$_hup"
+}
+
 admin_get() { # admin_get <outfile> <path-with-query> -> http code
   curl -sS -o "$1" -w '%{http_code}' --max-time 5 \
     -H "$(admin_token_header)" "$GW_URL$2"
