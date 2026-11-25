@@ -39,7 +39,7 @@ caller ──POST /v1/chat/completions──► kori
 |---|---|
 | CLI flags | flag parsing, precedence over config, exit `2` on bad input |
 | config | JSON loading, leg defaults, prices, the log rotation policy, and every refusal: a pool that cannot also be the bearer, an unranked effort, a `weight` outside 1-1000, a `retries` outside 0-5, a negative price |
-| log writer | the twelve-key line (nine keys always, `alias`, `effort_clamped` and `cost_usd` only when the request earned them), the single append, size rotation with `keep`, the descriptor held for the process |
+| log writer | the fourteen-key line (nine keys always; `alias`, `effort_clamped` and `cost_usd`, then `prompt_kib` and `header_ms`, only when the request earned them), the single append, size rotation with `keep`, the descriptor held for the process |
 | time | RFC 3339 stamps used by the log and the admin GETs |
 | router | leg availability, pick order, smooth weighted round-robin (`DEC-11`), leg and key cooldowns, served/attempted counters, the latency ring |
 | upstream IO | raw socket dial, TLS wrap, the deadline-bounded send and receive |
@@ -91,7 +91,10 @@ path, content type and body for the eight files under `apps/web/dist`.
 6. Whatever happened, one log line is written before the handler returns. `failover_reason`
    is the first reason met, except for a mid-stream abort, which overrides it because it is
    what the caller actually saw. The same completion feeds the `/metrics` counters, so a scrape
-   and the log cannot disagree about how many requests a route answered.
+   and the log cannot disagree about how many requests a route answered. `prompt_kib` is the
+   prompt body size in KiB (bytes, not tokens: JSON overhead is in it) and `header_ms` is the
+   wait from body sent to the first response byte, recorded only on the leg that answered, so a
+   failure leaves it out instead of reporting a wait it never finished.
 
 Cooldowns are 60 s for availability failures and 900 s for a quota `429`, with one exception:
 `header_timeout` starts at the header window that attempt waited, clamped to 5–60 s, and doubles per

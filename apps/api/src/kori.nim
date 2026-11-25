@@ -461,6 +461,9 @@ type
     tokensIn: Option[int]
     tokensOut: Option[int]
     headerWindowMs: int      ## the header deadline this attempt actually waited
+    headerMs: int            ## ms from body sent to first response byte, -1 unknown
+    retryAfterS: int         ## upstream Retry-After, -1 when absent or not a number
+    passthroughBody: string  ## a 429 body kept so the last leg can return it honestly
 
   Chain = object
     firstFrom: string
@@ -927,7 +930,8 @@ proc requestLogLine*(ts, route: string, status, latencyMs: int,
                      tokensIn, tokensOut: Option[int],
                      failoverFrom, failoverReason: string,
                      stream: bool, alias = "", effortClamped = "",
-                     costUsd = none(float)): string =
+                     costUsd = none(float), promptKib = -1, headerMs = -1,
+                     legsCooling = -1, retryAfterS = -1): string =
   ## The nine keys of SPEC §5.1 in that order, plus `alias` as a tenth when the
   ## caller named a gateway alias, plus `effort_clamped` as an eleventh when the
   ## leg's ceiling pulled the requested effort down, plus `cost_usd` as a twelfth
@@ -953,6 +957,17 @@ proc requestLogLine*(ts, route: string, status, latencyMs: int,
     result.add ",\"effort_clamped\":" & jsonEscape(effortClamped)
   if costUsd.isSome:
     result.add ",\"cost_usd\":" & jsonUsd6(costUsd.get)
+  # DEC-26. Four more optional keys, last for the same reason as the three above:
+  # a line written by an older binary still parses, and a reader that knows only
+  # the nine keys sees the same row it always did.
+  if promptKib >= 0:
+    result.add ",\"prompt_kib\":" & $promptKib
+  if headerMs >= 0:
+    result.add ",\"header_ms\":" & $headerMs
+  if legsCooling >= 0:
+    result.add ",\"legs_cooling\":" & $legsCooling
+  if retryAfterS >= 0:
+    result.add ",\"retry_after_s\":" & $retryAfterS
   result.add "}"
 
 proc openRequestLog*(path: string, rotateBytes: int64 = 0,
@@ -2590,6 +2605,7 @@ proc attemptLeg(gateway: Gateway, request: Request, leg: Leg, bearer: string,
     result.headerWindowMs =
       if stream: streamHeaderDeadlineMs(body.len)
       else: HeaderDeadlineNonStreamMs
+    let headerSentAt = epochTime()
     let headerDeadline = deadlineIn(result.headerWindowMs)
     var raw = ""
     var headDone = false
@@ -2617,6 +2633,18 @@ proc attemptLeg(gateway: Gateway, request: Request, leg: Leg, bearer: string,
     let split = raw.find("\r\n\r\n")
     let (status, headers) = parseHead(raw[0 ..< split])
     let leftover = raw[split + 4 .. ^1]
+    # DEC-26. The measurement the plan asked for: body sent to first byte of the
+    # response head. Only the answering leg records one, so a failed leg leaves it
+    # unknown rather than reporting a wait it did not finish.
+    result.headerMs = max(0, int((epochTime() - headerSentAt) * 1000.0))
+    let retryHeader = headerValue(headers, "retry-after")
+    if retryHeader.len > 0:
+      try:
+        let seconds = parseInt(retryHeader.strip())
+        if seconds >= 0:
+          result.retryAfterS = seconds
+      except ValueError:
+        discard
     if status == 0:
       result.kind = akFailed
       result.reason = TokenUpstream5xx
@@ -2807,6 +2835,15 @@ proc handleChat(gateway: Gateway, request: Request): Future[void] {.async.} =
   # Item (cost): the id the answering leg was actually sent, so the price lookup
   # uses the provider's model and not the caller's alias.
   var servedModel = ""
+  # DEC-26. Facts the response and the log both need.
+  var headerMs = -1
+  var legsCooling = -1
+  var retryAfterS = -1
+  var terminalReason = ""
+  var lastRateBody = ""
+  var lastRateStatus = 429
+  var lastRateS = -1
+  let promptKib = forwardBody.len div 1024
 
   var aliasKnown = false
   if alias.isSome and not aliasTooLong(alias.get):
@@ -2992,6 +3029,8 @@ proc handleChat(gateway: Gateway, request: Request): Future[void] {.async.} =
           abortReason = outcome.reason
         tokensIn = outcome.tokensIn
         tokensOut = outcome.tokensOut
+        if outcome.headerMs >= 0:
+          headerMs = outcome.headerMs
         # A caller that hung up still got a live answer from a live leg, so the
         # leg is marked served: the abort is the caller's fault, not the leg's.
         if outcome.kind != akTerminal:
@@ -3090,7 +3129,11 @@ proc handleChat(gateway: Gateway, request: Request): Future[void] {.async.} =
       # never clamped keeps the nine keys it had before this feature.
       effortClamped = effortClampedLog,
       # Absent on a model the config does not price: "not priced" is not "$0.00".
-      costUsd = costUsd))
+      costUsd = costUsd,
+      promptKib = promptKib,
+      headerMs = headerMs,
+      legsCooling = legsCooling,
+      retryAfterS = retryAfterS))
 
 # ------------------------------------------------------------- systemone ---
 
@@ -3152,6 +3195,7 @@ proc attemptSystemone(gateway: Gateway, request: Request, leg: SystemoneLeg,
 
     let headerDeadline = deadlineIn(HeaderDeadlineNonStreamMs)
     result.headerWindowMs = HeaderDeadlineNonStreamMs
+    let headerSentAt = epochTime()
     var raw = ""
     var headDone = false
     while not headDone:
@@ -3178,6 +3222,18 @@ proc attemptSystemone(gateway: Gateway, request: Request, leg: SystemoneLeg,
     let split = raw.find("\r\n\r\n")
     let (status, headers) = parseHead(raw[0 ..< split])
     let leftover = raw[split + 4 .. ^1]
+    # DEC-26. The measurement the plan asked for: body sent to first byte of the
+    # response head. Only the answering leg records one, so a failed leg leaves it
+    # unknown rather than reporting a wait it did not finish.
+    result.headerMs = max(0, int((epochTime() - headerSentAt) * 1000.0))
+    let retryHeader = headerValue(headers, "retry-after")
+    if retryHeader.len > 0:
+      try:
+        let seconds = parseInt(retryHeader.strip())
+        if seconds >= 0:
+          result.retryAfterS = seconds
+      except ValueError:
+        discard
     if status == 0:
       result.kind = akFailed
       result.reason = TokenUpstream5xx
@@ -3282,6 +3338,14 @@ proc handleSystemone(gateway: Gateway, request: Request): Future[void] {.async.}
   var servedModel = ""
   var firstFrom = ""
   var firstReason = ""
+  var headerMs = -1
+  var legsCooling = -1
+  var retryAfterS = -1
+  var terminalReason = ""
+  var lastRateBody = ""
+  var lastRateStatus = 429
+  var lastRateS = -1
+  let promptKib = body.len div 1024
 
   let order = gateway.systemoneOrder(epochTime())
   if order.len == 0:
@@ -3367,7 +3431,11 @@ proc handleSystemone(gateway: Gateway, request: Request): Future[void] {.async.}
       failoverFrom = firstFrom,
       failoverReason = logReason,
       stream = false,
-      costUsd = costUsd))
+      costUsd = costUsd,
+      promptKib = promptKib,
+      headerMs = headerMs,
+      legsCooling = legsCooling,
+      retryAfterS = retryAfterS))
 
 # ---------------------------------------------------------------- log tail ---
 
@@ -3382,9 +3450,11 @@ const
 ## shows that absence rather than inventing an empty string or a zero.
 const LogRowKeys = ["ts", "route", "status", "latency_ms", "tokens_in",
                     "tokens_out", "failover_from", "failover_reason", "stream",
-                    "alias", "effort_clamped", "cost_usd"]
+                    "alias", "effort_clamped", "cost_usd", "prompt_kib",
+                    "header_ms", "legs_cooling", "retry_after_s"]
 
-const OptionalLogKeys* = ["alias", "effort_clamped", "cost_usd"]
+const OptionalLogKeys* = ["alias", "effort_clamped", "cost_usd", "prompt_kib",
+                          "header_ms", "legs_cooling", "retry_after_s"]
 
 type
   LogFilter* = object

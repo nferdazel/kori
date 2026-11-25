@@ -1484,6 +1484,23 @@ block:
   check "a stylesheet is not gated", not isGatedPage("/assets/any-hashed-name.css")
   check "a font is not gated", not isGatedPage("/fonts/inter-latin-var.woff2")
 
+block:
+  # DEC-26. The new log keys are optional and last, so a line an older binary
+  # wrote still parses and a reader that knows only the nine keys is unaffected.
+  let bare = requestLogLine("2026-11-25T10:00:00Z", "leg-a", 200, 120,
+                            some(100), some(50), "", "", false)
+  check "a line without the new facts keeps the nine-key shape",
+    not bare.contains("prompt_kib") and not bare.contains("header_ms")
+  let measured = requestLogLine("2026-11-25T10:00:00Z", "leg-a", 200, 120,
+                                some(100), some(50), "", "", false,
+                                promptKib = 64, headerMs = 880)
+  check "prompt_kib is the prompt size in KiB",
+    measured.contains("\"prompt_kib\":64")
+  check "header_ms is the wait to the first response byte",
+    measured.contains("\"header_ms\":880")
+  check "the new keys follow the nine",
+    measured.find("\"prompt_kib\"") > measured.find("\"stream\"")
+
 # --------------------------------------------------------------------- report ---
 
 removeDir(scratch)

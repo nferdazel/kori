@@ -659,7 +659,10 @@ route_count() { # route_count <n> <route> -> how many of the last n lines that l
 LOG_KEYS='["ts","route","status","latency_ms","tokens_in","tokens_out","failover_from","failover_reason","stream"]'
 
 assert_log_keys() { # label
-  got=$(log_line | jq -c 'keys_unsorted' 2>/dev/null)
+  # The nine-key contract is the first nine keys, in order. The optional tail
+  # (alias, effort_clamped, cost_usd, prompt_kib, header_ms, legs_cooling,
+  # retry_after_s) may follow, exactly as `alias` and `cost_usd` always could.
+  got=$(log_line | jq -c 'keys_unsorted[0:9]' 2>/dev/null)
   assert_eq "$1 key order" "$got" "$LOG_KEYS"
 }
 
