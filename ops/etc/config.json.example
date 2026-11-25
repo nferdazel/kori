@@ -32,6 +32,13 @@
   "systemone": {
     "legs": [
       {
+        "name": "opencode-go-jev",
+        "base_url": "https://opencode.ai/inference/go/systemone/v1",
+        "api_key": "__KORI_OPENCODE_GO_API_KEY__",
+        "model": "jev-1.14",
+        "headers": { "x-opencode-session": "__KORI_OPENCODE_SESSION__" }
+      },
+      {
         "name": "commandcode-jev",
         "base_url": "https://api.commandcode.ai/provider/v1",
         "api_key": "__KORI_COMMANDCODE_API_KEY__",

@@ -11,6 +11,15 @@ this one, is the answer to "what is live".
 
 ## [Unreleased]
 
+### Changed
+
+- The committed `ops/etc/config.json.example` chains `opencode-go-jev` ahead of `commandcode-jev` on
+  the System One door, and takes a fourth value, `KORI_OPENCODE_GO_API_KEY`, in
+  `ops/scripts/kori-config.sh` (DEC-25). No binary behaviour changed: the door already sends each
+  leg its own `model` id. Verified on qouver1 2026-11-25 — `POST /v1/systemone` answered from
+  `https://opencode.ai/inference/go/systemone/v1` in 418 ms and the log line carries
+  `route: opencode-go-jev`, `tokens_in: 299`, `tokens_out: 32`.
+
 ## [0.10.4] - 2026-11-24
 
 ### Changed

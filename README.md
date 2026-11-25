@@ -499,6 +499,20 @@ repository, in an image or in a log.
 | `log.keep` | no | how many rotated files stay beside the live one, `1`-`20`, default `2` |
 | `listen`, `log` | no | overridden by `--address`, `--port`, `--log` |
 
+A System One leg names the decision endpoint in `base_url`, and kori appends `/systemone` unless the
+path already ends there. Both hosts measured on qouver1 speak the body DEC-19 describes:
+
+| Provider | `base_url` | `model` | Sent with |
+|---|---|---|---|
+| `opencode-go` | `https://opencode.ai/inference/go/systemone/v1` | `jev-1.14` | `x-opencode-session`, static key |
+| `commandcode` | `https://api.commandcode.ai/provider/v1` | `typesafe/jev-1.14.0` | static key |
+
+The Go plan covers the short id and bills it at $0.042/M input with output free; the canonical
+`typesafe/jev-1.14.0` is refused there with "isn't included in OpenCode Go", measured 2026-11-25,
+which is why the id belongs to the leg. `jev-1.14` answers only on the `systemone` protocol: the same
+model on `/chat/completions` and `/responses` answers `400 ModelProtocolUnsupported`, so it is never a
+chat leg (`DEC-25`).
+
 For the `opencode-go` leg, which the committed template no longer chains, `token_url` and `client_id`
 are the OpenCode Console's own values, published in its OAuth discovery document at
 `https://opencode.ai/console/.well-known/oauth-authorization-server` and in

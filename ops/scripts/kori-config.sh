@@ -23,6 +23,7 @@
 # Values file format, one per line, '#' comments and blank lines ignored:
 #   KORI_COMMANDCODE_API_KEY=...
 #   KORI_SINARCLOUD_API_KEY=...
+#   KORI_OPENCODE_GO_API_KEY=...    # the static Go key, also the jev credential (DEC-25)
 #
 # A value is required only when the template still carries its placeholder, so a template that
 # chains the two static-key legs does not demand the three OpenCode OAuth values. Adding an
@@ -95,6 +96,7 @@ v_access="$UNSET"
 v_session="$UNSET"
 v_commandcode="$UNSET"
 v_sinarcloud="$UNSET"
+v_opencodego="$UNSET"
 line_number=0
 
 set_value() { # set_value <key> <value>
@@ -104,6 +106,7 @@ set_value() { # set_value <key> <value>
     KORI_OPENCODE_SESSION) v_session="$2" ;;
     KORI_COMMANDCODE_API_KEY) v_commandcode="$2" ;;
     KORI_SINARCLOUD_API_KEY) v_sinarcloud="$2" ;;
+    KORI_OPENCODE_GO_API_KEY) v_opencodego="$2" ;;
     *) return 1 ;;
   esac
   return 0
@@ -124,13 +127,14 @@ while IFS= read -r line || [ -n "$line" ]; do
   set_value "$key" "$value" || die "values line $line_number has an unknown key '$key'"
 done < "${VALUES_FILE:-/dev/stdin}"
 
-for key in KORI_OPENCODE_REFRESH_TOKEN KORI_OPENCODE_ACCESS_TOKEN KORI_OPENCODE_SESSION KORI_COMMANDCODE_API_KEY KORI_SINARCLOUD_API_KEY; do
+for key in KORI_OPENCODE_REFRESH_TOKEN KORI_OPENCODE_ACCESS_TOKEN KORI_OPENCODE_SESSION KORI_COMMANDCODE_API_KEY KORI_SINARCLOUD_API_KEY KORI_OPENCODE_GO_API_KEY; do
   case "$key" in
     KORI_OPENCODE_REFRESH_TOKEN) value="$v_refresh" ;;
     KORI_OPENCODE_ACCESS_TOKEN) value="$v_access" ;;
     KORI_OPENCODE_SESSION) value="$v_session" ;;
     KORI_COMMANDCODE_API_KEY) value="$v_commandcode" ;;
     KORI_SINARCLOUD_API_KEY) value="$v_sinarcloud" ;;
+    KORI_OPENCODE_GO_API_KEY) value="$v_opencodego" ;;
   esac
   # Only a value the template actually substitutes is required: a template with no opencode-go
   # leg has nothing to fill from the three OpenCode values, so demanding them would block the run
@@ -208,6 +212,7 @@ esc_access="$(json_escape "$v_access")"
 esc_session="$(json_escape "$v_session")"
 esc_commandcode="$(json_escape "$v_commandcode")"
 esc_sinarcloud="$(json_escape "$v_sinarcloud")"
+esc_opencodego="$(json_escape "$v_opencodego")"
 
 while IFS= read -r line || [ -n "$line" ]; do
   line="$(subst "$line" __KORI_OPENCODE_REFRESH_TOKEN__ "$esc_refresh")"
@@ -215,6 +220,7 @@ while IFS= read -r line || [ -n "$line" ]; do
   line="$(subst "$line" __KORI_OPENCODE_SESSION__ "$esc_session")"
   line="$(subst "$line" __KORI_COMMANDCODE_API_KEY__ "$esc_commandcode")"
   line="$(subst "$line" __KORI_SINARCLOUD_API_KEY__ "$esc_sinarcloud")"
+  line="$(subst "$line" __KORI_OPENCODE_GO_API_KEY__ "$esc_opencodego")"
   printf '%s\n' "$line" >>"$TMP"
 done <"$TEMPLATE"
 

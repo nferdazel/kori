@@ -71,6 +71,7 @@ SENTINEL_AT="st-SENTINEL-argv-probe-115"
 SENTINEL_SES="ses_SENTINEL-argv-probe-222"
 SENTINEL_CC="cc-SENTINEL-argv-probe-333"
 SENTINEL_SC="sc-SENTINEL-argv-probe-444"
+SENTINEL_GO="go-SENTINEL-argv-probe-555"
 
 VALUES="$ROOT/values.env"
 cat >"$VALUES" <<EOF
@@ -80,6 +81,7 @@ KORI_OPENCODE_ACCESS_TOKEN=$SENTINEL_AT
 KORI_OPENCODE_SESSION=$SENTINEL_SES
 KORI_COMMANDCODE_API_KEY=$SENTINEL_CC
 KORI_SINARCLOUD_API_KEY=$SENTINEL_SC
+KORI_OPENCODE_GO_API_KEY=$SENTINEL_GO
 EOF
 # A real values file is 0600; the fill script refuses anything wider, so every fixture matches.
 chmod 600 "$VALUES"
@@ -126,8 +128,11 @@ grep -q '"legs"' "$OUT" && pass "the config still has the legs array" || fail "l
 first_leg="$(awk '/"name":/ { n = $0; sub(/.*"name": "/, "", n); sub(/".*/, "", n); print n; exit }' "$OUT")"
 [ "$first_leg" = "commandcode" ] && pass "the first leg is commandcode" \
   || fail "the first leg is '$first_leg'"
-grep -q 'opencode-go' "$OUT" && fail "an opencode-go leg is still chained" \
-  || pass "no opencode-go leg in the generated config"
+# Only the chat walk: since DEC-25 the System One block legitimately carries an opencode-go leg,
+# and the thing this check owns is the three-leg chat config the host does not run.
+chat_legs="$(sed -n '1,/"systemone"/p' "$OUT")"
+printf '%s' "$chat_legs" | grep -q 'opencode-go' && fail "an opencode-go chat leg is still chained" \
+  || pass "no opencode-go leg in the chat walk"
 role_of() { # role_of <leg name> -> that leg's role
   awk -v want="$1" '
     /"name":/ { n = $0; sub(/.*"name": "/, "", n); sub(/".*/, "", n) }

@@ -655,3 +655,34 @@ across a real network, so no acceptance case asserts a number. The client-side c
 per request on a keep-alive connection, which is microseconds against a completion measured in
 seconds. Nagle's coalescing was never buying anything here: kori writes one head and one body, and
 it uses no pipelined small writes on a connection it wants to be fast on.
+
+## DEC-25 — jev is a System One leg on the plan that already pays for it, and never a chat leg
+
+**Status:** accepted 2026-11-25.
+
+**Context.** The OpenCode Go plan lists `jev-1.14` next to the chat models, so the question was
+whether the decision model can ride the same subscription the gateway already uses instead of living
+only on commandcode. Measured on qouver1 that day: `jev-1.14` answers `400 ModelProtocolUnsupported`
+on `/inference/go/openai/v1/chat/completions` and on `/responses`, and answers `200` on
+`/inference/go/systemone/v1/systemone` with the DEC-19 body, billed to the Go plan
+(`"billing_source": "go"`, `cost: 0` on the call, input $0.042/M). The canonical id
+`typesafe/jev-1.14.0` is refused there: "Model typesafe/jev-1.14.0 isn't included in OpenCode Go".
+`/models` publishes exactly this split in each model's `api` block: a `decision` model carries
+`systemone` and no `chat-completions`.
+
+**Decision.** `jev-1.14` is a `systemone.legs[]` entry with
+`base_url: "https://opencode.ai/inference/go/systemone/v1"`, the Go key as `api_key`, and the
+`x-opencode-session` header the plan requires. It is ordered before `commandcode-jev`, which stays as
+the fallback. No code changes: the door already rewrites `model` per leg and forwards the rest, which
+is why the id can differ between the two hosts. kori never translates a chat request into a decision
+call and never presents a decision model on `/v1/models` as a chat model.
+
+**Rejected.** A protocol translator that serves jev through `/v1/chat/completions`: it would answer a
+completion-shaped request with a choice distribution, and DEC-19 already refuses a third wire shape on
+purpose. Also rejected: mapping the caller's `jev-latest` to the canonical id at the Go host, which
+that host rejects.
+
+**Consequences.** The decision door spends the Go subscription, so commandcode quota is no longer on
+the critical path for group-chat routing. The failure classes stay DEC-19's: a `422` from the Go
+gateway ("Upstream request failed: Endpoint is unavailable") is not in the dead-route list, so it
+reaches the caller instead of failing over; that is a known gap, not addressed here.
