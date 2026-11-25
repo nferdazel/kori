@@ -18,7 +18,7 @@ import {
 } from "./format";
 import { buildLogRow } from "./logtable";
 import { initShell, setSentence, setUp, startLoop } from "./shell";
-import type { AdminConfig, AdminLog, AdminState, RouteLeg } from "./types";
+import type { AdminConfig, AdminLog, AdminState, LogRow, RouteLeg } from "./types";
 
 interface Store {
   state: AdminState | null;
@@ -28,6 +28,21 @@ interface Store {
 
 const store: Store = { state: null, log: null, config: null };
 const TAPE_LIMIT = 50;
+
+// The prompt-size table needs a sample bigger than the state endpoint's `recent` cap, so it walks
+// /admin/log itself, once per page load. 200 is the endpoint's ceiling: a larger limit is a 400.
+const BUCKET_PAGE = 200;
+const BUCKET_PAGES = 5;
+
+interface BucketSample {
+  rows: LogRow[];
+  pages: number;
+  more: boolean;
+  failed: string | null;
+}
+
+let bucketSample: BucketSample | null = null;
+let bucketReading = false;
 
 type StateKey = "ok" | "cooling" | "quota" | "unknown";
 
@@ -305,6 +320,164 @@ function renderTape(): void {
   }
 }
 
+interface PromptBucket {
+  label: string;
+  lo: number;
+  hi: number | null;
+}
+
+const BUCKETS: PromptBucket[] = [
+  { label: "<32", lo: 0, hi: 32 },
+  { label: "32\u201364", lo: 32, hi: 64 },
+  { label: "64\u2013128", lo: 64, hi: 128 },
+  { label: "128\u2013256", lo: 128, hi: 256 },
+  { label: "\u2265256", lo: 256, hi: null },
+];
+
+// Nearest rank: the ceil(p/100 * n)th value of the ascending sample, clamped to 1..n. The table's
+// caption states the same rule, so a reader can reproduce a number without the source.
+function percentile(sorted: number[], p: number): number | null {
+  const n = sorted.length;
+  if (n === 0) return null;
+  const rank = Math.min(n, Math.max(1, Math.ceil((p / 100) * n)));
+  return sorted[rank - 1];
+}
+
+function latencyCell(label: string, ms: number | null): HTMLTableCellElement {
+  const td = el("td", "num");
+  td.dataset.label = label;
+  if (ms === null) {
+    td.textContent = "-";
+    return td;
+  }
+  td.textContent = secs(ms);
+  // The header is a column away from the number, so the cell states what it measured.
+  td.setAttribute("aria-label", `${label} ${ms} milliseconds`);
+  return td;
+}
+
+function labelLatScroll(): void {
+  const box = q("[data-lat-scroll]");
+  if (!box) return;
+  if (box.scrollWidth > box.clientWidth + 1) box.tabIndex = 0;
+  else box.removeAttribute("tabindex");
+}
+
+function bucketNote(sample: BucketSample): string {
+  const pages =
+    sample.pages === 0
+      ? "no page of /admin/log was read"
+      : `${sample.pages} page${sample.pages === 1 ? "" : "s"} of ${BUCKET_PAGE} rows read from /admin/log`;
+  const parts = [pages];
+  if (sample.more) parts.push("older rows exist and were not read");
+  if (sample.failed) parts.push(sample.failed);
+  return parts.join(" \u00B7 ");
+}
+
+function renderBuckets(): void {
+  const tbody = q("[data-lat-buckets]");
+  const caption = q("[data-lat-caption]");
+  const foot = q("[data-lat-foot]");
+  if (!tbody) return;
+  clear(tbody);
+
+  const setFoot = (text: string): void => {
+    if (!foot) return;
+    foot.textContent = text;
+    show(foot, text.length > 0);
+  };
+
+  const sample = bucketSample;
+  if (!sample) {
+    if (caption) caption.textContent = `reading up to ${BUCKET_PAGES * BUCKET_PAGE} log rows for a prompt-size sample`;
+    setFoot("");
+    const tr = el("tr");
+    const td = el("td", "table-note");
+    td.colSpan = 5;
+    td.textContent = "reading the log";
+    tr.appendChild(td);
+    tbody.appendChild(tr);
+    labelLatScroll();
+    return;
+  }
+
+  if (sample.rows.length === 0) {
+    if (caption) {
+      caption.textContent = sample.failed
+        ? "the log endpoint did not answer, so there is no prompt-size sample"
+        : "no logged request carried a prompt size yet";
+    }
+    setFoot(bucketNote(sample));
+    const tr = el("tr");
+    const td = el("td", "table-note");
+    td.colSpan = 5;
+    td.textContent = "-";
+    tr.appendChild(td);
+    tbody.appendChild(tr);
+    labelLatScroll();
+    return;
+  }
+
+  const samples: number[][] = BUCKETS.map(() => []);
+  let counted = 0;
+  for (const row of sample.rows) {
+    const kib = row.prompt_kib;
+    if (typeof kib !== "number") continue;
+    counted++;
+    const index = BUCKETS.findIndex((b) => kib >= b.lo && (b.hi === null || kib < b.hi));
+    if (index >= 0) samples[index].push(row.latency_ms);
+  }
+  const without = sample.rows.length - counted;
+
+  BUCKETS.forEach((bucket, index) => {
+    const values = samples[index].sort((a, b) => a - b);
+    const tr = el("tr");
+    tr.appendChild(el("td", "lat-bucket", bucket.label));
+    const count = el("td", "num");
+    count.dataset.label = "n";
+    count.textContent = values.length === 0 ? "-" : String(values.length);
+    tr.appendChild(count);
+    tr.appendChild(latencyCell("p50", percentile(values, 50)));
+    tr.appendChild(latencyCell("p90", percentile(values, 90)));
+    tr.appendChild(latencyCell("p99", percentile(values, 99)));
+    tbody.appendChild(tr);
+  });
+
+  if (caption) {
+    caption.textContent =
+      `over the last ${sample.rows.length} log rows \u00B7 ${counted} carried prompt_kib, ${without} did not \u00B7 ` +
+      "percentiles are nearest-rank: the ceil(p/100 \u00D7 n)th value of the ascending sample, clamped to 1 to n";
+  }
+  setFoot(bucketNote(sample));
+  labelLatScroll();
+}
+
+async function loadBucketSample(): Promise<void> {
+  if (bucketReading) return;
+  bucketReading = true;
+  const rows: LogRow[] = [];
+  let pages = 0;
+  let more = false;
+  let failed: string | null = null;
+  try {
+    for (let page = 0; page < BUCKET_PAGES; page++) {
+      const res = await fetchLog({ limit: BUCKET_PAGE, offset: page * BUCKET_PAGE });
+      if (!res.ok) {
+        failed = res.status === 0 ? `the log endpoint did not answer (${res.message})` : `the log read stopped with HTTP ${res.status}`;
+        break;
+      }
+      pages++;
+      rows.push(...res.data.rows);
+      more = res.data.more_older;
+      if (!more || res.data.rows.length < BUCKET_PAGE || res.data.scan.budget_exhausted) break;
+    }
+  } finally {
+    bucketReading = false;
+  }
+  bucketSample = { rows, pages, more, failed };
+  renderBuckets();
+}
+
 function renderShare(): void {
   const bar = q("[data-sharebar]");
   const list = q("[data-share-rows]");
@@ -480,10 +653,12 @@ async function refresh(): Promise<boolean> {
 export function startOverview(): void {
   initShell("index.html");
   startLoop(refresh);
+  renderBuckets();
+  void loadBucketSample();
 }
 
 // Exposed for the verification harness: lets a page be driven with a snapshot without a binary.
-export function __setStoreForTest(s: Store): void {
+export function __setStoreForTest(s: Store, buckets?: LogRow[]): void {
   store.state = s.state;
   store.log = s.log;
   store.config = s.config;
@@ -499,6 +674,10 @@ export function __setStoreForTest(s: Store): void {
   }
   renderTape();
   renderFooter();
+  if (buckets) {
+    bucketSample = { rows: buckets, pages: 1, more: false, failed: null };
+    renderBuckets();
+  }
 }
 
 export { mbLabel };

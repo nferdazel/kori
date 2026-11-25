@@ -19,7 +19,7 @@
       <a href="routes.html"><span class="n">3</span>Routes</a>
       <a href="config.html"><span class="n">4</span>Config</a>
     </nav>
-    <div class="rail-foot">read-only<br>token required</div>
+    <div class="rail-foot">read + write<br>token required</div>
   </aside>
 
   <div class="main">
@@ -53,12 +53,26 @@
         </div>
       </div>
 
+      <div class="writehead">
+        <p class="writestatus" data-write-status aria-live="polite"></p>
+        <p class="writecount" data-write-count></p>
+      </div>
+
       <div class="cfg" data-config></div>
+
+      <dialog class="confirm" data-confirm aria-labelledby="confirm-h" aria-describedby="confirm-p">
+        <h2 id="confirm-h">Turn off the last serving provider?</h2>
+        <p id="confirm-p">This turns off the last serving provider. Requests will answer 503 until one is back on.</p>
+        <div class="confirm-actions">
+          <button class="btn" type="button" data-confirm-cancel>Cancel</button>
+          <button class="btn danger" type="button" data-confirm-ok>Turn it off anyway</button>
+        </div>
+      </dialog>
 
       <footer class="footer">
         <span class="path" data-footer-path>log path</span>
         <span data-footer-count></span>
-        <span>read-only · token required</span>
+        <span>read + write · token required</span>
       </footer>
     </main>
   </div>

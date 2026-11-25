@@ -9,6 +9,8 @@ export interface FetchErr {
   ok: false;
   status: number;
   parameter?: string;
+  /** The binary's error.type when the body carried one: the switch page keys its message off it. */
+  type?: string;
   message: string;
 }
 
@@ -60,11 +62,11 @@ export function timeoutMessage(ms = READ_TIMEOUT_MS): string {
 
 export const READ_TIMEOUT_S = READ_TIMEOUT_MS / 1000;
 
-async function getJson<T>(path: string): Promise<Fetched<T>> {
-  const { signal, cancel } = readSignal();
+async function sendJson<T>(path: string, init: RequestInit, ms: number): Promise<Fetched<T>> {
+  const { signal, cancel } = readSignal(ms);
   try {
     const response = await fetch(path, {
-      headers: { Accept: "application/json" },
+      ...init,
       cache: "no-store",
       signal,
     });
@@ -85,16 +87,21 @@ async function getJson<T>(path: string): Promise<Fetched<T>> {
         ok: false,
         status: response.status,
         parameter: response.status === 400 ? err?.message : undefined,
+        type: err?.type,
         message: err?.message || `HTTP ${response.status}`,
       };
     }
     return { ok: true, data: body as T };
   } catch (e) {
-    if (isTimeout(e)) return { ok: false, status: 0, message: timeoutMessage() };
+    if (isTimeout(e)) return { ok: false, status: 0, message: timeoutMessage(ms) };
     return { ok: false, status: 0, message: e instanceof Error ? e.message : "network error" };
   } finally {
     cancel();
   }
+}
+
+function getJson<T>(path: string): Promise<Fetched<T>> {
+  return sendJson<T>(path, { headers: { Accept: "application/json" } }, READ_TIMEOUT_MS);
 }
 
 import type { AdminConfig, AdminLog, AdminState } from "./types";
@@ -123,4 +130,44 @@ export function fetchLog(query: LogQuery = {}): Promise<Fetched<AdminLog>> {
   if (query.since) params.set("since", query.since);
   const qs = params.toString();
   return getJson<AdminLog>("/admin/log" + (qs ? "?" + qs : ""));
+}
+
+// ---------------------------------------------------------------- the write surface
+
+// A write also rewrites a backup file and re-validates the patched config before it answers, so it
+// gets a longer leash than a read. The 5 s shell tick is held off while a write is in flight (the
+// config page), which is why this can outlive the tick without starving it.
+export const WRITE_TIMEOUT_MS = 8000;
+
+export interface OverrideBody {
+  legs: Record<string, boolean>;
+  models: Record<string, boolean>;
+  confirm_last_leg?: boolean;
+}
+
+export interface OverridesWritten {
+  written: boolean;
+  applied: boolean;
+  reload_requested: boolean;
+  updated_at: string;
+  overrides: { legs: Record<string, boolean>; models: Record<string, boolean> };
+}
+
+// The body REPLACES the whole override block: a name left out goes back to the value the config
+// file carries. Callers send the complete desired map, never one entry. The X-Kori-Write header is
+// what marks a cookie-authenticated write as intended (DEC-27); no token travels in JavaScript.
+export function putOverrides(body: OverrideBody): Promise<Fetched<OverridesWritten>> {
+  return sendJson<OverridesWritten>(
+    "/admin/overrides",
+    {
+      method: "PUT",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        "X-Kori-Write": "1",
+      },
+      body: JSON.stringify(body),
+    },
+    WRITE_TIMEOUT_MS,
+  );
 }
