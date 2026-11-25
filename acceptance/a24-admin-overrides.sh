@@ -14,6 +14,8 @@
 # A24e a model (alias) switch answers 400 alias_disabled while it is off.
 # A24f a cookie write needs X-Kori-Write; the write session lives 12 h.
 # A24g the override survives a restart, and a host with no write token answers 404.
+# A24h the four token/verb combinations: the write token reads, the read token
+#      cannot write, and a bearer of neither is 401.
 set -u
 ACC_DIR=$(cd "$(dirname "$0")" && pwd)
 . "$ACC_DIR/lib.sh"
@@ -156,6 +158,28 @@ assert_eq "A24f the refusal names the header" \
   "$(jq -r '.error.type' "$RUN/a24-csrf.json")" "csrf_header_required"
 assert_eq "A24f with the header it is 200" \
   "$(put_overrides "$RUN/a24-csrf-ok.json" '{"legs":{"leg-b":false}}' --cookie "$ADMIN_COOKIE_NAME=$wcookie" -H 'X-Kori-Write: 1')" "200"
+
+echo
+echo "=== A24h: the four token/verb combinations (DEC-27, amended)"
+# A24a proved the two PUT arms. These are the two GET arms and the negative
+# case, so the whole matrix is in one place: the write token reads, the read
+# token still cannot write, and a bearer of neither is still 401.
+assert_eq "A24h GET /admin/state with the read token is 200" \
+  "$(gate_code GET /admin/state -H "$(admin_token_header)")" "200"
+assert_eq "A24h GET /admin/state with the write token is 200" \
+  "$(gate_code GET /admin/state -H "$(admin_write_header)")" "200"
+assert_eq "A24h GET /admin/config with the write token is 200" \
+  "$(gate_code GET /admin/config -H "$(admin_write_header)")" "200"
+assert_eq "A24h GET /admin/log with the write token is 200" \
+  "$(gate_code GET '/admin/log?limit=1' -H "$(admin_write_header)")" "200"
+assert_eq "A24h GET /admin/state with neither is 401" \
+  "$(gate_code GET /admin/state)" "401"
+assert_eq "A24h GET /admin/state with a bogus bearer is 401" \
+  "$(gate_code GET /admin/state -H 'Authorization: Bearer not-a-token')" "401"
+assert_eq "A24h PUT with the read token is still 403" \
+  "$(put_overrides "$RUN/a24h-read.json" '{"legs":{}}' -H "$(admin_token_header)")" "403"
+assert_eq "A24h PUT with the write token is still 200" \
+  "$(put_overrides "$RUN/a24h-write.json" '{"legs":{"leg-b":false}}' -H "$(admin_write_header)")" "200"
 
 echo
 echo "=== A24g: the override survives a restart; no write token is a 404"

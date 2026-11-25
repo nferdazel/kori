@@ -2,6 +2,7 @@
   "listen": { "host": "127.0.0.1", "port": 8787 },
   "log": { "path": "/var/log/kori/requests.jsonl", "rotate_bytes": 67108864, "keep": 2 },
   "balance": false,
+  "systemone_balance": false,
   "prices": {
     "deepseek-v4.1-flash": { "in": 0.27, "out": 1.10 },
     "glm-5.3-flash": { "in": 0.60, "out": 2.20 },

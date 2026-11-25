@@ -121,7 +121,10 @@ and takes no cooldown.
 
 `POST /v1/systemone` is a second door (`DEC-19`), and it shares the log, the counters and the
 classification rules but not the walk. Its upstreams come from a `systemone.legs` block, they
-are tried in config order, and the walk stops at the first answer. The caller's body is
+are tried in config order, and the walk stops at the first answer. `systemone_balance: true`
+(`DEC-28`, default false) makes the first pick a smooth weighted round-robin over the eligible
+legs, by `systemone.legs[].weight`; the tail of the walk stays config order, so failover is still
+deterministic. The chat door's `balance` does not reach this list. The caller's body is
 forwarded byte for byte with one field replaced, the top-level `model`, because the name a
 caller uses for a decision model is not the id a provider accepts. The answer is written back
 untouched, which is why this door has no streaming path and no `stream_options` injection: a
@@ -158,7 +161,9 @@ state projected per leg, and it dials nothing, so asking what is broken cannot c
 call or a token.
 
 `/admin/config` reports the config path and a `<path>:<line>` reference per leg credential, never
-the value. The key pool is reported as a size and a cooling count, and an `oauth` leg as a state
+the value. A `base_url` printed there loses its `user:pass@` authority, so a credential carried in
+the URL cannot come out through the dashboard. The key pool is reported as a size and a cooling
+count, and an `oauth` leg as a state
 plus its expiry, so the same page can answer "which credential is dead" without carrying one. It
 also reports the log rotation policy, the price table and the last reload (`count`, `at`,
 `error`), which is the artifact a `SIGHUP` leaves behind.
@@ -176,7 +181,9 @@ file and the process converge at the next quiet moment. The endpoint has its own
 (`KORI_ADMIN_WRITE_TOKEN_FILE`): a missing file answers `404`, the read token answers `403`, a
 write session lives 12 h and must carry `X-Kori-Write: 1`, switching the last serving provider off
 is `409` without `confirm_last_leg`, and a size or mtime change between read and write is
-`409 config_changed`. `/admin/config` reports `enabled` (the file), `serving` (the effective value)
+`409 config_changed`. The write credential is also accepted as a bearer on every gated GET
+(`/admin/state`, `/admin/config`, `/admin/log`), because it could already mint a write session and
+a write session reads every page; the read token stays read-only and can never write. `/admin/config` reports `enabled` (the file), `serving` (the effective value)
 and `override` (null when the dashboard has never touched that name), so the three states stay
 distinguishable without reading the file.
 

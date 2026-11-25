@@ -13,11 +13,12 @@ this one, is the answer to "what is live".
 
 ### Added
 
-- `balance: true` now selects the System One leg as well: the first `systemone.legs` pick is the chat
-  door's smooth weighted round-robin over the eligible legs, and the rest of the walk stays config
-  order for failover (DEC-28). `systemone.legs[].weight` (1-1000, default 1) is the share, published
-  in `/admin/config`. `balance: false` leaves the System One walk exactly as DEC-19 wrote it, and a
-  config that names no weight balances evenly.
+- `systemone_balance: true` (new, default `false`) gives the System One door the chat door's weighted
+  pick: the first `systemone.legs` pick is smooth weighted round-robin over the eligible legs, and the
+  rest of the walk stays config order for failover (DEC-28). `systemone.legs[].weight` (1-1000,
+  default 1) is the share, published in `/admin/config` beside the flag. `systemone_balance: false`
+  leaves the System One walk exactly as DEC-19 wrote it and the weight inert, even when the chat
+  door's `balance` is on.
 
 - `./task phase2 <requests.jsonl>`: the phase 2 measurement. Per prompt-size bucket (`<=32`, `33-128`,
   `129-512`, `>512` KiB) it prints n and the p50/p90/p99 of `prompt_kib` and `header_ms`, nearest

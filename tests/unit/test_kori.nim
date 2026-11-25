@@ -649,6 +649,8 @@ block:
     redactUrl("user:pw@h.test/v1") == "h.test/v1"
   check "an '@' in the path is not userinfo",
     redactUrl("https://h.test/v1/a@b") == "https://h.test/v1/a@b"
+  check "an '@' in the query is not userinfo",
+    redactUrl("https://h.test/v1?user=a@b") == "https://h.test/v1?user=a@b"
 
 block:
   # §5.4 at the surface that prints it: /admin/config never carries the credential
@@ -1235,6 +1237,24 @@ block:
   check "a systemone leg with no weight gets 1, so old configs balance evenly",
     weighted.systemone[0].weight == 1
   check "a named weight is kept", weighted.systemone[1].weight == 7
+  check "systemone_balance defaults to false, so DEC-19 stays the default",
+    weighted.systemoneBalance == false
+  let soBalanced = loadConfig(writeConfig("systemone-balanced.json", """
+{"legs":[{"name":"leg-a","base_url":"http://127.0.0.1:1/v1","api_key":"k"}],
+ "systemone_balance":true,
+ "systemone":{"legs":[
+   {"name":"jev","base_url":"https://x.test/v1","api_key":"k","model":"m"}]}}
+"""))
+  check "systemone_balance true is kept", soBalanced.systemoneBalance
+  check "the chat door's balance is still its own default",
+    soBalanced.balance == false
+  checkRaises "a non-boolean systemone_balance is refused", ConfigError:
+    discard loadConfig(writeConfig("systemone-balanced-bad.json", """
+{"legs":[{"name":"leg-a","base_url":"http://127.0.0.1:1/v1","api_key":"k"}],
+ "systemone_balance":"yes",
+ "systemone":{"legs":[
+   {"name":"jev","base_url":"https://x.test/v1","api_key":"k","model":"m"}]}}
+"""))
   checkRaises "a systemone weight of 0 is refused", ConfigError:
     discard loadConfig(writeConfig("systemone-weight-zero.json", """
 {"legs":[{"name":"leg-a","base_url":"http://127.0.0.1:1/v1","api_key":"k"}],
@@ -1292,11 +1312,14 @@ block:
     parseJson(gateway.configJson()){"legs"}.len == 1
 
 block:
-  # DEC-28: with `balance` on, the first System One pick is weighted and the rest
-  # of the walk stays config order. Same SWRR as DEC-11, so equal weights alternate
-  # and a cooling leg leaves the pool instead of taking its share to nobody.
+  # DEC-28: `systemone_balance` is its own opt-in (default false). With it on the
+  # first System One pick is weighted and the rest of the walk stays config order;
+  # with it off the walk is DEC-19 even when the chat door balances. Same SWRR as
+  # DEC-11, so equal weights alternate and a cooling or disabled leg leaves the
+  # pool instead of taking its share to nobody.
   var cfg = Config(listenHost: "127.0.0.1", listenPort: 4011,
-                   logPath: scratch / "so-balance.jsonl", balance: true)
+                   logPath: scratch / "so-balance.jsonl",
+                   balance: true, systemoneBalance: true)
   cfg.legs = @[legSpec("leg-a", lrPrimary)]
   cfg.systemone = @[
     SystemoneLeg(name: "jev-a", baseUrl: "https://a.test/v1", model: "m",
@@ -1318,10 +1341,47 @@ block:
   cfg.systemone[0].weight = 3
   let heavy = newGateway(cfg, RequestLog(fd: -1), "127.0.0.1:4011")
   var counts: array[2, int]
-  for _ in 0 ..< 8:
+  for _ in 0 ..< 400:
     inc counts[heavy.systemoneOrder(epochTime())[0]]
-  check "a 3:1 config gives the heavy leg six of eight picks",
-    counts[0] == 6 and counts[1] == 2
+  check "a 3:1 config over 400 requests gives 300:100",
+    counts[0] == 300 and counts[1] == 100
+
+  # A disabled leg is out of the pool and out of the walk, so it cannot be picked
+  # even as the tail that would only be dialled on a failure.
+  cfg.systemone[1].enabled = false
+  let disabled = newGateway(cfg, RequestLog(fd: -1), "127.0.0.1:4011")
+  var disabledPicks: seq[int]
+  for _ in 0 ..< 20:
+    disabledPicks.add disabled.systemoneOrder(epochTime())[0]
+  check "a disabled leg is never picked",
+    disabledPicks.allIt(it == 0) and
+      disabled.systemoneOrder(epochTime()) == @[0]
+
+  # The opt-in is separate from the chat door's `balance`: turning chat balancing
+  # on must not re-order System One traffic underneath the operator.
+  var chatOnly = cfg
+  chatOnly.balance = true
+  chatOnly.systemoneBalance = false
+  chatOnly.systemone[1].enabled = true
+  let unswitched = newGateway(chatOnly, RequestLog(fd: -1), "127.0.0.1:4011")
+  var chatOnlyPicks: seq[int]
+  for _ in 0 ..< 6:
+    chatOnlyPicks.add unswitched.systemoneOrder(epochTime())[0]
+  check "chat balance alone leaves the System One walk in config order",
+    chatOnlyPicks.allIt(it == 0) and
+      unswitched.systemoneOrder(epochTime()) == @[0, 1]
+
+  # /admin/config publishes the flag and the shares, and still no credential.
+  cfg.systemone[0].baseUrl = "https://u:pw@a.test/v1"
+  let printed = parseJson(newGateway(cfg, RequestLog(fd: -1),
+                                     "127.0.0.1:4011").configJson())
+  check "the System One flag is published",
+    printed{"systemone_balance"}.getBool() == true
+  check "each System One leg publishes its weight",
+    printed{"systemone"}[0]{"weight"}.getInt() == 3 and
+      printed{"systemone"}[1]{"weight"}.getInt() == 1
+  check "the published System One base_url carries no credential",
+    printed{"systemone"}[0]{"base_url"}.getStr() == "https://a.test/v1"
 
 # ------------------------------------------------------------- the admin gate ---
 #

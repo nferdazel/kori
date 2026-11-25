@@ -414,7 +414,7 @@ not a config edit.
 ## DEC-19 — `/v1/systemone` is a second door with its own legs, not a second protocol path
 
 **Status:** accepted 2026-11-18, amended 2026-11-25 by DEC-28 (the first pick is weighted when
-`balance` is on).
+`systemone_balance` is on).
 
 **Context.** Jev — the model that decides which bot answers a message in a group chat — is not a
 chat model. On commandcode it is served at `POST /provider/v1/systemone` with a body of `state`,
@@ -773,7 +773,7 @@ credentials exists on the same protected volume — accepted, one generation onl
 (Phase 8) is what signs off on it. `state.admin_writes` and a stderr line record that a write
 happened, never what the token was.
 
-## DEC-28 — `balance` picks the System One leg too, with the chat door's weighted pick
+## DEC-28 — `systemone_balance` gives the System One door the chat door's weighted pick
 
 **Status:** accepted 2026-11-25.
 
@@ -781,20 +781,25 @@ happened, never what the token was.
 a load balancer. That was written when jev had one usable endpoint. Since 2026-11-25 the gateway runs on
 two plans that both serve jev (`opencode-go` and `commandcode`, DEC-25) and the chat door splits traffic
 between them 1:1, so jev traffic — the highest-volume caller kori has — piled onto the first leg while
-the second sat idle until a failure. The owner asked for one switch to mean the same thing on both
-doors.
+the second sat idle until a failure. The owner asked for the System One door to be able to split its
+traffic the same way.
 
-**Decision.** `systemone.legs[].weight` is a 1-1000 share with the same default (1) and the same refusal
-of 0 as a chat leg. When `balance` is true, the first pick is the chat door's smooth weighted
+**Decision.** A top-level `systemone_balance` (boolean, default **false**) turns the split on.
+`systemone.legs[].weight` is a 1-1000 share with the same default (1) and the same refusal of 0 as a
+chat leg. When `systemone_balance` is true, the first pick is the chat door's smooth weighted
 round-robin over the enabled System One legs that are not cooling; the rest of the walk stays config
 order, so failover is still deterministic and the second leg is still the one that answers when the
-first dies. When `balance` is false the walk is exactly what DEC-19 wrote and the weight is inert. A
-cooling leg leaves the pool; one eligible leg is always the pick.
+first dies. When it is false — the default, and what every config written before this key says — the
+walk is exactly what DEC-19 wrote and the weight is inert. A cooling or disabled leg leaves the pool;
+one eligible leg is always the pick.
 
-**Rejected.** A separate switch for the System One door: two knobs for one intent is how a config drifts.
-Rejected a weighted pick per dial rather than per request: a decision request is one call, and a
-per-dial pick would move the model id mid-request.
+**Rejected.** Reusing the chat door's `balance`: one switch for two doors means an operator who turns
+on chat balancing silently re-orders the decision door, which is the kind of coupling that makes an
+incident hard to reason about. Two switches with one default (off) keep DEC-19 the default on both
+doors. Also rejected a weighted pick per dial rather than per request: a decision request is one call,
+and a per-dial pick would move the model id mid-request.
 
-**Consequences.** `/admin/config` reports `weight` per System One leg, like a chat leg. The SWRR state
-lives in memory per leg and resets on restart, which is harmless at this volume. `balance: true` with
-`systemone` absent changes nothing.
+**Consequences.** `/admin/config` reports `systemone_balance` and the `weight` of each System One leg,
+like a chat leg. The SWRR state lives in memory per leg and resets on restart, which is harmless at this
+volume. `systemone_balance: true` with `systemone` absent changes nothing, because there is no door to
+balance.

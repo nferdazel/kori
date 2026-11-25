@@ -201,10 +201,11 @@ A cooling leg leaves the pool, so its share is redistributed instead of halving 
 `balance: false` the weight is inert and the order is the config order. `DEC-11` supersedes the
 older rule that refused every weight but 1.
 
-The same switch decides the System One door (`DEC-28`): with `balance: true` the first
+The System One door has its own opt-in (`DEC-28`): with `systemone_balance: true` the first
 `systemone.legs` entry is a weighted pick over the eligible legs, using `systemone.legs[].weight`
 (also 1-1000, default 1), and the rest of that list stays config order for failover. With
-`balance: false` the System One walk is config order and nothing else.
+`systemone_balance: false` — the default — the System One walk is config order and nothing else,
+whatever `balance` says; the chat door's switch never re-orders the decision door.
 
 ### Credential refresh
 
@@ -497,6 +498,7 @@ repository, in an image or in a log.
 | `legs[].oauth.expires_at` | no | epoch seconds; without it kori refreshes only after a `401` |
 | `legs[].oauth.refresh_skew_seconds` | no | refresh this long before expiry, default `60` |
 | `balance` | no | default `false`, which keeps strict leg order; `true` splits the pick across available primaries by `weight` (DEC-11) |
+| `systemone_balance` | no | default `false`: the System One walk is config order; `true` picks its first leg by `systemone.legs[].weight` (DEC-28) |
 | `prices` | no | USD per million tokens, keyed by the model id sent upstream, for example `{"z-ai/glm-5.3-flash": {"in": 0.15, "out": 0.5}}`; `"*"` is the catch-all. A caller alias is not the key: the id the leg sends is. A model with no entry logs no `cost_usd` (DEC-16) |
 | `systemone` | no | a second door, `POST /v1/systemone` (`DEC-19`); absent means the route answers `404`. Its legs are not part of the chat walk |
 | `systemone.legs[].name` | yes, with `systemone` | the name that appears in the log and on the dashboard |
@@ -504,7 +506,7 @@ repository, in an image or in a log.
 | `systemone.legs[].model` | yes, with `systemone` | the provider id that replaces the caller's `model`; unlike a chat leg this is required, because the whole reason the door exists is that the caller's name is not the provider's |
 | `systemone.legs[].api_key` | no | sent as `Authorization: Bearer …` unless `headers` already sets one |
 | `systemone.legs[].headers` | no | extra request headers |
-| `systemone.legs[].weight` | no | 1-1000, default `1`: the leg's share of the first pick when `balance` is `true` (DEC-28) |
+| `systemone.legs[].weight` | no | 1-1000, default `1`: the leg's share of the first pick when `systemone_balance` is `true` (DEC-28) |
 | `systemone.legs[].enabled` | no | `true` or `false`, default `true` |
 | `log.rotate_bytes` | no | rotate the live log at this size in bytes; `0`, the default, keeps one growing file (DEC-17) |
 | `log.keep` | no | how many rotated files stay beside the live one, `1`-`20`, default `2` |

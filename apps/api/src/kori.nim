@@ -324,7 +324,7 @@ type
     apiKey*: string
     model*: string            ## the provider id sent upstream; "" forwards the caller's
     headers*: seq[(string, string)]
-    weight*: int              ## DEC-28: its share of the pick when `balance` is on
+    weight*: int              ## DEC-28: its share of the pick when `systemone_balance` is on
     enabled*: bool
 
   Config* = object
@@ -334,6 +334,9 @@ type
     logRotateBytes*: int64   ## 0 keeps the single append-only file, which is the default
     logKeep*: int            ## rotated files kept beside the live one
     balance*: bool
+    ## DEC-28. Its own switch, default false: turning the chat door's balancing on
+    ## must not re-order System One traffic underneath the operator.
+    systemoneBalance*: bool
     legs*: seq[Leg]
     prices*: Table[string, Price]  ## by model id, plus "*" for the fallback
     systemone*: seq[SystemoneLeg]  ## `POST /v1/systemone` upstreams, in config order
@@ -767,6 +770,12 @@ proc loadConfigText*(raw, path: string): Config =
     if balance.kind != JBool:
       failConfig("balance must be true or false")
     result.balance = balance.getBool()
+
+  let systemoneBalance = root{"systemone_balance"}
+  if systemoneBalance != nil and systemoneBalance.kind != JNull:
+    if systemoneBalance.kind != JBool:
+      failConfig("systemone_balance must be true or false")
+    result.systemoneBalance = systemoneBalance.getBool()
 
   let legs = root{"legs"}
   if legs == nil or legs.kind != JArray:
@@ -1694,11 +1703,12 @@ proc recordEvent(gateway: Gateway, fromRoute, toRoute, reason: string) =
 # ------------------------------------------------------- systemone router ---
 
 proc systemoneOrder*(gateway: Gateway, now: float): seq[int] =
-  ## DEC-19 as amended by DEC-28. With `balance: false` this is config order and
-  ## nothing else: a fallback chain, not a load balancer. With `balance: true` the
-  ## first pick is the same smooth weighted round-robin the chat door uses, over
-  ## the legs that are enabled and not cooling, and the rest of the walk stays
-  ## config order. A cooling leg is skipped without a dial exactly as a chat leg is.
+  ## DEC-19 as amended by DEC-28. With `systemone_balance: false` (the default)
+  ## this is config order and nothing else: a fallback chain, not a load balancer.
+  ## With it on, the first pick is the same smooth weighted round-robin the chat
+  ## door uses, over the legs that are enabled and not cooling, and the rest of the
+  ## walk stays config order. A cooling leg is skipped without a dial exactly as a
+  ## chat leg is.
   var pool: seq[int]
   for index, leg in gateway.cfg.systemone:
     if not leg.enabled:
@@ -1708,7 +1718,7 @@ proc systemoneOrder*(gateway: Gateway, now: float): seq[int] =
     pool.add index
   if pool.len == 0:
     return @[]
-  if not gateway.cfg.balance:
+  if not gateway.cfg.systemoneBalance:
     return pool
   var currents = newSeq[int](gateway.cfg.systemone.len)
   for index in 0 ..< gateway.cfg.systemone.len:
@@ -4239,6 +4249,7 @@ proc configJson*(gateway: Gateway): string =
     configNode["modified_at"] = newJNull()
   root["config"] = configNode
   root["balance"] = %gateway.cfg.balance
+  root["systemone_balance"] = %gateway.cfg.systemoneBalance
 
   var legs = newJArray()
   for index, leg in gateway.cfg.legs:

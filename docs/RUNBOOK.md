@@ -221,3 +221,53 @@ The running version is authoritative at `/healthz` (`{"status":"ok","version":"0
 host sits in `src/VERSION` and is what the source checkout carries. `curl -s
 http://127.0.0.1:8787/healthz` on the host is the one place version and revision are reported
 together by the process that is actually serving.
+
+---
+
+## 7. Splitting jev traffic: `systemone_balance`
+
+`systemone.legs` is walked in config order unless the top-level `systemone_balance` is `true`
+(DEC-28, default `false`). The chat door's `balance` does not touch this list, so turning chat
+balancing on never re-orders decision traffic.
+
+To split jev across two plans, in `config.json` on the host:
+
+```json
+"systemone_balance": true,
+"systemone": { "legs": [
+  { "name": "opencode-go-jev", "...": "...", "weight": 1 },
+  { "name": "commandcode-jev", "...": "...", "weight": 1 } ] }
+```
+
+- `weight` is 1-1000, default 1, and `0` is refused at load. Equal weights alternate.
+- The first pick is weighted over the enabled legs that are not cooling; the tail of the walk is
+  config order, so the second leg is still the one that answers when the first fails.
+- Apply with `SIGHUP` (`kill -HUP $(pgrep -f 'kori --config')`), not a restart: the walk state is
+  carried by leg name and a reload keeps cooldowns.
+- Read back on `/admin/config`: `systemone_balance` at the top level and `weight` on each
+  `systemone[].` entry. A leg showing `enabled: false` is out of the pool.
+- To undo: set `systemone_balance` back to `false` and `SIGHUP`. The walk returns to DEC-19 and the
+  weights go inert; no config edit is needed to remove them.
+
+The write token (`KORI_ADMIN_WRITE_TOKEN_FILE`, DEC-27) is accepted as a bearer on the gated GETs as
+well as on `PUT /admin/overrides`, so one script credential can read `/admin/state` and write the
+switches. The read token remains read-only: a `PUT` with it is `403 write_scope_required`.
+
+---
+
+## 8. Measuring phase 2 after a deploy
+
+`./task phase2 <requests.jsonl>` reads a copy of the request log and prints, per prompt-size bucket
+(`<=32`, `33-128`, `129-512`, `>512` KiB), `n` plus nearest-rank p50/p90/p99 of `prompt_kib` and
+`header_ms`, and how many lines it skipped for lacking those two fields. It reads a file and never
+dials a provider:
+
+```sh
+scp qouver1:/srv/qouver/apps/kori/logs/requests.jsonl /tmp/req.jsonl
+./task phase2 /tmp/req.jsonl
+```
+
+The fields exist from 0.10.5 on, so a log written by 0.10.4 skips every line and the table is empty
+with a skipped count equal to the file's line count. That is not a clean measurement; it means the
+log predates the release. The numbers are what set `header.stream_base_ms`, the slope and the cap in
+the config.
