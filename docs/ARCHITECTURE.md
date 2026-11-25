@@ -167,6 +167,19 @@ A `SIGHUP` re-reads the config away from the request path and swaps it in only a
 validates and keeps the same listener. Router state is carried across by leg name, so a reload is
 not a restart: cooldowns and live OAuth tokens survive, and a stream in flight is not cut.
 
+`PUT /admin/overrides` is the one write (`DEC-27`). It accepts two switch maps and nothing else,
+patches the top-level `overrides` key in `config.json` by text so no credential byte is
+re-serialised, validates the patched document with the boot loader, writes `config.json.bak` (0600,
+one generation) and then replaces the file by temp-and-rename. The effective `enabled` of every leg
+changes in memory at once — only a boolean moves, no leg index — and a reload is requested so the
+file and the process converge at the next quiet moment. The endpoint has its own token file
+(`KORI_ADMIN_WRITE_TOKEN_FILE`): a missing file answers `404`, the read token answers `403`, a
+write session lives 12 h and must carry `X-Kori-Write: 1`, switching the last serving provider off
+is `409` without `confirm_last_leg`, and a size or mtime change between read and write is
+`409 config_changed`. `/admin/config` reports `enabled` (the file), `serving` (the effective value)
+and `override` (null when the dashboard has never touched that name), so the three states stay
+distinguishable without reading the file.
+
 ## Acceptance harness
 
 `acceptance/` proves the router end to end against a real binary. Each case is its own

@@ -2,7 +2,7 @@
 # grades byte-wise, CLI flag forms and precedence, and config defaults. No socket
 # is opened here; the harness starts the real binary.
 
-import std/[json, options, os, posix, sequtils, strutils, tables, times]
+import std/[hashes, json, options, os, posix, sequtils, strutils, tables, times]
 
 import std/asynchttpserver
 
@@ -1350,7 +1350,9 @@ block:
 
   # Expiry is enforced on read: an entry past its deadline is dropped by the next
   # gate call, so a 30 day old cookie cannot survive in a running process.
-  gateway.sessions[second.get] = epochTime() - 1
+  gateway.sessions[second.get] =
+    AdminSession(expiresAt: epochTime() - 1, scope: asRead,
+                 tokenHash: hash("gate-token"))
   let probe = Request(reqMethod: HttpGet,
                       headers: newHttpHeaders([("Cookie",
                         AdminCookieName & "=" & second.get)]))
@@ -1545,6 +1547,54 @@ block:
   check "a rate-limit 429 clamps to 5-120 s",
     cooldownSeconds(TokenRateLimited, 0, HeaderDeadlineStreamMs, false, 3) == 5.0 and
     cooldownSeconds(TokenRateLimited, 0, HeaderDeadlineStreamMs, false, 600) == 120.0
+
+
+block:
+  # DEC-27: the overrides block is parsed after the legs, so a name that matches
+  # nothing is a load error rather than a switch that silently does nothing.
+  let path = writeConfig("overridden.json", """
+{"legs":[
+  {"name":"a","base_url":"http://127.0.0.1:1/v1"},
+  {"name":"b","base_url":"http://127.0.0.1:2/v1","enabled":false},
+  {"name":"c","base_url":"http://127.0.0.1:3/v1","aliases":{"jev":"jev-1.14"}}],
+ "overrides":{"legs":{"a":false,"b":true},"models":{"jev":false}}}
+""")
+  let cfg = loadConfig(path)
+  check "an override switches a file-enabled leg off",
+    cfg.legs[0].enabledFile and not cfg.legs[0].enabled
+  check "an override switches a file-disabled leg on",
+    not cfg.legs[1].enabledFile and cfg.legs[1].enabled
+  check "a leg without an override keeps its file value",
+    cfg.legs[2].enabledFile and cfg.legs[2].enabled
+  check "a model override is read", cfg.overridesModels["jev"] == false
+
+  # The dashboard write is a text patch, so a credential the file holds is never
+  # a value the write path can lose, reorder or reformat.
+  let raw = """{
+  "listen": {"host":"127.0.0.1","port":4011},
+  "log": {"path":"/tmp/x.jsonl"},
+  "legs": [{"name":"a","base_url":"http://127.0.0.1:1/v1","api_key":"SENTINEL"}]
+}"""
+  let first = patchOverridesText(raw,
+    """{"legs":{"a":false},"models":{},"updated_at":"2026-11-25T10:00:00Z"}""")
+  check "the patch keeps every credential byte", first.contains("SENTINEL")
+  let firstCfg = loadConfigText(first, "patch.json")
+  check "the patched config turns the leg off without rewriting `enabled`",
+    firstCfg.legs[0].enabledFile and not firstCfg.legs[0].enabled
+  let second = patchOverridesText(first,
+    """{"legs":{"a":true},"models":{},"updated_at":"2026-11-25T10:01:00Z"}""")
+  check "a second patch replaces the block instead of adding one",
+    second.count("\"overrides\"") == 1
+  check "the second switch is the one that applies",
+    loadConfigText(second, "patch.json").legs[0].enabled
+
+checkRaises "an override of a name no leg has is refused", ConfigError:
+  discard loadConfigText("""{"legs":[{"name":"a","base_url":"http://127.0.0.1:1/v1"}],
+    "overrides":{"legs":{"typo":false}}}""", "override-typo.json")
+
+checkRaises "an override of a model no alias maps is refused", ConfigError:
+  discard loadConfigText("""{"legs":[{"name":"a","base_url":"http://127.0.0.1:1/v1"}],
+    "overrides":{"models":{"typo":false}}}""", "override-model-typo.json")
 
 # --------------------------------------------------------------------- report ---
 

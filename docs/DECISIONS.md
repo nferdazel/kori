@@ -686,3 +686,79 @@ that host rejects.
 the critical path for group-chat routing. The failure classes stay DEC-19's: a `422` from the Go
 gateway ("Upstream request failed: Endpoint is unavailable") is not in the dead-route list, so it
 reaches the caller instead of failing over; that is a known gap, not addressed here.
+
+## DEC-26 — The header window is config, a one-leg gateway skips for 15 s, and a failed walk says what it means
+
+**Status:** accepted 2026-11-25.
+
+**Context.** Three facts measured on qouver1 with the owner. First, of 103 requests since 16:24 WIB
+86 answered `200` and 7 hit a header timeout on a prompt whose median size was 64k tokens; the
+straight-line rule that already existed (base plus a per-KiB slope, capped) was never the reason a leg
+was skipped — the numbers were, and they were compiled in. Second, with one leg enabled, a single
+header timeout removed the only route for 60 s and the caller got `502 all_legs_cooling` labelled with
+a leg that had not been dialled, at 0 ms. Third, an upstream `429` that names `Retry-After: 42` was
+treated as a 900 s capacity failure, and a plain rate-limit `429` was a client error that never failed
+over.
+
+**Decision.** `timeouts.header_ms_stream_base`, `header_ms_stream_slope_per_kib`,
+`header_ms_stream_max` and `header_ms_non_stream` are config keys with the current numbers as
+defaults, validated (`0 < base <= max`, non-negative slope) and published under `timeouts` in
+`/admin/config`. When every enabled leg is cooling the answer is `503 all_legs_cooling` with a
+`Retry-After` header equal to the body's `retry_after_s` (the earliest expiry among the cooling legs,
+never below 1 s), no leg name in the body, and `route: ""` in the log; zero enabled legs answers
+`503 no_leg_enabled`, because "every leg is cooling" would be a lie about a config state. A gateway
+with one enabled leg caps a header-timeout rung at 15 s: the rung only decides how long the caller is
+told to wait, and the window's own floor is the smallest honest number. A quota `429` that names
+`Retry-After` is believed, clamped to 60–900 s. A `429` that is not a quota becomes
+`rate_limited_429` on a 5–120 s clock (30 s by default), fails over, and when the last leg still
+answers `429` its own body and header reach the caller instead of a fabricated `502`.
+
+**Rejected.** Raising the header deadline: the timeouts were provider stalls, not an undersized
+budget, and the direct-dial first byte at 20/160/400 KiB was 0.9/3.8/4.7 s — inside the existing
+window. Also rejected: keeping `502` for the all-cooling case (a `502` says a leg failed; nothing was
+dialled), and a per-leg `Retry-After` in the body (it would name a leg to a caller who has no way to
+choose one).
+
+**Consequences.** Four more optional log keys (`prompt_kib`, `header_ms`, `legs_cooling`,
+`retry_after_s`), all last, so the nine-key contract and old lines still hold. A client that retries
+only `502` would stop retrying on `503`; that is a client fact, not a gateway one, and the plan's
+Phase 9 gate is what decides whether it needs reverting (`408`-safe alternative: keep `502`, keep the
+honest body and `Retry-After`).
+
+## DEC-27 — The dashboard may switch providers and model aliases off, and that is the only write
+
+**Status:** accepted 2026-11-25.
+
+**Context.** Switching a provider off meant editing `/etc/kori/config.json` by hand and signalling the
+process. The config file also holds every provider credential, so any write surface is a way to
+rewrite a credential if it accepts more than it should, and the dashboard's read session is a 30-day
+cookie — long enough that a stolen one must not be able to disable a leg.
+
+**Decision.** The only mutation is `PUT /admin/overrides` with a body of
+`{"legs":{name:bool}, "models":{alias:bool}, "confirm_last_leg":bool}`. A name that no leg or alias
+has is a `400`. The block replaces the whole `overrides` block in `config.json`, applied by a textual
+patch of that one top-level key, so no credential byte is ever re-serialised; the patched document is
+validated by the same loader the process boots with before the file is replaced by temp-and-rename,
+with one `config.json.bak` (0600, same volume, one generation) written first, and a size+mtime check
+turns a concurrent hand edit or OAuth write-back into `409 config_changed`. The switch is applied in
+memory immediately (only a boolean changes; no leg index moves) and a reload is requested so the file
+and the process converge at the next quiet moment.
+
+Writes have their own credential: `KORI_ADMIN_WRITE_TOKEN_FILE` (default
+`/etc/kori/admin-write.token`), constant-time compared, and a host without that file answers the same
+`404` the read gate answers without a token. A read token on this endpoint is `403
+write_scope_required`. A session minted from the write token lives 12 h, stores its scope and a
+fingerprint of the token that minted it, so rotating the token invalidates it, and a cookie write must
+also carry `X-Kori-Write: 1` — a header a cross-site form cannot set. A bearer write needs no such
+header. Refusing to switch the last serving provider off is `409 last_leg` unless the body says
+`confirm_last_leg: true`.
+
+**Rejected.** A general config editor, `PATCH` on arbitrary keys, and accepting credentials or
+timeouts through the same door: each widens what a compromised process can rewrite. Also rejected:
+waiting for `inFlight == 0` before applying a boolean.
+
+**Consequences.** `config.json` and its directory must be writable by the gateway's uid (already true
+in the container template, `:rw,Z`, uid 10001). Every write writes a `.bak`, so a second copy of the
+credentials exists on the same protected volume — accepted, one generation only, and Galih's review
+(Phase 8) is what signs off on it. `state.admin_writes` and a stderr line record that a write
+happened, never what the token was.

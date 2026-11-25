@@ -35,8 +35,9 @@
 # identity, a second replica, and compression of rotated logs.
 # docs/ARCHITECTURE.md, "Not built", is the list this comment must agree with.
 
-import std/[algorithm, asyncdispatch, asyncnet, base64, exitprocs, httpcore,
-            json, net, options, os, posix, strutils, sysrand, tables, times, uri]
+import std/[algorithm, asyncdispatch, asyncnet, base64, exitprocs, hashes,
+            httpcore, json, net, options, os, posix, strutils, sysrand, tables,
+            times, uri]
 import std/asynchttpserver
 
 import generated/static_files
@@ -166,6 +167,14 @@ const
   # default: the host points KORI_ADMIN_TOKEN_FILE at wherever it keeps the file.
   DefaultAdminTokenFile* = "/etc/kori/admin.token"
   AdminTokenEnv* = "KORI_ADMIN_TOKEN_FILE"
+  ## DEC-27. The write surface has its own token file. A read deployment keeps no
+  ## write token at all, and then every write answers the same 404 the read gate
+  ## answers without a token: an unconfigured host does not advertise the surface.
+  DefaultAdminWriteTokenFile* = "/etc/kori/admin-write.token"
+  AdminWriteTokenEnv* = "KORI_ADMIN_WRITE_TOKEN_FILE"
+  ## A write session is short on purpose: it can switch a provider off, and the
+  ## read cookie already lives for thirty days.
+  AdminWriteSessionTtlS* = 43_200.0
   AdminCookieName* = "kori_admin"
   ## 32 random bytes, base64url, unpadded: 43 characters of URL-safe alphabet, so
   ## the value needs no quoting in a cookie and carries no `=`.
@@ -224,6 +233,9 @@ const
   AliasPrefix* = "kori/"
   TokenAliasUnmapped* = "alias_unmapped"
   TokenUnknownAlias* = "unknown_alias"
+  ## DEC-27. The alias is mapped, and the operator switched it off from the
+  ## dashboard. A caller can tell this from a name the config never had.
+  TokenAliasDisabled* = "alias_disabled"
   TokenAliasTooLong* = "alias_too_long"
 
   ## Item 3. The alias is echoed into the request log, so it is bounded far below
@@ -290,7 +302,8 @@ type
     retries*: int              ## extra dials on this leg before it is classed failed
     oauth*: Oauth
     hasOauth*: bool
-    enabled*: bool             ## false only when the config says so: skipped, never dialled
+    enabled*: bool             ## effective: the file's value after `overrides.legs`
+    enabledFile*: bool         ## the leg's own `enabled`, before any override
     aliases*: Table[string, string]  ## `kori/<alias>` -> this leg's provider id
     efforts*: seq[string]      ## the reasoning_effort values this leg accepts
     hasEfforts*: bool          ## `efforts` came from the config, so the ceiling applies
@@ -394,6 +407,18 @@ type
     toRoute*: string
     reason*: string
 
+  AdminScope* = enum
+    asRead = "read"
+    asWrite = "write"
+
+  AdminSession* = object
+    ## DEC-27. The scope and the token that minted the session live beside the
+    ## expiry. A write token rotated on disk therefore invalidates its own
+    ## sessions on the next request, and a read session can never be upgraded.
+    expiresAt*: float
+    scope*: AdminScope
+    tokenHash*: Hash
+
   Metrics* = object
     ## Counters /metrics prints. Everything here is already decided elsewhere in
     ## the request path, so this is a tally, never a second source of truth: no
@@ -452,8 +477,14 @@ type
     cli*: CliOptions             ## kept so a reload applies the same precedence
     # DEC-20. The gate's own state, all of it in memory: a restart empties the
     # session table on purpose, and nothing here is written to disk or logged.
-    sessions*: Table[string, float]   ## session id -> expiry, epoch seconds
-    loginFailures*: seq[float]        ## epochs of the failures still in the window
+    sessions*: Table[string, AdminSession]  ## session id -> expiry, scope, token
+    loginFailures*: seq[float]        ## epochs of the read-token failures in the window
+    writeLoginFailures*: seq[float]   ## the same window, counted apart for writes
+    # DEC-27. What the write surface has done since the process started. Counters
+    # only: no token, no session id, no config value a caller sent.
+    adminWrites*: int
+    lastAdminWriteAt*: string
+    lastAdminWriteAction*: string
 
   RecvKind = enum
     rkData, rkEof, rkTruncated, rkTimeout, rkError
@@ -500,6 +531,10 @@ type
     capacity: bool
 
 var logFdToClose: cint = -1
+## DEC-27. Raised by the config write path and by SIGHUP, read by the main loop
+## when no request is in flight. The write path needs it before its own proc, so
+## the flag lives up here rather than beside the signal handlers.
+var reloadRequested {.volatile.}: bool = false
 
 # ---------------------------------------------------------------- CLI flags ---
 
@@ -821,6 +856,7 @@ proc loadConfigText*(raw, path: string): Config =
       if enabledNode.kind != JBool:
         failConfig(ctx & ".enabled must be true or false")
       leg.enabled = enabledNode.getBool()
+    leg.enabledFile = leg.enabled
     # Item 2. The alias table is per leg: one caller name, one provider id per leg.
     let aliasesNode = item{"aliases"}
     if aliasesNode != nil and aliasesNode.kind != JNull:
@@ -892,6 +928,56 @@ proc loadConfigText*(raw, path: string): Config =
     result.legs.add(leg)
   if result.legs.len == 0:
     failConfig("config needs at least one leg")
+
+  # DEC-27. `overrides` is the dashboard's switch block: two maps of name -> bool.
+  # It is parsed after the legs so a name that matches nothing is a load error
+  # rather than a switch that silently does nothing.
+  let overrides = root{"overrides"}
+  if overrides != nil and overrides.kind != JNull:
+    if overrides.kind != JObject:
+      failConfig("overrides must be an object")
+    for key, _ in overrides:
+      if key notin ["legs", "models", "updated_at"]:
+        failConfig("overrides." & key & " is not a known key")
+    let updated = overrides{"updated_at"}
+    if updated != nil and updated.kind != JNull:
+      if updated.kind != JString:
+        failConfig("overrides.updated_at must be a string")
+      result.overridesUpdatedAt = updated.getStr()
+    let legOverrides = overrides{"legs"}
+    if legOverrides != nil and legOverrides.kind != JNull:
+      if legOverrides.kind != JObject:
+        failConfig("overrides.legs must be an object")
+      for name, value in legOverrides:
+        if value.kind != JBool:
+          failConfig("overrides.legs." & name & " must be true or false")
+        var known = false
+        for leg in result.legs:
+          if leg.name == name:
+            known = true
+            break
+        if not known:
+          failConfig("overrides.legs." & name & " names no leg")
+        result.overridesLegs[name] = value.getBool()
+    let modelOverrides = overrides{"models"}
+    if modelOverrides != nil and modelOverrides.kind != JNull:
+      if modelOverrides.kind != JObject:
+        failConfig("overrides.models must be an object")
+      for alias, value in modelOverrides:
+        if value.kind != JBool:
+          failConfig("overrides.models." & alias & " must be true or false")
+        var known = false
+        for leg in result.legs:
+          if leg.aliases.hasKey(alias):
+            known = true
+            break
+        if not known:
+          failConfig("overrides.models." & alias & " names no model alias")
+        result.overridesModels[alias] = value.getBool()
+    for index in 0 ..< result.legs.len:
+      let name = result.legs[index].name
+      if result.overridesLegs.hasKey(name):
+        result.legs[index].enabled = result.overridesLegs[name]
 
   # DEC-19. `systemone` is a second door with its own ordered legs. It is
   # optional: a config without it serves the chat door exactly as before and
@@ -1342,7 +1428,7 @@ proc newGateway*(cfg: Config, log: RequestLog,
                                     failoversByReason: initTable[string, int](),
                                     cooldownStarts: initTable[string, int](),
                                     statusClasses: initTable[string, int]()),
-                   sessions: initTable[string, float](),
+                   sessions: initTable[string, AdminSession](),
                    staticFiles: staticFileTable())
   # The seeded credential is the starting point, not the truth: a refresh replaces
   # it in memory and, when the file is writable, on disk.
@@ -2122,6 +2208,13 @@ proc unknownAliasBody*(alias: string): string =
   ## A client error with a body that says what the caller can fix.
   "{\"error\":{\"type\":\"unknown_alias\",\"message\":" &
     jsonEscape("no leg maps the model alias '" & alias & "'") & "}}"
+
+proc aliasDisabledBody*(alias: string): string =
+  ## DEC-27. Fixed shape, the caller's own alias echoed only after the same length
+  ## bound an unknown alias gets.
+  "{\"error\":{\"type\":\"" & TokenAliasDisabled &
+    "\",\"message\":" & jsonEscape("model alias '" & alias &
+    "' is switched off in the gateway") & "}}"
 
 proc aliasTooLong*(alias: string): bool =
   ## Item 3: checked before any leg is touched, so an over-long name never reaches
@@ -3037,6 +3130,13 @@ proc handleChat(gateway: Gateway, request: Request): Future[void] {.async.} =
     status = 400
     answered = true
     chain.firstReason = TokenAliasTooLong
+  elif alias.isSome and gateway.modelDisabled(alias.get):
+    # DEC-27. The alias exists and the operator switched it off, which is a
+    # different fact from a name no leg maps.
+    await request.sendErrorBody(400, aliasDisabledBody(alias.get))
+    status = 400
+    answered = true
+    chain.firstReason = TokenAliasDisabled
   elif alias.isSome and not aliasKnown:
     # No leg in the config maps this name: a client error with a body that says
     # so, not a 500 and not a walk that ends in an all-legs-failed 502.
@@ -4103,7 +4203,12 @@ proc configJson*(gateway: Gateway): string =
     node["weight"] = %leg.weight
     node["base_url"] = %redactUrl(leg.baseUrl)
     node["model"] = %leg.model
-    node["enabled"] = %leg.enabled
+    node["enabled"] = %leg.enabledFile
+    node["serving"] = %leg.enabled
+    if gateway.cfg.overridesLegs.hasKey(leg.name):
+      node["override"] = %gateway.cfg.overridesLegs[leg.name]
+    else:
+      node["override"] = newJNull()
     node["retries"] = %leg.retries
     var aliases = newJObject()
     for alias, providerId in leg.aliases:
@@ -4199,6 +4304,31 @@ proc configJson*(gateway: Gateway): string =
   reload["error"] = (if gateway.lastReloadError.len > 0: %gateway.lastReloadError
                      else: newJNull())
   root["reload"] = reload
+
+  # DEC-27. The switch block exactly as the binary holds it, so the dashboard can
+  # say what is overridden without reading the file. Values only; no credential.
+  var overridesNode = newJObject()
+  var legOverrides = newJObject()
+  for name, value in gateway.cfg.overridesLegs:
+    legOverrides[name] = %value
+  var modelOverrides = newJObject()
+  for name, value in gateway.cfg.overridesModels:
+    modelOverrides[name] = %value
+  overridesNode["legs"] = legOverrides
+  overridesNode["models"] = modelOverrides
+  if gateway.cfg.overridesUpdatedAt.len > 0:
+    overridesNode["updated_at"] = %gateway.cfg.overridesUpdatedAt
+  else:
+    overridesNode["updated_at"] = newJNull()
+  root["overrides"] = overridesNode
+
+  var writes = newJObject()
+  writes["count"] = %gateway.adminWrites
+  writes["last_at"] = (if gateway.lastAdminWriteAt.len > 0:
+                         %gateway.lastAdminWriteAt else: newJNull())
+  writes["last_action"] = (if gateway.lastAdminWriteAction.len > 0:
+                             %gateway.lastAdminWriteAction else: newJNull())
+  root["admin_writes"] = writes
 
   # DEC-19. Reported beside the chat legs, never inside them: a System One leg is
   # not part of that walk, and a dashboard that merged the two lists would draw a
@@ -4562,10 +4692,17 @@ type
     agNoToken,   ## no token configured: the gated surface answers 404
     agDenied     ## a token exists and this request does not have it
 
+  AdminWriteGate* = enum
+    awOk,        ## the write token, as a bearer or as a write session
+    awNoToken,   ## no write token file: the surface answers 404
+    awDenied,    ## no credential that authenticates anything
+    awForbidden, ## authenticated with the read credential: wrong scope
+    awCsrf       ## a write session without the X-Kori-Write header
+
 proc pruneSessions*(gateway: Gateway, now: float) =
   var expired: seq[string]
-  for id, expiresAt in gateway.sessions:
-    if expiresAt <= now:
+  for id, session in gateway.sessions:
+    if session.expiresAt <= now:
       expired.add id
   for id in expired:
     gateway.sessions.del id
@@ -4577,6 +4714,62 @@ proc pruneLoginFailures*(gateway: Gateway, now: float) =
       kept.add at
   gateway.loginFailures = kept
 
+proc readAdminWriteToken*(): Option[string] =
+  ## DEC-27. The same file contract as the read token, in its own path. A host
+  ## without this file has no write surface at all: the caller gets the 404 the
+  ## read gate answers without a token.
+  let fromEnv = getEnv(AdminWriteTokenEnv)
+  let path = if fromEnv.len > 0: fromEnv else: DefaultAdminWriteTokenFile
+  var raw: string
+  try:
+    if not fileExists(path):
+      return none(string)
+    raw = readFile(path)
+  except CatchableError:
+    return none(string)
+  let token = raw.strip()
+  if token.len == 0:
+    return none(string)
+  some(token)
+
+proc headerIs*(request: Request, name, want: string): bool =
+  ## Exact, case-insensitive header *name* (the table already is), exact value.
+  ## Used for the one non-simple header a cookie write must carry (DEC-27).
+  for value in seq[string](request.headers.getOrDefault(name)):
+    if value.strip() == want:
+      return true
+  false
+
+proc adminWriteGate*(gateway: Gateway, request: Request): AdminWriteGate =
+  ## DEC-27. The same constant-time compare as the read gate, then three facts the
+  ## read gate does not need: the session's scope, the token that minted it, and
+  ## the header a cross-site form cannot set.
+  let token = readAdminWriteToken()
+  if token.isNone:
+    return awNoToken
+  let now = epochTime()
+  pruneSessions(gateway, now)
+  let cookie = sessionCookieValue(request)
+  if cookie.len > 0 and gateway.sessions.hasKey(cookie):
+    let session = gateway.sessions[cookie]
+    if session.expiresAt > now and session.scope == asWrite and
+       session.tokenHash == hash(token.get):
+      if headerIs(request, "X-Kori-Write", "1"):
+        return awOk
+      return awCsrf
+  let bearer = bearerValue(request)
+  if bearer.len > 0 and constantTimeEquals(token.get, bearer):
+    return awOk
+  # A credential that is valid for reads is authenticated but not allowed here.
+  let readToken = readAdminToken()
+  if readToken.isSome and bearer.len > 0 and
+     constantTimeEquals(readToken.get, bearer):
+    return awForbidden
+  if cookie.len > 0 and gateway.sessions.hasKey(cookie) and
+     gateway.sessions[cookie].expiresAt > now:
+    return awForbidden
+  awDenied
+
 proc adminGate*(gateway: Gateway, request: Request): AdminGate =
   ## Session first: it is a table lookup, and a browser sends the cookie on every
   ## request while a script sends the bearer. Either one is enough.
@@ -4587,15 +4780,20 @@ proc adminGate*(gateway: Gateway, request: Request): AdminGate =
   pruneSessions(gateway, now)
   let cookie = sessionCookieValue(request)
   if cookie.len > 0 and gateway.sessions.hasKey(cookie):
-    return agOk
+    let session = gateway.sessions[cookie]
+    if session.expiresAt > now:
+      return agOk
   let bearer = bearerValue(request)
   if bearer.len > 0 and constantTimeEquals(token.get, bearer):
     return agOk
   agDenied
 
-proc startSession*(gateway: Gateway): Option[string] =
+proc startSession*(gateway: Gateway, scope = asRead,
+                   tokenHash: Hash = Hash(0)): Option[string] =
   ## A session id that is guessable is not a gate, so no CSPRNG means no session
   ## and the caller is told the surface is unavailable rather than let in.
+  ## DEC-27: the scope and the fingerprint of the token that minted it are stored
+  ## beside the expiry, so a write session cannot outlive a rotated write token.
   var bytes: array[AdminSessionBytes, byte]
   if not urandom(bytes):
     return none(string)
@@ -4611,12 +4809,14 @@ proc startSession*(gateway: Gateway): Option[string] =
     # goes, which is the one a caller is least likely to still be using.
     var oldestId = ""
     var oldestAt = 0.0
-    for existing, expiresAt in gateway.sessions:
-      if oldestId.len == 0 or expiresAt < oldestAt:
+    for existing, session in gateway.sessions:
+      if oldestId.len == 0 or session.expiresAt < oldestAt:
         oldestId = existing
-        oldestAt = expiresAt
+        oldestAt = session.expiresAt
     gateway.sessions.del oldestId
-  gateway.sessions[id] = now + AdminSessionTtlS
+  let ttl = if scope == asWrite: AdminWriteSessionTtlS else: AdminSessionTtlS
+  gateway.sessions[id] = AdminSession(expiresAt: now + ttl, scope: scope,
+                                      tokenHash: tokenHash)
   some(id)
 
 proc sessionCookie*(value: string, maxAge: int): string =
@@ -4644,6 +4844,326 @@ proc respondGateMissing*(request: Request): Future[void] {.async.} =
   ## 401 and never 500: the answer is the same 404 an unknown path gets.
   await respondJson(request, Http404, notFoundBody())
 
+# ------------------------------------------------------------ config write ---
+# DEC-27. The only mutation the admin surface accepts: two switch maps, patched
+# into the config file by text, validated by the same loader the process boots
+# with, and applied in memory without moving the leg list.
+
+const MaxOverridesBodyBytes* = 16_384
+
+type
+  JsonSpan = object
+    found: bool
+    valueStart: int
+    valueEnd: int
+
+proc jsonValueEnd(raw: string, start: int): int =
+  ## The last byte of the JSON value beginning at `start`, or -1. String-aware, so
+  ## a brace inside a token or a URL cannot end an object early.
+  if start < 0 or start >= raw.len:
+    return -1
+  case raw[start]
+  of '{', '[':
+    var depth = 0
+    var inString = false
+    var escaped = false
+    var i = start
+    while i < raw.len:
+      let ch = raw[i]
+      if inString:
+        if escaped: escaped = false
+        elif ch == '\\': escaped = true
+        elif ch == '"': inString = false
+      else:
+        case ch
+        of '"': inString = true
+        of '{', '[': inc depth
+        of '}', ']':
+          dec depth
+          if depth == 0:
+            return i
+        else: discard
+      inc i
+    -1
+  of '"':
+    stringLiteralEnd(raw, start)
+  else:
+    var i = start
+    while i < raw.len and raw[i] notin {',', '}', ']', ' ', '\t', '\r', '\n'}:
+      inc i
+    i - 1
+
+proc overridesSpan(raw: string): JsonSpan =
+  ## The top-level `"overrides"` value. Only a key at depth 1 can match, so an
+  ## `overrides` string inside a leg or a header value is never touched.
+  var depth = 0
+  var inString = false
+  var escaped = false
+  var i = 0
+  while i < raw.len:
+    let ch = raw[i]
+    if inString:
+      if escaped: escaped = false
+      elif ch == '\\': escaped = true
+      elif ch == '"': inString = false
+      inc i
+      continue
+    case ch
+    of '"':
+      let endQuote = stringLiteralEnd(raw, i)
+      if endQuote < 0:
+        return
+      var j = endQuote + 1
+      while j < raw.len and raw[j] in {' ', '\t', '\r', '\n'}:
+        inc j
+      if depth == 1 and j < raw.len and raw[j] == ':' and
+         raw[i + 1 ..< endQuote] == "overrides":
+        inc j
+        while j < raw.len and raw[j] in {' ', '\t', '\r', '\n'}:
+          inc j
+        if j >= raw.len:
+          return
+        let endValue = jsonValueEnd(raw, j)
+        if endValue >= j:
+          return JsonSpan(found: true, valueStart: j, valueEnd: endValue)
+      i = endQuote + 1
+    of '{':
+      inc depth
+      inc i
+    of '}':
+      dec depth
+      inc i
+    else:
+      inc i
+
+proc overrideMapText(pairs: seq[(string, bool)]): string =
+  ## Sorted by name so two writes of the same state produce the same bytes.
+  var parts: seq[string]
+  for pair in pairs:
+    parts.add jsonEscape(pair[0]) & ":" & (if pair[1]: "true" else: "false")
+  parts.sort()
+  "{" & parts.join(",") & "}"
+
+proc patchOverridesText*(raw, valueText: string): string =
+  let span = overridesSpan(raw)
+  if span.found:
+    return raw[0 ..< span.valueStart] & valueText & raw[span.valueEnd + 1 .. ^1]
+  let close = raw.rfind('}')
+  if close < 0:
+    return ""
+  let head = raw[0 ..< close]
+  let needsComma = head.strip().len > 1
+  head & (if needsComma: "," else: "") & "\n  \"overrides\": " & valueText &
+    "\n" & raw[close .. ^1]
+
+proc writeScopeBody*(): string =
+  "{\"error\":{\"type\":\"write_scope_required\",\"message\":\"a write token is required for this endpoint\"}}"
+
+proc csrfHeaderBody*(): string =
+  "{\"error\":{\"type\":\"csrf_header_required\",\"message\":\"X-Kori-Write: 1 is required for a cookie write\"}}"
+
+proc lastLegBody*(): string =
+  "{\"error\":{\"type\":\"last_leg\",\"message\":\"this would switch off the last serving provider; send confirm_last_leg to do it anyway\"}}"
+
+proc adminBadBody*(message: string): string =
+  "{\"error\":{\"type\":\"bad_request\",\"message\":" & jsonEscape(message) & "}}"
+
+proc handleAdminOverrides(gateway: Gateway,
+                          request: Request): Future[void] {.async.} =
+  case gateway.adminWriteGate(request)
+  of awNoToken: await respondGateMissing(request); return
+  of awDenied: await respondGateDenied(request, page = false); return
+  of awForbidden: await respondJson(request, Http403, writeScopeBody()); return
+  of awCsrf: await respondJson(request, Http403, csrfHeaderBody()); return
+  of awOk: discard
+
+  if request.body.len > MaxOverridesBodyBytes:
+    await respondJson(request, Http413,
+      "{\"error\":{\"type\":\"body_too_large\",\"message\":\"overrides body is larger than 16 KiB\"}}")
+    return
+  var node: JsonNode
+  try:
+    node = parseJson(request.body)
+  except CatchableError:
+    await respondJson(request, Http400, adminBadBody("body is not valid JSON"))
+    return
+  if node.kind != JObject:
+    await respondJson(request, Http400, adminBadBody("body must be a JSON object"))
+    return
+
+  var confirmLast = false
+  var legs = initTable[string, bool]()
+  var models = initTable[string, bool]()
+  for key, value in node:
+    case key
+    of "confirm_last_leg":
+      if value.kind != JBool:
+        await respondJson(request, Http400,
+          adminBadBody("confirm_last_leg must be true or false"))
+        return
+      confirmLast = value.getBool()
+    of "legs":
+      if value.kind != JObject:
+        await respondJson(request, Http400, adminBadBody("legs must be an object"))
+        return
+      for name, flag in value:
+        if flag.kind != JBool:
+          await respondJson(request, Http400,
+            adminBadBody("legs." & name & " must be true or false"))
+          return
+        legs[name] = flag.getBool()
+    of "models":
+      if value.kind != JObject:
+        await respondJson(request, Http400, adminBadBody("models must be an object"))
+        return
+      for name, flag in value:
+        if flag.kind != JBool:
+          await respondJson(request, Http400,
+            adminBadBody("models." & name & " must be true or false"))
+          return
+        models[name] = flag.getBool()
+    else:
+      await respondJson(request, Http400,
+        adminBadBody("overrides." & key & " is not a known key"))
+      return
+
+  # Only names the config knows. A typo is refused here rather than written into a
+  # file the next reload would refuse whole.
+  for name in legs.keys:
+    var known = false
+    for leg in gateway.cfg.legs:
+      if leg.name == name:
+        known = true
+        break
+    if not known:
+      await respondJson(request, Http400,
+        adminBadBody("legs." & name & " names no leg"))
+      return
+  for name in models.keys:
+    var known = false
+    for leg in gateway.cfg.legs:
+      if leg.aliases.hasKey(name):
+        known = true
+        break
+    if not known:
+      await respondJson(request, Http400,
+        adminBadBody("models." & name & " names no model alias"))
+      return
+
+  # The last-leg guard: the file's own `enabled` is the baseline, not the value an
+  # earlier override wrote.
+  var serving = 0
+  for leg in gateway.cfg.legs:
+    let effective =
+      if legs.hasKey(leg.name): legs[leg.name] else: leg.enabledFile
+    if effective:
+      inc serving
+  if serving == 0 and not confirmLast:
+    await respondJson(request, Http409, lastLegBody())
+    return
+
+  if gateway.configPath.len == 0:
+    await respondJson(request, Http500,
+      adminBadBody("this process has no config path to write"))
+    return
+  var raw: string
+  try:
+    raw = readFile(gateway.configPath)
+  except CatchableError:
+    await respondJson(request, Http500,
+      adminBadBody("cannot read the config file back"))
+    return
+  let originalSize = raw.len
+  var originalMtime = fromUnix(0)
+  try:
+    originalMtime = getLastModificationTime(gateway.configPath)
+  except CatchableError:
+    discard
+
+  let stamp = nowStamp()
+  var legPairs: seq[(string, bool)]
+  for name, flag in legs:
+    legPairs.add (name, flag)
+  var modelPairs: seq[(string, bool)]
+  for name, flag in models:
+    modelPairs.add (name, flag)
+  let valueText = "{\"legs\":" & overrideMapText(legPairs) &
+    ",\"models\":" & overrideMapText(modelPairs) &
+    ",\"updated_at\":" & jsonEscape(stamp) & "}"
+  let patched = patchOverridesText(raw, valueText)
+  if patched.len == 0:
+    await respondJson(request, Http500,
+      adminBadBody("the config file has no closing object to patch"))
+    return
+  try:
+    discard loadConfigText(patched, gateway.configPath)
+  except ConfigError:
+    await respondJson(request, Http500,
+      adminBadBody("the patched config did not validate; nothing was written"))
+    return
+  # An external hand edit or an OAuth refresh between the read and the write is a
+  # conflict, not a file to clobber.
+  var currentMtime = fromUnix(0)
+  try:
+    currentMtime = getLastModificationTime(gateway.configPath)
+  except CatchableError:
+    discard
+  var sizeChanged = true
+  try:
+    sizeChanged = getFileSize(gateway.configPath) != originalSize.int64
+  except CatchableError:
+    discard
+  if currentMtime != originalMtime or sizeChanged:
+    await respondJson(request, Http409,
+      "{\"error\":{\"type\":\"config_changed\",\"message\":\"the config changed while the write was prepared; retry\"}}")
+    return
+
+  # One generation of backup beside the original, same 0600 mode, then the same
+  # temp-and-rename the OAuth write-back already uses.
+  if not writeFileAtomic(gateway.configPath & ".bak", raw):
+    await respondJson(request, Http500,
+      adminBadBody("cannot write the config backup"))
+    return
+  if not writeFileAtomic(gateway.configPath, patched):
+    await respondJson(request, Http500,
+      adminBadBody("cannot write the config file"))
+    return
+
+  # Apply now without touching the leg list: `enabled` is a field future requests
+  # read, and nothing holds an index across this block. The reload is requested as
+  # well, so the in-memory config and the file converge at the next quiet moment.
+  gateway.cfg.overridesLegs = legs
+  gateway.cfg.overridesModels = models
+  gateway.cfg.overridesUpdatedAt = stamp
+  for index in 0 ..< gateway.cfg.legs.len:
+    let name = gateway.cfg.legs[index].name
+    gateway.cfg.legs[index].enabled =
+      if legs.hasKey(name): legs[name] else: gateway.cfg.legs[index].enabledFile
+  inc gateway.adminWrites
+  gateway.lastAdminWriteAt = stamp
+  gateway.lastAdminWriteAction = "overrides"
+  reloadRequested = true
+  stderr.writeLine("kori: admin overrides written, " & $legs.len &
+                   " leg(s), " & $models.len & " model(s)")
+
+  var root = newJObject()
+  root["written"] = %true
+  root["applied"] = %true
+  root["reload_requested"] = %true
+  root["updated_at"] = %stamp
+  var legNode = newJObject()
+  for name, flag in legs:
+    legNode[name] = %flag
+  var modelNode = newJObject()
+  for name, flag in models:
+    modelNode[name] = %flag
+  var overrides = newJObject()
+  overrides["legs"] = legNode
+  overrides["models"] = modelNode
+  root["overrides"] = overrides
+  await respondJson(request, Http200, $root)
+
+
 proc handleSessionLogin(gateway: Gateway,
                         request: Request): Future[void] {.async.} =
   ## DEC-20 §6 and §8, as narrowed by DEC-21: the window throttles a *failed*
@@ -4657,7 +5177,8 @@ proc handleSessionLogin(gateway: Gateway,
     await respondMethodNotAllowed(request, allow = "POST")
     return
   let token = readAdminToken()
-  if token.isNone:
+  let writeToken = readAdminWriteToken()
+  if token.isNone and writeToken.isNone:
     await respondGateMissing(request)
     return
   let now = epochTime()
@@ -4673,14 +5194,29 @@ proc handleSessionLogin(gateway: Gateway,
       # A body that is not this shape is a failed login, not a 400: the gate has
       # one answer for "no valid token" and this is one of the ways to have none.
       discard
-  if supplied.len > 0 and constantTimeEquals(token.get, supplied):
-    let sessionId = startSession(gateway)
+  # DEC-27: the write token logs in with write scope; the read token keeps the
+  # thirty-day session it always had. When an operator sets both files to the same
+  # value, the write scope wins, because that is the credential they configured for
+  # writing and the shorter session is the safe reading of an ambiguous setup.
+  var scope = asRead
+  var matchedToken = ""
+  if supplied.len > 0 and writeToken.isSome and
+     constantTimeEquals(writeToken.get, supplied):
+    scope = asWrite
+    matchedToken = writeToken.get
+  elif supplied.len > 0 and token.isSome and
+       constantTimeEquals(token.get, supplied):
+    scope = asRead
+    matchedToken = token.get
+  if matchedToken.len > 0:
+    let sessionId = startSession(gateway, scope, hash(matchedToken))
     if sessionId.isNone:
       await respondJson(request, Http500,
         "{\"error\":{\"type\":\"session_unavailable\",\"message\":\"no session could be created\"}}")
       return
     var headers = newHttpHeaders()
-    headers["Set-Cookie"] = sessionCookie(sessionId.get, int(AdminSessionTtlS))
+    let ttl = if scope == asWrite: AdminWriteSessionTtlS else: AdminSessionTtlS
+    headers["Set-Cookie"] = sessionCookie(sessionId.get, int(ttl))
     headers["Cache-Control"] = "no-store"
     await request.respond(Http204, "", headers)
     return
@@ -4792,6 +5328,13 @@ proc routeRequest(gateway: Gateway, request: Request): Future[void] {.async.} =
         # A HEAD gets the same headers and no body, like every other read surface.
         let payload = if request.reqMethod == HttpHead: "" else: body
         await request.client.send(buildHead(200, headers) & payload)
+  elif path == "/admin/overrides":
+    # DEC-27. The one write on the admin surface. Its own gate, its own method,
+    # and a 405 that names PUT for everything else.
+    if request.reqMethod != HttpPut:
+      await respondMethodNotAllowed(request, allow = "PUT")
+    else:
+      await gateway.handleAdminOverrides(request)
   elif path.startsWith("/admin/"):
     # D11 point 4: any method but GET or HEAD under /admin/ is a 405 that names
     # GET, with no upstream dial and no state change. An unknown path under
@@ -4852,7 +5395,6 @@ proc dispatch*(gateway: Gateway, request: Request): Future[void] {.async.} =
 # ----------------------------------------------------------------- shutdown ---
 
 var stopSignalNumber {.volatile.}: cint = 0
-var reloadRequested {.volatile.}: bool = false
 
 proc onStopSignal(signalNumber: cint) {.noconv.} =
   ## Signal context: one store, no allocation, no lock, no logging.
