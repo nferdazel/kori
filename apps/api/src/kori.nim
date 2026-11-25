@@ -4072,16 +4072,20 @@ proc badRequestBody(parameter: string): string =
 
 proc redactUrl*(value: string): string =
   ## §5.4: a base URL is printed in full only when it carries no credential.
-  ## `user:pass@host` is one: the authority before the first `/` after the scheme
-  ## is stripped when it holds an `@`, and the query/fragment rules follow.
+  ## `user:pass@host` is one: the authority (up to the first `/`, `?` or `#`)
+  ## is stripped at its last `@`, and the query/fragment rules follow. The last
+  ## `@` matters because a password may itself contain one, and the `?`/`#`
+  ## bounds matter because an `@` past them is path or query data, not userinfo.
   var url = value
   let schemeAt = url.find("://")
   let authStart = if schemeAt >= 0: schemeAt + 3 else: 0
-  var authEnd = url.find('/', authStart)
-  if authEnd < 0:
-    authEnd = url.len
-  let at = url.find('@', authStart)
-  if at >= 0 and at < authEnd:
+  var authEnd = url.len
+  for stop in ['/', '?', '#']:
+    let hit = url.find(stop, authStart)
+    if hit >= 0 and hit < authEnd:
+      authEnd = hit
+  let at = url.rfind('@', authStart, authEnd - 1)
+  if at >= 0:
     let tail = if at + 1 < url.len: url[at + 1 .. ^1] else: ""
     url = url[0 ..< authStart] & tail
   let query = url.find('?')

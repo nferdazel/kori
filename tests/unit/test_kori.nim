@@ -651,6 +651,12 @@ block:
     redactUrl("https://h.test/v1/a@b") == "https://h.test/v1/a@b"
   check "an '@' in the query is not userinfo",
     redactUrl("https://h.test/v1?user=a@b") == "https://h.test/v1?user=a@b"
+  check "an '@' in a query with no path is not userinfo",
+    redactUrl("https://h.test?user=a@b") == "https://h.test?user=a@b"
+  check "a password carrying an '@' keeps only the last one out",
+    redactUrl("https://user:p@ss@h.test/v1") == "https://h.test/v1"
+  check "the credential never survives even with an '@' in the password",
+    not redactUrl("https://user:p@ss@h.test/v1").contains("p@ss")
 
 block:
   # §5.4 at the surface that prints it: /admin/config never carries the credential
