@@ -36,6 +36,11 @@
 #     stop that ever reaches a kill is the bug the drain exists to prevent.
 
 [Unit]
+# No Wants=/After=qouver-postgres.service on purpose, and it is a decision, not an omission:
+# kori has no database at all (no DB_/PG* variable in the env file, no pg/libpq in kori.nimble,
+# no DB call in apps/api). Boot evidence 2026-11-26 18:17: kori logged "listening on 0.0.0.0:8787"
+# at 18:17:35, ahead of qouver-postgres at 18:17:39, with zero DB warning or retry, and served
+# traffic on that boot. Ordering against a service it never contacts would be decoration.
 OnFailure=alert@%N.service
 Description=kori — in-house LLM gateway (Nim)
 After=network-online.target
