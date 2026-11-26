@@ -11,6 +11,31 @@ this one, is the answer to "what is live".
 
 ## [Unreleased]
 
+### Fixed
+
+- `redactUrl` now redacts after the scheme prefix whenever the value carries an `@` anywhere, so the
+  three shapes that printed a credential as the authority at 0.10.6
+  (`http://user:8443/rest@SECRET7/v1`, `https://host/user:pw@h2/v1`, `https://////user:pw@h.test`)
+  read `scheme://<redacted>` (F1c). One rule instead of the six shape heuristics that were each wrong
+  in a new shape, because a credential is itself shaped like a host. Cost, declared and intentional:
+  a clean URL with a literal `@` in its path or query (`https://h.test/v1/a@b`) redacts too. Dialing
+  is unaffected; `parseUri` still reads exactly the configured value. Pinned in
+  `tests/unit/test_kori.nim`.
+
+- The dash site answers `404` on `/healthz` for every query and trailing slash, so the anonymous body
+  no longer prints the running version and revision after a deploy re-renders the edge
+  (`ops/caddy/Caddyfile.kori.example`). The ai site keeps its `401` without a bearer.
+
+### Changed
+
+- The `image-api` job exports its GitHub Actions cache with `mode=min` instead of `mode=max`: the
+  2026-11-26 export was cancelled after ten minutes and skipped cosign, which left the image
+  unsigned for 42 minutes. F2-5 (tags written before the signature) is untouched by this change.
+
+- `ops/systemd/kori-api.container` states in `[Unit]` why it declares no
+  `After=qouver-postgres.service`: kori has no database, and on the 2026-11-26 18:17 boot it listened
+  on `:8787` four seconds before Postgres was ready, with no DB line in its journal.
+
 ## [0.10.6] - 2026-11-26
 
 ### Added
@@ -56,16 +81,17 @@ this one, is the answer to "what is live".
   Cost, declared: a URL that carries a credential no longer shows which host it points at, and a
   query or a fragment beside such an authority is not printed either. A `base_url` with no `@` is
   untouched, including its host, port and path (`https://api.commandcode.ai/provider/v1`,
-  `http://127.0.0.1:8090/v1`), and a query that names a key is still dropped. F1c closed on
-  2026-11-26 with one rule instead of a shape heuristic: any `@` anywhere in the value redacts after
-  the scheme prefix, so the three shapes that used to print now read `scheme://<redacted>` too.
+  `http://127.0.0.1:8090/v1`), and a query that names a key is still dropped. An `@` in the path or
+  query of an otherwise clean authority stays, because no credential can put it there.
+  Still open, tracked as F1c: the rule fires on an `@` inside the authority, and three shapes keep
+  their `@` outside it or have no authority at all. They print unchanged:
   `http://user:8443/rest@SECRET7/v1` (a password whose digit run fills the port slot),
   `https://host/user:pw@h2/v1` (userinfo after a path) and `https://////user:pw@h.test` (an empty
-  authority) are pinned in `tests/unit/test_kori.nim`. The six shape rules that came before it were
-  each wrong in a new shape, because a credential is itself shaped like a host. The cost is now the
-  other way round and it is intentional: a clean URL with a literal `@` in its path or query
-  (`https://h.test/v1/a@b`) redacts too. Dialing is unaffected; `parseUri` still reads exactly the
-  configured value.
+  authority). Each is indistinguishable from a real port, a real path and a real empty authority.
+  `parseUri` reads `user` or `host` as the host in the first two, so `dial()` connects there instead
+  of the host written in the string: the credential does not reach the leg it names, but it is not
+  hidden either. The empty-authority shape parses to no host at all, so nothing is dialled from it.
+  All three print at 0.10.4 as well. Needs its own ticket.
 
 - A write token now works as a bearer on the read GETs (`/admin/state`, `/admin/config`,
   `/admin/log`) (DEC-27, amended). It could already read through a write session; the bearer form
