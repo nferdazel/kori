@@ -343,6 +343,13 @@ function percentile(sorted: number[], p: number): number | null {
   return sorted[rank - 1];
 }
 
+// The table exists to compare buckets against each other, and `secs` rounds 31 ms to "0.0s",
+// which hides the difference it is being read for. Below a second the cell keeps its milliseconds.
+function latencyValue(ms: number): string {
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  return (ms / 1000).toFixed(ms >= 10000 ? 0 : 1) + "s";
+}
+
 function latencyCell(label: string, ms: number | null): HTMLTableCellElement {
   const td = el("td", "num");
   td.dataset.label = label;
@@ -350,7 +357,7 @@ function latencyCell(label: string, ms: number | null): HTMLTableCellElement {
     td.textContent = "-";
     return td;
   }
-  td.textContent = secs(ms);
+  td.textContent = latencyValue(ms);
   // The header is a column away from the number, so the cell states what it measured.
   td.setAttribute("aria-label", `${label} ${ms} milliseconds`);
   return td;
