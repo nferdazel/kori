@@ -342,6 +342,16 @@ function render(config: AdminConfig): void {
             : "off \u00B7 strict config order",
         ],
       ];
+      // DEC-28: the second door has its own opt-in, and it defaults off. An older binary does not
+      // emit the key at all, so the row appears only when the answer says what the value is.
+      if (typeof config.systemone_balance === "boolean") {
+        rows.push([
+          "systemone_balance",
+          config.systemone_balance
+            ? "on \u00B7 smooth weighted round-robin over the System One legs (DEC-28)"
+            : "off \u00B7 strict config order (DEC-19)",
+        ]);
+      }
       panel.appendChild(kvList(rows));
     }),
   );
@@ -428,6 +438,38 @@ function render(config: AdminConfig): void {
   });
   legs.classList.add("wide");
   root.appendChild(legs);
+
+  // DEC-19/DEC-28: the second door, in its own block right after the chat legs so the two leg lists
+  // sit together and neither looks like part of the other's failover chain. Read-only on purpose:
+  // the dashboard's one write is the chat-leg override block, and System One has no override yet.
+  if (config.systemone && config.systemone.length > 0) {
+    const systemone = cfgBlock(
+      "System One",
+      "config order \u00B7 only used when systemone_balance is on",
+      (panel) => {
+        config.systemone?.forEach((leg) => {
+          const row = el("div", "legrow");
+          row.appendChild(el("span", "ord", String(leg.order)));
+          row.appendChild(el("span", "nm", leg.name));
+          row.appendChild(el("span", "role", leg.enabled ? "enabled" : "disabled"));
+          row.appendChild(el("span", "wt", "weight " + leg.weight));
+          const rest = el("span", "rest");
+          rest.appendChild(el("b", undefined, leg.base_url));
+          rest.appendChild(document.createTextNode(" \u00B7 " + (leg.model || "- (the caller's model is forwarded)")));
+          rest.appendChild(
+            document.createTextNode(" \u00B7 " + (leg.headers.length ? leg.headers.join(", ") + ": set" : "no extra headers")),
+          );
+          const cr = credentialText(leg.credential);
+          rest.appendChild(document.createTextNode(" \u00B7 key "));
+          rest.appendChild(el("span", cr.cls === "dead" ? "dead-text" : undefined, cr.text));
+          row.appendChild(rest);
+          panel.appendChild(row);
+        });
+      },
+    );
+    systemone.classList.add("wide");
+    root.appendChild(systemone);
+  }
 
   const aliasIds = new Map<string, string[]>();
   for (const leg of config.legs) {
