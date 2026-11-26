@@ -4073,43 +4073,24 @@ proc badRequestBody(parameter: string): string =
 proc redactUrl*(value: string): string =
   ## §5.4: a `base_url` that carries a credential prints neither the credential
   ## nor the host beside it; the answer is `scheme://<redacted>` when it carries
-  ## either. Two shapes carry one:
-  ##
-  ## * an `@` inside the authority (`[^/?#]*` after the scheme) is userinfo;
-  ## * an `@` past a separator whose authority ends in a colon that is not an
-  ##   all-digit port is a password that a `/`, `?` or `#` pushed out of the
-  ##   authority (`user:pa/ss@host`, `user:pw#x@token`).
-  ##
-  ## The host is not salvaged in either case. Salvaging was tried across six
-  ## findings (F1c, F1f, F1g, F1h, F1i, F1j) and each rule that judged the
-  ## survivor taught the next one, because a credential is itself shaped like a
-  ## host (a JWT, `sk.live.…`, any `vendor.env.key`). An `@` in a path or query
-  ## of an otherwise clean authority cannot be userinfo and stays. Dialing is
-  ## unaffected: `parseUri` still reads the configured value; only this print is
-  ## decided.
+  ## one. Any `@` anywhere in the value counts: inside the authority it is
+  ## userinfo, and outside it may be a password that a `/`, `?` or `#` pushed out
+  ## of the authority (`user:pa/ss@host`, `user:pw#x@token`) or a userinfo-style
+  ## tail after a path (`host/user:pw@h2`). Six shape rules were tried across
+  ## F1c, F1f, F1g, F1h, F1i and F1j and each one was wrong in a new shape,
+  ## because a credential is itself shaped like a host (a JWT, `sk.live.…`, any
+  ## `vendor.env.key`). The `@` alone is the tell; a value without one cannot
+  ## carry userinfo. The host is never salvaged. Cost, declared: a clean URL with
+  ## a literal `@` in its path or query also redacts. Dialing is unaffected:
+  ## `parseUri` still reads the configured value; only this print is decided.
   let schemeAt = value.find("://")
   let authStart =
     if schemeAt >= 0: schemeAt + 3
     elif value.startsWith("//"): 2
     else: 0
-  var sep = value.len
-  for stop in ['/', '?', '#']:
-    let hit = value.find(stop, authStart)
-    if hit >= 0 and hit < sep:
-      sep = hit
-  let span = if authStart < sep: value[authStart ..< sep] else: ""
-  var credential = span.contains('@')
-  if not credential and span.len > 0 and span[0] != '[' and
-     value.find('@', sep) >= 0:
-    let colon = span.rfind(':')
-    if colon >= 0:
-      let after = span[colon + 1 .. ^1]
-      var allDigits = after.len > 0
-      for ch in after:
-        if not isDigit(ch):
-          allDigits = false
-          break
-      credential = not allDigits
+  # F1c closed 2026-11-26: one rule instead of a shape heuristic. Over-redaction
+  # is the safe direction, and the alternative printed a credential six times.
+  let credential = value.contains('@')
   if credential:
     return value[0 ..< authStart] & "<redacted>"
   let query = value.find('?')

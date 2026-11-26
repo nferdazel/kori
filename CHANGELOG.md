@@ -11,6 +11,43 @@ this one, is the answer to "what is live".
 
 ## [Unreleased]
 
+## [0.10.7] - 2026-11-26
+
+### Fixed
+
+- `redactUrl` now redacts after the scheme prefix whenever the value carries an `@` anywhere, so the
+  three shapes that printed a credential as the authority at 0.10.6
+  (`http://user:8443/rest@SECRET7/v1`, `https://host/user:pw@h2/v1`, `https://////user:pw@h.test`)
+  read `scheme://<redacted>` (F1c). One rule instead of the six shape heuristics that were each wrong
+  in a new shape, because a credential is itself shaped like a host. Cost, declared and intentional:
+  a clean URL with a literal `@` in its path or query (`https://h.test/v1/a@b`) redacts too. Dialing
+  is unaffected; `parseUri` still reads exactly the configured value. Pinned in
+  `tests/unit/test_kori.nim`.
+
+- The dash site answers `404` on `/healthz` for every query and trailing slash, so the anonymous body
+  no longer prints the running version and revision after a deploy re-renders the edge
+  (`ops/caddy/Caddyfile.kori.example`). The ai site keeps its `401` without a bearer.
+
+### Changed
+
+- The `image-api` job exports its GitHub Actions cache with `mode=min` instead of `mode=max`: the
+  2026-11-26 export was cancelled after ten minutes and skipped cosign, which left the image
+  unsigned for 42 minutes.
+
+- The `image-api` job pushes the image by digest with no tags, signs that digest, then creates
+  `:sha-<sha7>` and `:main` from the signed digest and verifies both (F2-5). A tag can no longer
+  exist before the signature does, so the 42-minute unsigned window of 2026-11-26 cannot repeat.
+  `mode=min` and this change ship together; the tags are created after `cosign sign`, not before.
+
+- The Config page's System One block says what the flag actually does: the note now reads
+  `weight used when systemone_balance is on` instead of implying the legs are unused while the flag
+  is off, and a leg marked `disabled` renders in the dead colour instead of the same grey as an
+  enabled one.
+
+- `ops/systemd/kori-api.container` states in `[Unit]` why it declares no
+  `After=qouver-postgres.service`: kori has no database, and on the 2026-11-26 18:17 boot it listened
+  on `:8787` four seconds before Postgres was ready, with no DB line in its journal.
+
 ## [0.10.6] - 2026-11-26
 
 ### Added
