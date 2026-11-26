@@ -11,15 +11,6 @@ this one, is the answer to "what is live".
 
 ## [Unreleased]
 
-### Fixed
-
-- The Overview's latency table printed every percentile under a second as `0.0s`, because it shared
-  the page's `secs()` formatter. The table exists to compare prompt-size buckets, and on a 60-row
-  local sample every one of the five buckets showed `0.0s` while the same file queried directly gave
-  p50 62, 61, 62, 66 and 62 ms. A value below a second now prints in milliseconds; a second and above
-  is unchanged. The cell's `aria-label` already carried the exact milliseconds, so the accessible
-  value was correct and only the visible text was not.
-
 ## [0.10.6] - 2026-11-26
 
 ### Added
@@ -46,6 +37,13 @@ this one, is the answer to "what is live".
   focus order stay as they were.
 
 ### Fixed
+
+- The Overview's latency table printed every percentile under a second as `0.0s`, because it shared
+  the page's `secs()` formatter. The table exists to compare prompt-size buckets, and on a 60-row
+  local sample every one of the five buckets showed `0.0s` while the same file queried directly gave
+  p50 62, 61, 62, 66 and 62 ms. A value below a second now prints in milliseconds; a second and above
+  is unchanged. The cell's `aria-label` already carried the exact milliseconds, so the accessible
+  value was correct and only the visible text was not.
 
 - `redactUrl` strips `user:pass@` from the authority, so a `base_url` configured with a credential is
   printed as `https://host/…` in `/admin/config` instead of in full. When the authority itself is
