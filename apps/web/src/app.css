@@ -898,6 +898,7 @@ tr.detail-row .sep { display: none; }
   color: var(--ink-2);
 }
 .legrow .role.primary { color: var(--ink); }
+.legrow .role.dead-text { color: var(--dead); }
 .legrow .wt { color: var(--ink-2); }
 .legrow .rest { color: var(--ink-2); overflow-wrap: anywhere; white-space: normal; }
 .legrow .rest b { color: var(--ink); font-weight: 400; }

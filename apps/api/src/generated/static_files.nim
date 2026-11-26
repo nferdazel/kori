@@ -9,10 +9,10 @@ type StaticFile* = object
 type StaticEntry* = tuple[path: string, contentType: string, body: string]
 
 const staticEntries* = [
-  (path: "/assets/dom-CyOwnlRu.css", contentType: "text/css; charset=utf-8", body: staticRead("../../../web/dist/assets/dom-CyOwnlRu.css")),
-  (path: "/assets/dom-Dv8Nv8us.js", contentType: "text/javascript; charset=utf-8", body: staticRead("../../../web/dist/assets/dom-Dv8Nv8us.js")),
-  (path: "/assets/login-BTyVOKMI.js", contentType: "text/javascript; charset=utf-8", body: staticRead("../../../web/dist/assets/login-BTyVOKMI.js")),
-  (path: "/assets/main-B7Kq3aFO.js", contentType: "text/javascript; charset=utf-8", body: staticRead("../../../web/dist/assets/main-B7Kq3aFO.js")),
+  (path: "/assets/dom-Bq0qv1u2.css", contentType: "text/css; charset=utf-8", body: staticRead("../../../web/dist/assets/dom-Bq0qv1u2.css")),
+  (path: "/assets/dom-DSIc3Ver.js", contentType: "text/javascript; charset=utf-8", body: staticRead("../../../web/dist/assets/dom-DSIc3Ver.js")),
+  (path: "/assets/login-CCWoER64.js", contentType: "text/javascript; charset=utf-8", body: staticRead("../../../web/dist/assets/login-CCWoER64.js")),
+  (path: "/assets/main-CC3NsWkp.js", contentType: "text/javascript; charset=utf-8", body: staticRead("../../../web/dist/assets/main-CC3NsWkp.js")),
   (path: "/config.html", contentType: "text/html; charset=utf-8", body: staticRead("../../../web/dist/config.html")),
   (path: "/favicon.svg", contentType: "image/svg+xml", body: staticRead("../../../web/dist/favicon.svg")),
   (path: "/fonts/inter-latin-var.woff2", contentType: "font/woff2", body: staticRead("../../../web/dist/fonts/inter-latin-var.woff2")),

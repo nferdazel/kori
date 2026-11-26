@@ -120,6 +120,19 @@ export interface ConfigLeg {
   credential: Credential;
 }
 
+// DEC-19/DEC-28: the second door's own ordered legs. Reported beside the chat legs, never inside
+// them, because a System One leg is not part of that failover walk.
+export interface ConfigSystemoneLeg {
+  order: number;
+  name: string;
+  base_url: string;
+  model: string | null;
+  weight: number;
+  enabled: boolean;
+  headers: string[];
+  credential: Credential;
+}
+
 export interface ConfigOverrides {
   legs: Record<string, boolean>;
   models: Record<string, boolean>;
@@ -139,6 +152,11 @@ export interface AdminConfig {
   started_at: string;
   config: { path: string; modified_at: string | null };
   balance: boolean;
+  // DEC-28: emitted by every binary from this release on; absent on an older one, which never
+  // rendered a System One block anyway.
+  systemone_balance?: boolean;
+  // DEC-19: present only when the config carries a System One block.
+  systemone?: ConfigSystemoneLeg[];
   legs: ConfigLeg[];
   timeouts: {
     connect_ms: number;
