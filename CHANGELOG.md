@@ -30,7 +30,17 @@ this one, is the answer to "what is live".
 
 - The `image-api` job exports its GitHub Actions cache with `mode=min` instead of `mode=max`: the
   2026-11-26 export was cancelled after ten minutes and skipped cosign, which left the image
-  unsigned for 42 minutes. F2-5 (tags written before the signature) is untouched by this change.
+  unsigned for 42 minutes.
+
+- The `image-api` job pushes the image by digest with no tags, signs that digest, then creates
+  `:sha-<sha7>` and `:main` from the signed digest and verifies both (F2-5). A tag can no longer
+  exist before the signature does, so the 42-minute unsigned window of 2026-11-26 cannot repeat.
+  `mode=min` and this change ship together; the tags are created after `cosign sign`, not before.
+
+- The Config page's System One block says what the flag actually does: the note now reads
+  `weight used when systemone_balance is on` instead of implying the legs are unused while the flag
+  is off, and a leg marked `disabled` renders in the dead colour instead of the same grey as an
+  enabled one.
 
 - `ops/systemd/kori-api.container` states in `[Unit]` why it declares no
   `After=qouver-postgres.service`: kori has no database, and on the 2026-11-26 18:17 boot it listened
