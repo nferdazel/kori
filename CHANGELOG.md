@@ -11,6 +11,115 @@ this one, is the answer to "what is live".
 
 ## [Unreleased]
 
+## [0.10.6] - 2026-11-26
+
+### Added
+
+- `systemone_balance: true` (new, default `false`) gives the System One door the chat door's weighted
+  pick: the first `systemone.legs` pick is smooth weighted round-robin over the eligible legs, and the
+  rest of the walk stays config order for failover (DEC-28). `systemone.legs[].weight` (1-1000,
+  default 1) is the share, published in `/admin/config` beside the flag. `systemone_balance: false`
+  leaves the System One walk exactly as DEC-19 wrote it and the weight inert, even when the chat
+  door's `balance` is on.
+
+- `./task phase2 <requests.jsonl>`: the phase 2 measurement. Per prompt-size bucket (`<=32`, `33-128`,
+  `129-512`, `>512` KiB) it prints n and the p50/p90/p99 of `prompt_kib` and `header_ms`, nearest
+  rank, plus how many lines it skipped for lacking the two fields and the share of requests whose
+  first leg hit its header deadline (`failover_reason: header_timeout`). No production log carries
+  them until 0.10.5 is deployed, so it reads a file and stays out of `check`;
+  `tests/dryrun-phase2.sh` proves the arithmetic on a fixed sample.
+
+### Changed
+
+- The Config page's provider and model-alias checkboxes now carry accessible names that say what
+  they control (`opencode-go provider`, `deep model alias`), with the role and state moved into
+  `aria-describedby`. No layout or behaviour change: the 360 px and 1280 px passes and the keyboard
+  focus order stay as they were.
+
+### Fixed
+
+- The Overview's latency table printed every percentile under a second as `0.0s`, because it shared
+  the page's `secs()` formatter. The table exists to compare prompt-size buckets, and on a 60-row
+  local sample every one of the five buckets showed `0.0s` while the same file queried directly gave
+  p50 62, 61, 62, 66 and 62 ms. A value below a second now prints in milliseconds; a second and above
+  is unchanged. The cell's `aria-label` already carried the exact milliseconds, so the accessible
+  value was correct and only the visible text was not.
+
+- `redactUrl` no longer tries to keep the host of a `base_url` that carries a credential. When the
+  authority holds an `@`, or ends in a colon whose tail is not an all-digit port while an `@` sits
+  past the next separator, `/admin/config` prints `scheme://<redacted>` and nothing else from that
+  URL. The credential was already hidden; the host used to be kept beside it, and keeping it is what
+  printed a token as the authority six times in a row (F1c, F1f, F1g, F1h, F1i, F1j): every rule that
+  judged the survivor by shape accepted a dotted credential (a JWT, an `sk.live.…` key) as a host,
+  because a credential is shaped like a host. The rule now reads only the authority and never what
+  survives it, so there is no survivor to judge.
+  Cost, declared: a URL that carries a credential no longer shows which host it points at, and a
+  query or a fragment beside such an authority is not printed either. A `base_url` with no `@` is
+  untouched, including its host, port and path (`https://api.commandcode.ai/provider/v1`,
+  `http://127.0.0.1:8090/v1`), and a query that names a key is still dropped. An `@` in the path or
+  query of an otherwise clean authority stays, because no credential can put it there.
+  Still open, tracked as F1c: the rule fires on an `@` inside the authority, and three shapes keep
+  their `@` outside it or have no authority at all. They print unchanged:
+  `http://user:8443/rest@SECRET7/v1` (a password whose digit run fills the port slot),
+  `https://host/user:pw@h2/v1` (userinfo after a path) and `https://////user:pw@h.test` (an empty
+  authority). Each is indistinguishable from a real port, a real path and a real empty authority.
+  `parseUri` reads `user` or `host` as the host in the first two, so `dial()` connects there instead
+  of the host written in the string: the credential does not reach the leg it names, but it is not
+  hidden either. The empty-authority shape parses to no host at all, so nothing is dialled from it.
+  All three print at 0.10.4 as well. Needs its own ticket.
+
+- A write token now works as a bearer on the read GETs (`/admin/state`, `/admin/config`,
+  `/admin/log`) (DEC-27, amended). It could already read through a write session; the bearer form
+  answered `401`. The read token stays read-only, and a bearer of neither token is still `401`.
+
+## [0.10.5] - 2026-11-25
+
+### Added
+
+- `prompt_kib` and `header_ms` on the request log line (DEC-26), both optional and last, so an older
+  line still parses and a reader that knows only the nine keys sees the same row. `prompt_kib` is the
+  prompt body in KiB; `header_ms` is body-sent to first response byte, recorded only on the leg that
+  answered. `A23` and the two new log keys are proved end to end.
+
+- The four header-deadline numbers are config, not compiled constants: `timeouts.header_ms_stream_base`,
+  `header_ms_stream_slope_per_kib`, `header_ms_stream_max` and `header_ms_non_stream`, with the
+  current numbers as defaults, validated at load and published under `timeouts` in `/admin/config`
+  (DEC-26). A config that names nothing behaves exactly as before.
+
+- `PUT /admin/overrides` (DEC-27): the dashboard's only write. Two switch maps and one confirm flag,
+  patched into `config.json` by text so no credential byte is re-serialised, validated by the boot
+  loader, written `.bak`-first at 0600, and applied in memory at once with a reload requested. Its own
+  token file (`KORI_ADMIN_WRITE_TOKEN_FILE`); a missing file answers 404, the read token answers 403,
+  a write session lives 12 h and must carry `X-Kori-Write: 1`; switching the last serving provider off
+  is 409 without `confirm_last_leg`; a size or mtime change between read and write is 409.
+  `/admin/config` reports `enabled`, `serving` and `override` per leg, `overrides`, and
+  `admin_writes`.
+
+- The Overview's latency-by-prompt-size table (p50/p90/p99 over `<32`, `32-64`, `64-128`, `128-256`,
+  `>=256` KiB, nearest rank, sample size in the caption) and a prompt-size filter on Requests. The
+  config page gains one switch per leg and one per model alias, a `no provider is serving` banner, the
+  router's own `skipped`/`cooling`/`serving` word from `/admin/state`, and a modal confirm for the
+  last leg.
+
+### Changed
+
+- When no leg can serve, the answer is `503 all_legs_cooling` with `Retry-After` equal to the body's
+  `retry_after_s` instead of a `502` labelled with a leg that was never dialled; zero enabled legs
+  answers `503 no_leg_enabled` (DEC-26). A request that dialled and failed keeps its `502`.
+- A gateway with one enabled leg caps a header-timeout rung at 15 s instead of 60 s.
+- A quota `429` that names `Retry-After` is believed, clamped to 60–900 s. A `429` that is not a quota
+  is `rate_limited_429` on a 5–120 s clock, fails over, and the last leg's own body and `Retry-After`
+  reach the caller.
+- Verified against the real client before shipping: opencode v2.4.1 retries a `503` exactly as it
+  retries a `502` and honours `Retry-After`, so the all-cooling answer stays `503`. jev is not
+  installed on the build host, so its retry policy stays unverified.
+- The committed `ops/etc/config.json.example` chains `opencode-go-jev` ahead of `commandcode-jev` on
+  the System One door, and takes a fourth value, `KORI_OPENCODE_GO_API_KEY`, in
+  `ops/scripts/kori-config.sh` (DEC-25). No binary behaviour changed: the door already sends each
+  leg its own `model` id. Verified on qouver1 2026-11-25 — `POST /v1/systemone` answered from
+  `https://opencode.ai/inference/go/systemone/v1` in 418 ms and the log line carries
+  `route: opencode-go-jev`, `tokens_in: 299`, `tokens_out: 32`.
+
 ## [0.10.4] - 2026-11-24
 
 ### Changed

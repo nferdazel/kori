@@ -2,7 +2,7 @@
 # grades byte-wise, CLI flag forms and precedence, and config defaults. No socket
 # is opened here; the harness starts the real binary.
 
-import std/[json, options, os, posix, sequtils, strutils, tables, times]
+import std/[hashes, json, options, os, posix, sequtils, strutils, tables, times]
 
 import std/asynchttpserver
 
@@ -286,8 +286,8 @@ check "403 is a client error and never fails over", failureToken(403, "") == ""
 check "404 is a client error and never fails over", failureToken(404, "") == ""
 check "429 with a quota body is the capacity class",
   failureToken(429, """{"error":{"type":"GoUsageLimitError"}}""") == "quota_429"
-check "429 without a quota body is a client error (D9.3)",
-  failureToken(429, """{"error":{"message":"Rate limit reached for requests per minute (RPM).","type":"requests"}}""") == ""
+check "429 without a quota body is the rate-limit class (DEC-26)",
+  failureToken(429, """{"error":{"message":"Rate limit reached for requests per minute (RPM).","type":"requests"}}""") == "rate_limited_429"
 check "402 is the billing class, whatever the body says",
   failureToken(402, "") == "billing_402" and
   failureToken(402, """{"error":{"message":"insufficient balance"}}""") == "billing_402"
@@ -638,6 +638,116 @@ block:
       "https://opencode.ai/inference/go/openai/v1"
   check "redactUrl drops a query that carries a key",
     redactUrl("https://example.test/v1?api_key=abc") == "https://example.test/v1"
+  # §5.4: a credential hides the whole authority, not just the credential. The
+  # host is the thing every earlier rule tried to save, and saving it is what
+  # printed a dotted token as the authority six times (F1c, F1f, F1g, F1h, F1i,
+  # F1j): a credential is itself shaped like a host.
+  check "a credential in the authority hides the host with it",
+    redactUrl("https://user:s3cret@api.example.test/v1") == "https://<redacted>"
+  check "the redacted URL carries no character of the password",
+    not redactUrl("https://user:s3cret@api.example.test/v1").contains("s3cret")
+  check "nor any character of the host beside it",
+    not redactUrl("https://user:s3cret@api.example.test/v1").contains("api.example.test")
+  check "a query is not kept beside a hidden authority",
+    redactUrl("https://user:pw@h.test/v1?mode=fast") == "https://<redacted>"
+  check "a base with no scheme loses its authority too",
+    redactUrl("user:pw@h.test/v1") == "<redacted>"
+  check "a scheme-less '//' base loses its authority",
+    redactUrl("//user:pw@h.test/v1") == "//<redacted>"
+  # An '@' in a path or a query of a clean authority cannot be userinfo: the
+  # authority ended before it. Those stay, so a normal URL is never rewritten.
+  check "an '@' in the path is not userinfo",
+    redactUrl("https://h.test/v1/a@b") == "https://h.test/v1/a@b"
+  check "an '@' in the query is not userinfo",
+    redactUrl("https://h.test/v1?user=a@b") == "https://h.test/v1?user=a@b"
+  check "an '@' in a query with no path is not userinfo",
+    redactUrl("https://h.test?user=a@b") == "https://h.test?user=a@b"
+  check "a port is not mistaken for userinfo",
+    redactUrl("https://h.test:8443/v1/a@b") == "https://h.test:8443/v1/a@b"
+  check "an empty port is not userinfo either",
+    redactUrl("https://h.test:/v1") == "https://h.test:/v1"
+  check "a bracketed IPv6 host is left intact",
+    redactUrl("https://[::1]:8443/v1") == "https://[::1]:8443/v1"
+  check "a local stub base URL is untouched",
+    redactUrl("http://127.0.0.1:8090/v1") == "http://127.0.0.1:8090/v1"
+  # A password carrying an '@' is userinfo all the same.
+  check "a password carrying an '@' hides the authority",
+    redactUrl("https://user:p@ss@h.test/v1") == "https://<redacted>"
+  check "the credential never survives even with an '@' in the password",
+    not redactUrl("https://user:p@ss@h.test/v1").contains("p@ss")
+  # F1/F1b: a separator inside the password ends the authority early, so the
+  # '@' is no longer in it. The colon whose tail is not an all-digit port is the
+  # tell, and the whole authority goes.
+  check "a slash inside the password hides the authority",
+    redactUrl("https://user:pa/ss@h.test/v1") == "https://<redacted>"
+  check "'?' inside the password hides the authority",
+    redactUrl("https://user:pa?ss@h.test/v1") == "https://<redacted>"
+  check "'#' inside the password hides the authority",
+    redactUrl("https://user:pa#ss@h.test/v1") == "https://<redacted>"
+  check "a password starting with a digit is not a port",
+    redactUrl("https://user:1pa/ss@h.test/v1") == "https://<redacted>"
+  check "the split password never survives",
+    not redactUrl("https://user:pa/ss@h.test/v1").contains("pa/ss")
+  # F1c, still open and named in the CHANGELOG: a digit run that fills the port
+  # slot, and userinfo that follows a path, are indistinguishable from a real
+  # port and a real path, so they still print. They are pinned so a future
+  # widening of the rule has to say so out loud. Neither reaches the host named
+  # in the string: `parseUri` reads `user`/`corp` as the host and `dial()`
+  # connects there.
+  check "F1c: a digit run reaching the separator still prints",
+    redactUrl("https://user:8443/rest@h.test/v1") == "https://user:8443/rest@h.test/v1"
+  check "F1c: userinfo after a path still prints",
+    redactUrl("https://corp/user:pw@h.test/v1") == "https://corp/user:pw@h.test/v1"
+  # F1d..F1j, one rule: an empty port or a non-digit port past the cut is a
+  # password, and the token behind it is never a host.
+  check "F1d: an '@' after an empty port hides the authority",
+    redactUrl("https://h.test:/v1?x=a@b&api_key=SECRET7") == "https://<redacted>"
+  check "F1d: a query value is never the authority",
+    not redactUrl("https://h.test:/v1?api_key=@SECRET9").contains("SECRET9")
+  check "F1e: an '@' behind an empty port hides the authority",
+    redactUrl("https://h.test:#x@F1E7") == "https://<redacted>"
+  check "F1e: a path value behind an empty port does not print",
+    redactUrl("https://h.test:/a@SECRET") == "https://<redacted>"
+  check "F1f: a trailing fragment '@' hides the authority",
+    redactUrl("https://h.test:abc#x@SECRET7") == "https://<redacted>"
+  check "F1f: a sign-prefixed port hides it too",
+    redactUrl("http://h.test:+443#x@SECRET7") == "http://<redacted>"
+  check "F1g: a sign-prefixed port after a real one hides it",
+    redactUrl("http://127.0.0.1:8099:+443@SECRET7") == "http://<redacted>"
+  check "F1h: a path behind the fragment '@' hides the authority",
+    redactUrl("https://h.test:abc#x@SECRET7/y") == "https://<redacted>"
+  check "F1h: a query key behind a port that reads as a password hides it",
+    redactUrl("https://h.test:pw/x@SECRET7/y@z") == "https://<redacted>"
+  check "F1i: a scheme-less base hides the token behind its '@'",
+    redactUrl("//user:pw@h.test/v1") == "//<redacted>"
+  # F1j: a dotted credential is still a credential. This is the whole reason the
+  # host is no longer salvaged: "contains a dot" cannot tell a host from a key.
+  check "F1j: a dotted key behind a fragment '@' hides the authority",
+    redactUrl("https://h.test:abc#x@sk.live.SECRET7") == "https://<redacted>"
+  check "F1j: the same behind a sign-prefixed port",
+    redactUrl("https://h.test:+443#x@sk.live.SECRET7") == "https://<redacted>"
+  check "F1j: a JWT behind the fragment 'at' hides the authority",
+    redactUrl("http://h.test:+443#x@eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig") == "http://<redacted>"
+  check "F1j: a dotted key behind well-formed userinfo hides it",
+    redactUrl("https://user:pw@h.test#x@sk.live.SECRET7") == "https://<redacted>"
+  check "the password-split residual no longer prints",
+    redactUrl("https://user:pw#x@sk.live.SECRET7") == "https://<redacted>"
+block:
+  # §5.4 at the surface that prints it: /admin/config never carries the credential
+  # a base URL was configured with.
+  var cfg = Config(listenHost: "127.0.0.1", listenPort: 4011,
+                   logPath: scratch / "redact.jsonl")
+  cfg.legs = @[legSpec("leg-a", lrPrimary)]
+  cfg.legs[0].baseUrl = "https://user:s3cret@api.example.test/v1"
+  cfg.systemone = @[SystemoneLeg(name: "jev", baseUrl: "https://u:pw@x.test/v1",
+                                 model: "m", enabled: true, weight: 1)]
+  let gateway = newGateway(cfg, RequestLog(fd: -1), "127.0.0.1:4011")
+  let printed = gateway.configJson()
+  check "/admin/config prints no part of a base_url credential",
+    not printed.contains("s3cret") and not printed.contains("u:pw@")
+  check "/admin/config prints no part of the authority either",
+    printed.contains("\"base_url\":\"https://<redacted>\"") and
+      not printed.contains("api.example.test") and not printed.contains("x.test")
 
 block:
   check "parseRfc3339 reads a +07:00 offset",
@@ -1195,6 +1305,50 @@ block:
 """))
 
 block:
+  # DEC-28: the System One weight is the chat leg's share, with the same default
+  # and the same refusal of 0.
+  let weighted = loadConfig(writeConfig("systemone-weight.json", """
+{"legs":[{"name":"leg-a","base_url":"http://127.0.0.1:1/v1","api_key":"k"}],
+ "systemone":{"legs":[
+   {"name":"jev","base_url":"https://x.test/v1","api_key":"k","model":"m"},
+   {"name":"jev-heavy","base_url":"https://y.test/v1","api_key":"k","model":"m",
+    "weight":7}]}}
+"""))
+  check "a systemone leg with no weight gets 1, so old configs balance evenly",
+    weighted.systemone[0].weight == 1
+  check "a named weight is kept", weighted.systemone[1].weight == 7
+  check "systemone_balance defaults to false, so DEC-19 stays the default",
+    weighted.systemoneBalance == false
+  let soBalanced = loadConfig(writeConfig("systemone-balanced.json", """
+{"legs":[{"name":"leg-a","base_url":"http://127.0.0.1:1/v1","api_key":"k"}],
+ "systemone_balance":true,
+ "systemone":{"legs":[
+   {"name":"jev","base_url":"https://x.test/v1","api_key":"k","model":"m"}]}}
+"""))
+  check "systemone_balance true is kept", soBalanced.systemoneBalance
+  check "the chat door's balance is still its own default",
+    soBalanced.balance == false
+  checkRaises "a non-boolean systemone_balance is refused", ConfigError:
+    discard loadConfig(writeConfig("systemone-balanced-bad.json", """
+{"legs":[{"name":"leg-a","base_url":"http://127.0.0.1:1/v1","api_key":"k"}],
+ "systemone_balance":"yes",
+ "systemone":{"legs":[
+   {"name":"jev","base_url":"https://x.test/v1","api_key":"k","model":"m"}]}}
+"""))
+  checkRaises "a systemone weight of 0 is refused", ConfigError:
+    discard loadConfig(writeConfig("systemone-weight-zero.json", """
+{"legs":[{"name":"leg-a","base_url":"http://127.0.0.1:1/v1","api_key":"k"}],
+ "systemone":{"legs":[{"name":"jev","base_url":"https://x.test/v1",
+                       "api_key":"k","model":"m","weight":0}]}}
+"""))
+  checkRaises "a systemone weight above the ceiling is refused", ConfigError:
+    discard loadConfig(writeConfig("systemone-weight-max.json", """
+{"legs":[{"name":"leg-a","base_url":"http://127.0.0.1:1/v1","api_key":"k"}],
+ "systemone":{"legs":[{"name":"jev","base_url":"https://x.test/v1",
+                       "api_key":"k","model":"m","weight":1001}]}}
+"""))
+
+block:
   # The one edit this door makes, and the usage shape it reads.
   let caller = """{"state":"who answers?","model":"jev-latest","questions":{}}"""
   check "the model id is replaced and nothing else is",
@@ -1236,6 +1390,78 @@ block:
     parseJson(gateway.configJson()){"systemone"}.len == 3
   check "the config reports the block beside the chat legs",
     parseJson(gateway.configJson()){"legs"}.len == 1
+
+block:
+  # DEC-28: `systemone_balance` is its own opt-in (default false). With it on the
+  # first System One pick is weighted and the rest of the walk stays config order;
+  # with it off the walk is DEC-19 even when the chat door balances. Same SWRR as
+  # DEC-11, so equal weights alternate and a cooling or disabled leg leaves the
+  # pool instead of taking its share to nobody.
+  var cfg = Config(listenHost: "127.0.0.1", listenPort: 4011,
+                   logPath: scratch / "so-balance.jsonl",
+                   balance: true, systemoneBalance: true)
+  cfg.legs = @[legSpec("leg-a", lrPrimary)]
+  cfg.systemone = @[
+    SystemoneLeg(name: "jev-a", baseUrl: "https://a.test/v1", model: "m",
+                 enabled: true, weight: 1),
+    SystemoneLeg(name: "jev-b", baseUrl: "https://b.test/v1", model: "m",
+                 enabled: true, weight: 1)]
+  let gateway = newGateway(cfg, RequestLog(fd: -1), "127.0.0.1:4011")
+  var picks: seq[int]
+  for _ in 0 ..< 4:
+    picks.add gateway.systemoneOrder(epochTime())[0]
+  check "equal weights alternate the System One first pick",
+    picks == @[0, 1, 0, 1]
+  check "the walk after the pick is config order",
+    gateway.systemoneOrder(epochTime()) == @[0, 1]
+  gateway.startSystemoneCooldown(0, TokenAuth401)
+  check "a cooling leg leaves the System One pool",
+    gateway.systemoneOrder(epochTime()) == @[1]
+
+  cfg.systemone[0].weight = 3
+  let heavy = newGateway(cfg, RequestLog(fd: -1), "127.0.0.1:4011")
+  var counts: array[2, int]
+  for _ in 0 ..< 400:
+    inc counts[heavy.systemoneOrder(epochTime())[0]]
+  check "a 3:1 config over 400 requests gives 300:100",
+    counts[0] == 300 and counts[1] == 100
+
+  # A disabled leg is out of the pool and out of the walk, so it cannot be picked
+  # even as the tail that would only be dialled on a failure.
+  cfg.systemone[1].enabled = false
+  let disabled = newGateway(cfg, RequestLog(fd: -1), "127.0.0.1:4011")
+  var disabledPicks: seq[int]
+  for _ in 0 ..< 20:
+    disabledPicks.add disabled.systemoneOrder(epochTime())[0]
+  check "a disabled leg is never picked",
+    disabledPicks.allIt(it == 0) and
+      disabled.systemoneOrder(epochTime()) == @[0]
+
+  # The opt-in is separate from the chat door's `balance`: turning chat balancing
+  # on must not re-order System One traffic underneath the operator.
+  var chatOnly = cfg
+  chatOnly.balance = true
+  chatOnly.systemoneBalance = false
+  chatOnly.systemone[1].enabled = true
+  let unswitched = newGateway(chatOnly, RequestLog(fd: -1), "127.0.0.1:4011")
+  var chatOnlyPicks: seq[int]
+  for _ in 0 ..< 6:
+    chatOnlyPicks.add unswitched.systemoneOrder(epochTime())[0]
+  check "chat balance alone leaves the System One walk in config order",
+    chatOnlyPicks.allIt(it == 0) and
+      unswitched.systemoneOrder(epochTime()) == @[0, 1]
+
+  # /admin/config publishes the flag and the shares, and still no credential.
+  cfg.systemone[0].baseUrl = "https://u:pw@a.test/v1"
+  let printed = parseJson(newGateway(cfg, RequestLog(fd: -1),
+                                     "127.0.0.1:4011").configJson())
+  check "the System One flag is published",
+    printed{"systemone_balance"}.getBool() == true
+  check "each System One leg publishes its weight",
+    printed{"systemone"}[0]{"weight"}.getInt() == 3 and
+      printed{"systemone"}[1]{"weight"}.getInt() == 1
+  check "the published System One base_url carries no credential or host",
+    printed{"systemone"}[0]{"base_url"}.getStr() == "https://<redacted>"
 
 # ------------------------------------------------------------- the admin gate ---
 #
@@ -1350,7 +1576,9 @@ block:
 
   # Expiry is enforced on read: an entry past its deadline is dropped by the next
   # gate call, so a 30 day old cookie cannot survive in a running process.
-  gateway.sessions[second.get] = epochTime() - 1
+  gateway.sessions[second.get] =
+    AdminSession(expiresAt: epochTime() - 1, scope: asRead,
+                 tokenHash: hash("gate-token"))
   let probe = Request(reqMethod: HttpGet,
                       headers: newHttpHeaders([("Cookie",
                         AdminCookieName & "=" & second.get)]))
@@ -1375,6 +1603,19 @@ block:
                             headers: newHttpHeaders([("Authorization",
                               "Bearer gate-token")]))
   check "the right bearer opens the gate", gateway.adminGate(rightBearer) == agOk
+
+  # DEC-27, amended: the write token reads. It can already mint a write session,
+  # which reads every GET, so the bearer form is not a wider door.
+  let writeTokenFile = scratch / "gate-write.token"
+  putEnv(AdminWriteTokenEnv, writeTokenFile)
+  writeFile(writeTokenFile, "write-token\n")
+  let writeBearer = Request(reqMethod: HttpGet,
+                            headers: newHttpHeaders([("Authorization",
+                              "Bearer write-token")]))
+  check "the write bearer opens the read gate",
+    gateway.adminGate(writeBearer) == agOk
+  check "the write bearer is still not the read token",
+    gateway.adminGate(rightBearer) == agOk
 
   # Fail closed: no token file means the gated surface does not exist, for every
   # request, and a bearer of any value is not a way around it.
@@ -1483,6 +1724,116 @@ block:
   check "the sign-in page is not gated", not isGatedPage("/login.html")
   check "a stylesheet is not gated", not isGatedPage("/assets/any-hashed-name.css")
   check "a font is not gated", not isGatedPage("/fonts/inter-latin-var.woff2")
+
+block:
+  # DEC-26. The new log keys are optional and last, so a line an older binary
+  # wrote still parses and a reader that knows only the nine keys is unaffected.
+  let bare = requestLogLine("2026-11-25T10:00:00Z", "leg-a", 200, 120,
+                            some(100), some(50), "", "", false)
+  check "a line without the new facts keeps the nine-key shape",
+    not bare.contains("prompt_kib") and not bare.contains("header_ms")
+  let measured = requestLogLine("2026-11-25T10:00:00Z", "leg-a", 200, 120,
+                                some(100), some(50), "", "", false,
+                                promptKib = 64, headerMs = 880)
+  check "prompt_kib is the prompt size in KiB",
+    measured.contains("\"prompt_kib\":64")
+  check "header_ms is the wait to the first response byte",
+    measured.contains("\"header_ms\":880")
+  check "the new keys follow the nine",
+    measured.find("\"prompt_kib\"") > measured.find("\"stream\"")
+
+block:
+  # DEC-26: the deadline numbers are config, not compile-time constants, and the
+  # one rule that reads them answers the same shape as before.
+  let path = writeConfig("tuned.json", """
+{"timeouts":{"header_ms_stream_base":9000,"header_ms_stream_slope_per_kib":25,
+ "header_ms_stream_max":30000,"header_ms_non_stream":45000},
+ "legs":[{"name":"a","base_url":"http://127.0.0.1:1/v1"}]}
+""")
+  let cfg = loadConfig(path)
+  check "config reads the four timeout numbers",
+    cfg.headerStreamBaseMs == 9000 and cfg.headerStreamPerKiBMs == 25 and
+    cfg.headerStreamMaxMs == 30_000 and cfg.headerNonStreamMs == 45_000
+  check "the tuned rule gives a 256 KiB body 15.4 s",
+    streamHeaderDeadlineMs(cfg.headerStreamBaseMs, cfg.headerStreamPerKiBMs,
+                           cfg.headerStreamMaxMs, 256 * 1024) == 15_400
+  check "a body of zero bytes still gets the floor",
+    streamHeaderDeadlineMs(9000, 25, 30_000, 0) == 9000
+  check "the slope is capped",
+    streamHeaderDeadlineMs(9000, 25, 30_000, 4 * 1024 * 1024) == 30_000
+
+checkRaises "a base above the max is refused", ConfigError:
+  discard loadConfigText("""{"timeouts":{"header_ms_stream_base":30000,
+    "header_ms_stream_max":15000},"legs":[{"name":"a",
+    "base_url":"http://127.0.0.1:1/v1"}]}""", "timeouts.json")
+
+block:
+  # DEC-26: the new cooldown shapes. A one-leg gateway caps a header rung at 15 s,
+  # a capacity 429 is believed between 60 s and 900 s, and a plain rate limit is a
+  # short class of its own.
+  check "a single leg caps a header rung at 15 s",
+    cooldownSeconds(TokenHeaderTimeout, 0, HeaderDeadlineNonStreamMs, true) == 15.0
+  check "a single leg still cools at least the floor",
+    cooldownSeconds(TokenHeaderTimeout, 0, 1_000, true) == 5.0
+  check "two legs keep the 60 s cap on the 90 s door",
+    cooldownSeconds(TokenHeaderTimeout, 0, HeaderDeadlineNonStreamMs, false) == 60.0
+  check "a quota 429 believes a short Retry-After only down to 60 s",
+    cooldownSeconds(TokenQuota429, 0, HeaderDeadlineStreamMs, false, 42) == 60.0
+  check "a quota 429 caps a long Retry-After at 900 s",
+    cooldownSeconds(TokenQuota429, 0, HeaderDeadlineStreamMs, false, 1200) == 900.0
+  check "a rate-limit 429 defaults to 30 s",
+    cooldownSeconds(TokenRateLimited, 0, HeaderDeadlineStreamMs) == 30.0
+  check "a rate-limit 429 clamps to 5-120 s",
+    cooldownSeconds(TokenRateLimited, 0, HeaderDeadlineStreamMs, false, 3) == 5.0 and
+    cooldownSeconds(TokenRateLimited, 0, HeaderDeadlineStreamMs, false, 600) == 120.0
+
+
+block:
+  # DEC-27: the overrides block is parsed after the legs, so a name that matches
+  # nothing is a load error rather than a switch that silently does nothing.
+  let path = writeConfig("overridden.json", """
+{"legs":[
+  {"name":"a","base_url":"http://127.0.0.1:1/v1"},
+  {"name":"b","base_url":"http://127.0.0.1:2/v1","enabled":false},
+  {"name":"c","base_url":"http://127.0.0.1:3/v1","aliases":{"jev":"jev-1.14"}}],
+ "overrides":{"legs":{"a":false,"b":true},"models":{"jev":false}}}
+""")
+  let cfg = loadConfig(path)
+  check "an override switches a file-enabled leg off",
+    cfg.legs[0].enabledFile and not cfg.legs[0].enabled
+  check "an override switches a file-disabled leg on",
+    not cfg.legs[1].enabledFile and cfg.legs[1].enabled
+  check "a leg without an override keeps its file value",
+    cfg.legs[2].enabledFile and cfg.legs[2].enabled
+  check "a model override is read", cfg.overridesModels["jev"] == false
+
+  # The dashboard write is a text patch, so a credential the file holds is never
+  # a value the write path can lose, reorder or reformat.
+  let raw = """{
+  "listen": {"host":"127.0.0.1","port":4011},
+  "log": {"path":"/tmp/x.jsonl"},
+  "legs": [{"name":"a","base_url":"http://127.0.0.1:1/v1","api_key":"SENTINEL"}]
+}"""
+  let first = patchOverridesText(raw,
+    """{"legs":{"a":false},"models":{},"updated_at":"2026-11-25T10:00:00Z"}""")
+  check "the patch keeps every credential byte", first.contains("SENTINEL")
+  let firstCfg = loadConfigText(first, "patch.json")
+  check "the patched config turns the leg off without rewriting `enabled`",
+    firstCfg.legs[0].enabledFile and not firstCfg.legs[0].enabled
+  let second = patchOverridesText(first,
+    """{"legs":{"a":true},"models":{},"updated_at":"2026-11-25T10:01:00Z"}""")
+  check "a second patch replaces the block instead of adding one",
+    second.count("\"overrides\"") == 1
+  check "the second switch is the one that applies",
+    loadConfigText(second, "patch.json").legs[0].enabled
+
+checkRaises "an override of a name no leg has is refused", ConfigError:
+  discard loadConfigText("""{"legs":[{"name":"a","base_url":"http://127.0.0.1:1/v1"}],
+    "overrides":{"legs":{"typo":false}}}""", "override-typo.json")
+
+checkRaises "an override of a model no alias maps is refused", ConfigError:
+  discard loadConfigText("""{"legs":[{"name":"a","base_url":"http://127.0.0.1:1/v1"}],
+    "overrides":{"models":{"typo":false}}}""", "override-model-typo.json")
 
 # --------------------------------------------------------------------- report ---
 

@@ -81,6 +81,10 @@ export function buildLogRow(row: LogRow, expandable: boolean): BuiltRow {
   if (row.effort_clamped !== undefined)
     pairs.push(["effort_clamped", '"' + row.effort_clamped + '"']);
   if (row.cost_usd !== undefined) pairs.push(["cost_usd", "$" + row.cost_usd.toFixed(6)]);
+  if (row.prompt_kib !== undefined) pairs.push(["prompt_kib", String(row.prompt_kib)]);
+  if (row.header_ms !== undefined) pairs.push(["header_ms", String(row.header_ms)]);
+  if (row.legs_cooling !== undefined) pairs.push(["legs_cooling", String(row.legs_cooling)]);
+  if (row.retry_after_s !== undefined) pairs.push(["retry_after_s", String(row.retry_after_s)]);
   for (const [k, v] of pairs) {
     const pair = el("span", "pair");
     pair.appendChild(el("span", "kv", k));

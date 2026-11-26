@@ -1,6 +1,7 @@
 // Requests: a GET view over /admin/log. Filters are a navigation (a new URL, one request), paging
-// moves the offset, and one row expands to the nine log keys. No client-side filtering of a page of
-// 50: that would answer "nothing matches" from a sample.
+// moves the offset, and one row expands to the nine log keys. Prompt size is the one filter the
+// endpoint has no parameter for, so it narrows the rows this page loaded and the page says so:
+// filtering a sample cannot answer "nothing matches in the log".
 
 import { fetchLog, fetchState } from "./api";
 import { clear, el, q, qq, show } from "./dom";
@@ -12,11 +13,21 @@ import type { AdminLog, LogRow } from "./types";
 const PAGE_SIZE = 50;
 const RANGES: Record<string, number> = { "15m": 15, "1h": 60, "24h": 1440 };
 
+// The same five buckets the overview table uses, as URL tokens so a filtered view is linkable.
+const PROMPT_BUCKETS: Record<string, { label: string; lo: number; hi: number | null }> = {
+  lt32: { label: "under 32 KiB", lo: 0, hi: 32 },
+  "32-64": { label: "32 to 64 KiB", lo: 32, hi: 64 },
+  "64-128": { label: "64 to 128 KiB", lo: 64, hi: 128 },
+  "128-256": { label: "128 to 256 KiB", lo: 128, hi: 256 },
+  gte256: { label: "256 KiB and over", lo: 256, hi: null },
+};
+
 interface Filters {
   route: string;
   status: string;
   reason: string;
   stream: string;
+  prompt: string;
   range: string;
 }
 
@@ -25,6 +36,7 @@ const S: Filters & { offset: number; sel: number; openKey: string | null } = {
   status: "all",
   reason: "all",
   stream: "all",
+  prompt: "all",
   range: "all",
   offset: 0,
   sel: -1,
@@ -35,9 +47,18 @@ let lastLog: AdminLog | null = null;
 let lastNewest: string | null = null;
 let lastLines = 0;
 let routesReady = false;
+// The rows after the prompt-size filter: j/k and expand index into what is on screen, not the page.
+let visibleRows: LogRow[] = [];
 
 function rowKey(row: LogRow): string {
   return `${row.ts}|${row.route}|${row.status}|${row.latency_ms}`;
+}
+
+function inPromptBucket(row: LogRow, bucket: string): boolean {
+  const range = PROMPT_BUCKETS[bucket];
+  const kib = row.prompt_kib;
+  if (!range || typeof kib !== "number") return false;
+  return kib >= range.lo && (range.hi === null || kib < range.hi);
 }
 
 function readURL(): void {
@@ -47,6 +68,9 @@ function readURL(): void {
       const v = params.get(k);
       if (v) S[k] = v;
     });
+    // An unknown bucket from a hand-edited URL would empty the table and explain nothing.
+    const prompt = params.get("prompt");
+    if (prompt && PROMPT_BUCKETS[prompt]) S.prompt = prompt;
     const off = parseInt(params.get("offset") || "0", 10);
     if (Number.isFinite(off) && off > 0) S.offset = off;
   } catch {
@@ -57,7 +81,7 @@ function readURL(): void {
 function writeURL(): void {
   try {
     const params = new URLSearchParams();
-    (["route", "status", "reason", "stream", "range"] as const).forEach((k) => {
+    (["route", "status", "reason", "stream", "prompt", "range"] as const).forEach((k) => {
       if (S[k] && S[k] !== "all") params.set(k, S[k]);
     });
     if (S.offset > 0) params.set("offset", String(S.offset));
@@ -74,6 +98,7 @@ function filtersSentence(): string {
   if (S.status !== "all") parts.push("status " + S.status);
   if (S.reason !== "all") parts.push("reason " + S.reason);
   if (S.stream !== "all") parts.push(S.stream === "true" ? "stream" : "not streamed");
+  if (S.prompt !== "all") parts.push("prompt " + (PROMPT_BUCKETS[S.prompt]?.label ?? S.prompt));
   if (S.range !== "all") parts.push("last " + S.range);
   return parts.length ? parts.join(" \u00B7 ") : "no filters";
 }
@@ -120,17 +145,23 @@ function noLogYet(log: AdminLog): boolean {
   return !log.file.exists || log.file.bytes === 0;
 }
 
+function shownRows(log: AdminLog): LogRow[] {
+  return S.prompt === "all" ? log.rows : log.rows.filter((row) => inPromptBucket(row, S.prompt));
+}
+
 function renderCaption(log: AdminLog): void {
   const node = q("[data-caption]");
   if (!node) return;
   const rows = log.rows;
+  const shown = shownRows(log).length;
   const rest: string[] = [];
   if (rows.length > 0) {
     rest.push(`oldest ${clock(rows[rows.length - 1].ts)}`, `newest ${clock(rows[0].ts)}`);
   }
   rest.push(`filters: ${filtersSentence()}`, fileFacts(log));
   clear(node);
-  node.appendChild(el("b", undefined, `${rows.length} rows`));
+  // A filter that narrows the page names both counts, so the sample it worked on stays visible.
+  node.appendChild(el("b", undefined, shown === rows.length ? `${rows.length} rows` : `${shown} of ${rows.length} rows`));
   node.appendChild(document.createTextNode(", " + rest.join(" \u00B7 ")));
 }
 
@@ -141,12 +172,23 @@ function renderRows(log: AdminLog): void {
   const empty = q("[data-empty]");
   if (!tbody) return;
 
-  const rows = log.rows;
+  const loaded = log.rows;
+  const rows = shownRows(log);
+  visibleRows = rows;
   const isEmpty = rows.length === 0;
   show(table, !isEmpty);
   show(pager, !isEmpty);
   show(empty, isEmpty);
   clear(tbody);
+
+  const promptNote = q("[data-prompt-note]");
+  if (promptNote) {
+    const narrowed = S.prompt !== "all";
+    show(promptNote, narrowed);
+    if (narrowed) {
+      promptNote.textContent = `Prompt size is not a server filter: this narrows the ${loaded.length} rows loaded on this page, not the whole log. A row with no prompt_kib never matches.`;
+    }
+  }
 
   if (isEmpty) {
     const emptyTitle = q("[data-empty-title]");
@@ -215,10 +257,11 @@ function renderRows(log: AdminLog): void {
   const note = q("[data-pager-note]");
   if (note) note.textContent = `rows ${S.offset + 1}\u2013${S.offset + rows.length}`;
 
-  // §3.7: filtering a tail cannot prove a negative, so say so instead of guessing.
+  // §3.7: filtering a tail cannot prove a negative, so say so instead of guessing. The page length
+  // is the server's answer, never the client-filtered count.
   const tail = q("[data-tail-note]");
   if (tail) {
-    const endOfTail = hasFilters() && rows.length < PAGE_SIZE && log.more_older;
+    const endOfTail = hasFilters() && loaded.length < PAGE_SIZE && log.more_older;
     show(tail, endOfTail);
     if (endOfTail) tail.textContent = "end of the scanned tail";
   }
@@ -315,6 +358,7 @@ function bind(): void {
     ["status", "status"],
     ["reason", "reason"],
     ["stream", "stream"],
+    ["prompt", "prompt"],
     ["range", "range"],
   ];
   for (const [key, name] of map) {
@@ -351,6 +395,7 @@ function bind(): void {
     S.sel = -1;
     S.openKey = null;
     S.route = S.status = S.reason = S.stream = "all";
+    S.prompt = "all";
     S.range = "all";
     qq<HTMLSelectElement>("[data-filters] select").forEach((x) => (x.value = "all"));
     writeURL();
@@ -379,7 +424,7 @@ function bind(): void {
       moveSel(-1);
     } else if (e.key === "Enter" && S.sel >= 0 && lastLog) {
       e.preventDefault();
-      const row = lastLog.rows[S.sel];
+      const row = visibleRows[S.sel];
       if (row) {
         S.openKey = S.openKey === rowKey(row) ? null : rowKey(row);
         renderRows(lastLog);
@@ -403,7 +448,7 @@ function bind(): void {
 
 function moveSel(delta: number): void {
   if (!lastLog) return;
-  const count = lastLog.rows.length;
+  const count = visibleRows.length;
   if (count <= 0) return;
   S.sel = Math.max(0, Math.min(count - 1, S.sel + delta));
   renderRows(lastLog);

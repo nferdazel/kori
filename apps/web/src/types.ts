@@ -49,6 +49,10 @@ export interface LogRow {
   alias?: string;
   effort_clamped?: string;
   cost_usd?: number;
+  prompt_kib?: number;
+  header_ms?: number;
+  legs_cooling?: number;
+  retry_after_s?: number;
 }
 
 export interface GatewayInfo {
@@ -106,8 +110,26 @@ export interface ConfigLeg {
   weight: number;
   base_url: string;
   model: string | null;
+  // DEC-27: `enabled` is the config file's own value, `serving` the value after the
+  // dashboard override, and `override` is null when the file's value stands alone.
+  enabled: boolean;
+  serving: boolean;
+  override: boolean | null;
+  aliases: Record<string, string>;
   headers: string[];
   credential: Credential;
+}
+
+export interface ConfigOverrides {
+  legs: Record<string, boolean>;
+  models: Record<string, boolean>;
+  updated_at: string | null;
+}
+
+export interface AdminWrites {
+  count: number;
+  last_at: string | null;
+  last_action: string | null;
 }
 
 export interface AdminConfig {
@@ -133,7 +155,10 @@ export interface AdminConfig {
     quota_s: number;
     header_timeout_s: number;
     header_timeout_max_s: number;
+    single_leg_header_max_s: number;
   };
+  overrides: ConfigOverrides;
+  admin_writes: AdminWrites;
   log: { path: string; append_only: boolean; redacted: boolean };
 }
 

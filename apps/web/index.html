@@ -82,6 +82,29 @@
         </div>
       </section>
 
+      <section class="panel section" aria-labelledby="lat-h">
+        <div class="panel-head">
+          <h2 id="lat-h">Latency by prompt size</h2>
+          <span class="hint">from /admin/log</span>
+        </div>
+        <div class="lat-scroll" data-lat-scroll role="region" aria-label="Latency by prompt size">
+          <table class="lat-table">
+            <caption data-lat-caption>reading the log for a prompt-size sample</caption>
+            <thead>
+              <tr>
+                <th scope="col">Prompt (KiB)</th>
+                <th scope="col" class="num">n</th>
+                <th scope="col" class="num">p50</th>
+                <th scope="col" class="num">p90</th>
+                <th scope="col" class="num">p99</th>
+              </tr>
+            </thead>
+            <tbody data-lat-buckets></tbody>
+          </table>
+        </div>
+        <p class="table-note" data-lat-foot></p>
+      </section>
+
       <div class="cols section">
         <section class="panel" aria-labelledby="share-h">
           <div class="panel-head">

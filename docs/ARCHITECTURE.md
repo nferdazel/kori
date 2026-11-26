@@ -38,8 +38,8 @@ caller ──POST /v1/chat/completions──► kori
 | Section | Holds |
 |---|---|
 | CLI flags | flag parsing, precedence over config, exit `2` on bad input |
-| config | JSON loading, leg defaults, prices, the log rotation policy, and every refusal: a pool that cannot also be the bearer, an unranked effort, a `weight` outside 1-1000, a `retries` outside 0-5, a negative price |
-| log writer | the twelve-key line (nine keys always, `alias`, `effort_clamped` and `cost_usd` only when the request earned them), the single append, size rotation with `keep`, the descriptor held for the process |
+| config | JSON loading, leg defaults, the four header-deadline numbers, prices, the log rotation policy, and every refusal: a pool that cannot also be the bearer, an unranked effort, a `weight` outside 1-1000, a `retries` outside 0-5, a negative price |
+| log writer | the sixteen-key line (nine keys always; `alias`, `effort_clamped` and `cost_usd`, then `prompt_kib`, `header_ms`, `legs_cooling` and `retry_after_s`, only when the request earned them), the single append, size rotation with `keep`, the descriptor held for the process |
 | time | RFC 3339 stamps used by the log and the admin GETs |
 | router | leg availability, pick order, smooth weighted round-robin (`DEC-11`), leg and key cooldowns, served/attempted counters, the latency ring |
 | upstream IO | raw socket dial, TLS wrap, the deadline-bounded send and receive |
@@ -91,13 +91,26 @@ path, content type and body for the eight files under `apps/web/dist`.
 6. Whatever happened, one log line is written before the handler returns. `failover_reason`
    is the first reason met, except for a mid-stream abort, which overrides it because it is
    what the caller actually saw. The same completion feeds the `/metrics` counters, so a scrape
-   and the log cannot disagree about how many requests a route answered.
+   and the log cannot disagree about how many requests a route answered. `prompt_kib` is the
+   prompt body size in KiB (bytes, not tokens: JSON overhead is in it) and `header_ms` is the
+   wait from body sent to the first response byte, recorded only on the leg that answered, so a
+   failure leaves it out instead of reporting a wait it never finished. `legs_cooling` and
+   `retry_after_s` are written only by the row that never dialled: when no leg can serve, the
+   answer is `503 all_legs_cooling` (or `503 no_leg_enabled`) with a `Retry-After` header equal
+   to the body's `retry_after_s`, the log row carries `route: ""`, and no leg name reaches the
+   caller. A request that dialled and failed keeps its `502`.
 
-Cooldowns are 60 s for availability failures and 900 s for a quota `429`, with one exception:
-`header_timeout` starts at the header window that attempt waited, clamped to 5–60 s, and doubles per
-consecutive timeout inside that clamp (`DEC-23`). The streaming door therefore starts at 15 s and the
-90 s non-stream and System One doors start at the 60 s cap: a rung shorter than the window it
-followed would schedule a probe dearer than the cooldown it ends. A leg whose cooldown has expired is
+Cooldowns are 60 s for availability failures and 900 s for a quota `429`, with three exceptions
+(`DEC-26`). `header_timeout` starts at the header window that attempt waited, clamped to 5–60 s, and
+doubles per consecutive timeout inside that clamp (`DEC-23`); the streaming door therefore starts at
+15 s and the 90 s non-stream and System One doors start at the 60 s cap, because a rung shorter than
+the window it followed would schedule a probe dearer than the cooldown it ends. A gateway with one
+enabled leg caps that rung at 15 s: with no second leg to protect, the rung only decides how long the
+caller is told to wait. A quota `429` that names its own `Retry-After` is believed, clamped to
+60–900 s, and a `429` that is not a quota is `rate_limited_429` on a 5–120 s clock (30 s when the
+provider names nothing): it is a rate limit that may clear in seconds, so it never inherits the
+capacity rung, the walk fails over past it, and the last leg's own `429` and `Retry-After` are passed
+to the caller instead of a fabricated `502`. A leg whose cooldown has expired is
 eligible again, and the first request that picks
 it acts as the half-open probe: a second failure starts a fresh full cooldown. A pool entry cools
 on the same clock, and the leg itself is only cooled once every entry in the pool is cooling. A leg
@@ -108,7 +121,10 @@ and takes no cooldown.
 
 `POST /v1/systemone` is a second door (`DEC-19`), and it shares the log, the counters and the
 classification rules but not the walk. Its upstreams come from a `systemone.legs` block, they
-are tried in config order, and the walk stops at the first answer. The caller's body is
+are tried in config order, and the walk stops at the first answer. `systemone_balance: true`
+(`DEC-28`, default false) makes the first pick a smooth weighted round-robin over the eligible
+legs, by `systemone.legs[].weight`; the tail of the walk stays config order, so failover is still
+deterministic. The chat door's `balance` does not reach this list. The caller's body is
 forwarded byte for byte with one field replaced, the top-level `model`, because the name a
 caller uses for a decision model is not the id a provider accepts. The answer is written back
 untouched, which is why this door has no streaming path and no `stream_options` injection: a
@@ -145,7 +161,10 @@ state projected per leg, and it dials nothing, so asking what is broken cannot c
 call or a token.
 
 `/admin/config` reports the config path and a `<path>:<line>` reference per leg credential, never
-the value. The key pool is reported as a size and a cooling count, and an `oauth` leg as a state
+the value. A `base_url` that carries a credential prints as `scheme://<redacted>`: the whole
+authority goes, not just the `user:pass@`, because a credential is shaped like a host and keeping the
+survivor printed one six times. A `base_url` with no `@` prints in full. The key pool is reported as a size and a cooling
+count, and an `oauth` leg as a state
 plus its expiry, so the same page can answer "which credential is dead" without carrying one. It
 also reports the log rotation policy, the price table and the last reload (`count`, `at`,
 `error`), which is the artifact a `SIGHUP` leaves behind.
@@ -153,6 +172,21 @@ also reports the log rotation policy, the price table and the last reload (`coun
 A `SIGHUP` re-reads the config away from the request path and swaps it in only after it parses,
 validates and keeps the same listener. Router state is carried across by leg name, so a reload is
 not a restart: cooldowns and live OAuth tokens survive, and a stream in flight is not cut.
+
+`PUT /admin/overrides` is the one write (`DEC-27`). It accepts two switch maps and nothing else,
+patches the top-level `overrides` key in `config.json` by text so no credential byte is
+re-serialised, validates the patched document with the boot loader, writes `config.json.bak` (0600,
+one generation) and then replaces the file by temp-and-rename. The effective `enabled` of every leg
+changes in memory at once — only a boolean moves, no leg index — and a reload is requested so the
+file and the process converge at the next quiet moment. The endpoint has its own token file
+(`KORI_ADMIN_WRITE_TOKEN_FILE`): a missing file answers `404`, the read token answers `403`, a
+write session lives 12 h and must carry `X-Kori-Write: 1`, switching the last serving provider off
+is `409` without `confirm_last_leg`, and a size or mtime change between read and write is
+`409 config_changed`. The write credential is also accepted as a bearer on every gated GET
+(`/admin/state`, `/admin/config`, `/admin/log`), because it could already mint a write session and
+a write session reads every page; the read token stays read-only and can never write. `/admin/config` reports `enabled` (the file), `serving` (the effective value)
+and `override` (null when the dashboard has never touched that name), so the three states stay
+distinguishable without reading the file.
 
 ## Acceptance harness
 

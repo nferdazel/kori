@@ -312,9 +312,12 @@ PY
 # A case that wants the fail-closed path (file missing → 404) sets
 # ADMIN_TOKEN_FILE to a path it never creates together with ADMIN_TOKEN_WRITE=0.
 ADMIN_TOKEN_VALUE="acc-TEST-admin-token-SENTINEL-do-not-log"
+ADMIN_WRITE_TOKEN_VALUE="acc-TEST-admin-write-token-SENTINEL-do-not-log"
 ADMIN_COOKIE_NAME="kori_admin"
 
 admin_token_path() { printf '%s' "${ADMIN_TOKEN_FILE:-$RUN/admin.token}"; }
+
+admin_write_token_path() { printf '%s' "${ADMIN_WRITE_TOKEN_FILE:-$RUN/admin-write.token}"; }
 
 admin_token_write() { # write the fixture token file: mode 0600, one trailing newline (the gate trims it)
   _atp=$(admin_token_path)
@@ -322,7 +325,15 @@ admin_token_write() { # write the fixture token file: mode 0600, one trailing ne
   chmod 600 "$_atp"
 }
 
+admin_write_token_write() { # DEC-27: the write token's own file, same mode and shape
+  _awp=$(admin_write_token_path)
+  printf '%s\n' "$ADMIN_WRITE_TOKEN_VALUE" >"$_awp"
+  chmod 600 "$_awp"
+}
+
 admin_token_header() { printf 'Authorization: Bearer %s' "$ADMIN_TOKEN_VALUE"; }
+
+admin_write_header() { printf 'Authorization: Bearer %s' "$ADMIN_WRITE_TOKEN_VALUE"; }
 
 # A log the dashboard can page over with no request going anywhere. Called before
 # gw_start(), so the file is already its full length when the binary opens it.
@@ -349,7 +360,15 @@ gw_start() {
   if [ ! -x "$GW_BIN" ]; then fail "gw_start" "no executable at $GW_BIN"; return 1; fi
   # DEC-20: one fixture token file per run, written here so a case never has to.
   # ADMIN_TOKEN_WRITE=0 leaves the path absent, which is the fail-closed case.
-  if [ "${ADMIN_TOKEN_WRITE:-1}" = "1" ]; then admin_token_write; fi
+  if [ "${ADMIN_TOKEN_WRITE:-1}" = "1" ]; then admin_token_write; else rm -f "$(admin_token_path)"; fi
+  # DEC-27: the write token exists by default, because most admin cases should
+  # exercise the surface; a case that proves the fail-closed 404 sets
+  # ADMIN_WRITE_TOKEN_WRITE=0.
+  if [ "${ADMIN_WRITE_TOKEN_WRITE:-1}" = "1" ]; then
+    admin_write_token_write
+  else
+    rm -f "$(admin_write_token_path)"
+  fi
   # A fresh port on every start. gw_stop's 0.2 s is not a promise that the last
   # listener has released the old number, and a3 starts the gateway three times.
   GW_PORT=$(free_port) || { fail "gw_start" "no free port on loopback"; return 1; }
@@ -372,6 +391,7 @@ PY
       ulimit -f "$GW_FSIZE_BLOCKS" || fail "gw_start" "cannot set a file size limit"
     fi
     KORI_ADMIN_TOKEN_FILE=$(admin_token_path) \
+    KORI_ADMIN_WRITE_TOKEN_FILE=$(admin_write_token_path) \
     "$GW_BIN" --config "$GW_CFG" --port "$GW_PORT" >>"$RUN/gateway.log" 2>&1 &
     echo "$!" >>"$RUN/pids" )
   gw_wait_ready || { fail "gw_start" "no answer from $GW_URL/healthz"; return 1; }
@@ -408,6 +428,16 @@ admin_json() { # admin_json <outfile>
 # field-level shapes come from DASHBOARD-surface.md §5, not from a numbered
 # decision yet (D11 is pending), so the readers below are the one place a shape
 # change touches (OPEN-10).
+gw_pid() { # gw_pid -> the pid of the gateway this run started last
+  if [ -f "$RUN/pids" ] && [ -s "$RUN/pids" ]; then tail -n 1 "$RUN/pids"; fi
+}
+
+gw_hup() { # gw_hup -> SIGHUP the running gateway, the reload the runbook uses
+  _hup=$(gw_pid)
+  [ -n "$_hup" ] || { fail "gw_hup" "no gateway pid"; return 1; }
+  kill -HUP "$_hup"
+}
+
 admin_get() { # admin_get <outfile> <path-with-query> -> http code
   curl -sS -o "$1" -w '%{http_code}' --max-time 5 \
     -H "$(admin_token_header)" "$GW_URL$2"
@@ -659,7 +689,10 @@ route_count() { # route_count <n> <route> -> how many of the last n lines that l
 LOG_KEYS='["ts","route","status","latency_ms","tokens_in","tokens_out","failover_from","failover_reason","stream"]'
 
 assert_log_keys() { # label
-  got=$(log_line | jq -c 'keys_unsorted' 2>/dev/null)
+  # DEC-26: the nine-key contract is the first nine keys, in order. The optional
+  # tail (alias, effort_clamped, cost_usd, prompt_kib, header_ms, legs_cooling,
+  # retry_after_s) may follow, exactly as `alias` and `cost_usd` always could.
+  got=$(log_line | jq -c 'keys_unsorted[0:9]' 2>/dev/null)
   assert_eq "$1 key order" "$got" "$LOG_KEYS"
 }
 

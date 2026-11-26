@@ -35,8 +35,9 @@
 # identity, a second replica, and compression of rotated logs.
 # docs/ARCHITECTURE.md, "Not built", is the list this comment must agree with.
 
-import std/[algorithm, asyncdispatch, asyncnet, base64, exitprocs, httpcore,
-            json, net, options, os, posix, strutils, sysrand, tables, times, uri]
+import std/[algorithm, asyncdispatch, asyncnet, base64, exitprocs, hashes,
+            httpcore, json, net, options, os, posix, strutils, sysrand, tables,
+            times, uri]
 import std/asynchttpserver
 
 import generated/static_files
@@ -116,6 +117,19 @@ const
   # a rung shorter than the window it followed would send a probe that is dearer
   # than the cooldown it ends, and the next caller pays the difference.
   HeaderTimeoutCooldownS* = 5.0
+  ## DEC-26. A header-timeout rung exists to stop the walk re-probing a dead leg
+  ## more often than the window it just paid for. With one enabled leg there is no
+  ## other leg to protect, so the rung only decides how long the caller is told to
+  ## wait: 15 s, the streaming window's own floor, and no higher.
+  SingleLegHeaderMaxMs* = 15_000
+  ## DEC-26. A capacity failure keeps its 900 s in every shape, but an upstream
+  ## that names its own Retry-After is believed between these bounds.
+  CapacityRetryAfterMinS* = 60.0
+  ## DEC-26. A plain 429 is a rate limit, not a spent balance: cool briefly and try
+  ## the next leg. A provider that names no number gets the default.
+  RateLimitRetryAfterMinS* = 5.0
+  RateLimitRetryAfterMaxS* = 120.0
+  RateLimitDefaultS* = 30.0
 
   # Item 5. A leg gets `retries` more dials before it is classed as failed and the
   # walk moves on, with a doubling pause between them. The pause is capped so one
@@ -153,6 +167,14 @@ const
   # default: the host points KORI_ADMIN_TOKEN_FILE at wherever it keeps the file.
   DefaultAdminTokenFile* = "/etc/kori/admin.token"
   AdminTokenEnv* = "KORI_ADMIN_TOKEN_FILE"
+  ## DEC-27. The write surface has its own token file. A read deployment keeps no
+  ## write token at all, and then every write answers the same 404 the read gate
+  ## answers without a token: an unconfigured host does not advertise the surface.
+  DefaultAdminWriteTokenFile* = "/etc/kori/admin-write.token"
+  AdminWriteTokenEnv* = "KORI_ADMIN_WRITE_TOKEN_FILE"
+  ## A write session is short on purpose: it can switch a provider off, and the
+  ## read cookie already lives for thirty days.
+  AdminWriteSessionTtlS* = 43_200.0
   AdminCookieName* = "kori_admin"
   ## 32 random bytes, base64url, unpadded: 43 characters of URL-safe alphabet, so
   ## the value needs no quoting in a cookie and carries no `=`.
@@ -186,6 +208,9 @@ const
   TokenUpstream5xx* = "upstream_5xx"
   TokenQuota429* = "quota_429"
   TokenBilling402* = "billing_402"
+  ## DEC-26. A 429 whose body is not a quota: a rate limit that may clear in
+  ## seconds. It is its own class so it never inherits the 900 s capacity rung.
+  TokenRateLimited* = "rate_limited_429"
   TokenMidStreamAbort* = "mid_stream_abort"
 
   ## The caller hung up before the answer was finished. It is not a leg failure:
@@ -208,6 +233,9 @@ const
   AliasPrefix* = "kori/"
   TokenAliasUnmapped* = "alias_unmapped"
   TokenUnknownAlias* = "unknown_alias"
+  ## DEC-27. The alias is mapped, and the operator switched it off from the
+  ## dashboard. A caller can tell this from a name the config never had.
+  TokenAliasDisabled* = "alias_disabled"
   TokenAliasTooLong* = "alias_too_long"
 
   ## Item 3. The alias is echoed into the request log, so it is bounded far below
@@ -274,7 +302,8 @@ type
     retries*: int              ## extra dials on this leg before it is classed failed
     oauth*: Oauth
     hasOauth*: bool
-    enabled*: bool             ## false only when the config says so: skipped, never dialled
+    enabled*: bool             ## effective: the file's value after `overrides.legs`
+    enabledFile*: bool         ## the leg's own `enabled`, before any override
     aliases*: Table[string, string]  ## `kori/<alias>` -> this leg's provider id
     efforts*: seq[string]      ## the reasoning_effort values this leg accepts
     hasEfforts*: bool          ## `efforts` came from the config, so the ceiling applies
@@ -295,6 +324,7 @@ type
     apiKey*: string
     model*: string            ## the provider id sent upstream; "" forwards the caller's
     headers*: seq[(string, string)]
+    weight*: int              ## DEC-28: its share of the pick when `systemone_balance` is on
     enabled*: bool
 
   Config* = object
@@ -304,9 +334,23 @@ type
     logRotateBytes*: int64   ## 0 keeps the single append-only file, which is the default
     logKeep*: int            ## rotated files kept beside the live one
     balance*: bool
+    ## DEC-28. Its own switch, default false: turning the chat door's balancing on
+    ## must not re-order System One traffic underneath the operator.
+    systemoneBalance*: bool
     legs*: seq[Leg]
     prices*: Table[string, Price]  ## by model id, plus "*" for the fallback
     systemone*: seq[SystemoneLeg]  ## `POST /v1/systemone` upstreams, in config order
+    # DEC-26. The streaming header deadline is a rule, and its three numbers are
+    # data: an operator tunes them from the config, not from a rebuild.
+    headerStreamBaseMs*: int
+    headerStreamPerKiBMs*: int
+    headerStreamMaxMs*: int
+    headerNonStreamMs*: int
+    # DEC-27. The dashboard's switches, kept in their own block so the leg objects
+    # (and every credential byte among them) are never rewritten by a toggle.
+    overridesLegs*: Table[string, bool]
+    overridesModels*: Table[string, bool]
+    overridesUpdatedAt*: string
 
   CliOptions* = object
     configPath*: string
@@ -349,9 +393,9 @@ type
     weightCurrent*: int
 
   SystemoneRuntime* = object
-    ## DEC-19. The same two facts the chat router keeps per leg, minus everything
-    ## that only means something to a weighted pick: a System One list is walked
-    ## in config order, so there is no weight, no cursor and no key pool.
+    ## DEC-19. The same two facts the chat router keeps per leg, minus the things
+    ## only a chat walk needs: no cursor, no key pool. DEC-28 adds the weighted
+    ## pick's credit, because `balance` now selects the first System One leg.
     attempted*: bool
     coolingUntil*: float
     lastFailureClass*: string
@@ -360,12 +404,26 @@ type
     ## DEC-23, the same ladder the chat door keeps: consecutive header timeouts
     ## with no served request in between.
     headerTimeouts*: int
+    ## DEC-28: smooth weighted round-robin credit, never negative.
+    weightCurrent*: int
 
   FailoverEvent* = object
     at*: string
     fromRoute*: string
     toRoute*: string
     reason*: string
+
+  AdminScope* = enum
+    asRead = "read"
+    asWrite = "write"
+
+  AdminSession* = object
+    ## DEC-27. The scope and the token that minted the session live beside the
+    ## expiry. A write token rotated on disk therefore invalidates its own
+    ## sessions on the next request, and a read session can never be upgraded.
+    expiresAt*: float
+    scope*: AdminScope
+    tokenHash*: Hash
 
   Metrics* = object
     ## Counters /metrics prints. Everything here is already decided elsewhere in
@@ -425,8 +483,14 @@ type
     cli*: CliOptions             ## kept so a reload applies the same precedence
     # DEC-20. The gate's own state, all of it in memory: a restart empties the
     # session table on purpose, and nothing here is written to disk or logged.
-    sessions*: Table[string, float]   ## session id -> expiry, epoch seconds
-    loginFailures*: seq[float]        ## epochs of the failures still in the window
+    sessions*: Table[string, AdminSession]  ## session id -> expiry, scope, token
+    loginFailures*: seq[float]        ## epochs of the read-token failures in the window
+    writeLoginFailures*: seq[float]   ## the same window, counted apart for writes
+    # DEC-27. What the write surface has done since the process started. Counters
+    # only: no token, no session id, no config value a caller sent.
+    adminWrites*: int
+    lastAdminWriteAt*: string
+    lastAdminWriteAction*: string
 
   RecvKind = enum
     rkData, rkEof, rkTruncated, rkTimeout, rkError
@@ -461,6 +525,9 @@ type
     tokensIn: Option[int]
     tokensOut: Option[int]
     headerWindowMs: int      ## the header deadline this attempt actually waited
+    headerMs: int            ## ms from body sent to first response byte, -1 unknown
+    retryAfterS: int         ## upstream Retry-After, -1 when absent or not a number
+    passthroughBody: string  ## a 429 body kept so the last leg can return it honestly
 
   Chain = object
     firstFrom: string
@@ -470,6 +537,10 @@ type
     capacity: bool
 
 var logFdToClose: cint = -1
+## DEC-27. Raised by the config write path and by SIGHUP, read by the main loop
+## when no request is in flight. The write path needs it before its own proc, so
+## the flag lives up here rather than beside the signal handlers.
+var reloadRequested {.volatile.}: bool = false
 
 # ---------------------------------------------------------------- CLI flags ---
 
@@ -579,12 +650,15 @@ proc effortRank*(effort: string): int =
       return index
   -1
 
-proc loadConfig*(path: string): Config =
-  var raw: string
-  try:
-    raw = readFile(path)
-  except CatchableError as e:
-    failConfig("cannot read config '" & path & "': " & e.msg)
+proc loadConfigText*(raw, path: string): Config =
+  ## The parse of one config document, separated from the read so the write path
+  ## can validate a patched document before it replaces the file on disk.
+  result.headerStreamBaseMs = HeaderDeadlineStreamMs
+  result.headerStreamPerKiBMs = HeaderDeadlineStreamPerKiBMs
+  result.headerStreamMaxMs = HeaderDeadlineStreamMaxMs
+  result.headerNonStreamMs = HeaderDeadlineNonStreamMs
+  result.overridesLegs = initTable[string, bool]()
+  result.overridesModels = initTable[string, bool]()
   var root: JsonNode
   try:
     root = parseJson(raw)
@@ -629,6 +703,40 @@ proc loadConfig*(path: string): Config =
         failConfig("log.keep must be 1-" & $MaxLogKeep)
       result.logKeep = keep.getInt()
 
+  # DEC-26. The four deadline numbers, with the compiled defaults. A value the
+  # config does not name keeps the number this binary shipped with.
+  let timeouts = root{"timeouts"}
+  if timeouts != nil and timeouts.kind != JNull:
+    if timeouts.kind != JObject:
+      failConfig("timeouts must be an object")
+    for key, spec in timeouts:
+      if key notin ["header_ms_stream_base", "header_ms_stream_slope_per_kib",
+                    "header_ms_stream_max", "header_ms_non_stream"]:
+        failConfig("timeouts." & key & " is not a known timeout")
+      if spec.kind != JInt:
+        failConfig("timeouts." & key & " must be an integer")
+      let value = spec.getInt()
+      case key
+      of "header_ms_stream_base":
+        if value < 100 or value > 600_000:
+          failConfig("timeouts.header_ms_stream_base must be 100-600000")
+        result.headerStreamBaseMs = value
+      of "header_ms_stream_slope_per_kib":
+        if value < 0 or value > 1_000:
+          failConfig("timeouts.header_ms_stream_slope_per_kib must be 0-1000")
+        result.headerStreamPerKiBMs = value
+      of "header_ms_stream_max":
+        if value < 100 or value > 600_000:
+          failConfig("timeouts.header_ms_stream_max must be 100-600000")
+        result.headerStreamMaxMs = value
+      of "header_ms_non_stream":
+        if value < 100 or value > 600_000:
+          failConfig("timeouts.header_ms_non_stream must be 100-600000")
+        result.headerNonStreamMs = value
+      else: discard
+  if result.headerStreamBaseMs > result.headerStreamMaxMs:
+    failConfig("timeouts.header_ms_stream_base must not exceed header_ms_stream_max")
+
   # Prices are money, so they are data in the config and never a constant in the
   # binary. USD per million tokens, both directions, keyed by the model id that is
   # actually sent upstream; `*` is the catch-all for a model with no entry.
@@ -662,6 +770,12 @@ proc loadConfig*(path: string): Config =
     if balance.kind != JBool:
       failConfig("balance must be true or false")
     result.balance = balance.getBool()
+
+  let systemoneBalance = root{"systemone_balance"}
+  if systemoneBalance != nil and systemoneBalance.kind != JNull:
+    if systemoneBalance.kind != JBool:
+      failConfig("systemone_balance must be true or false")
+    result.systemoneBalance = systemoneBalance.getBool()
 
   let legs = root{"legs"}
   if legs == nil or legs.kind != JArray:
@@ -754,6 +868,7 @@ proc loadConfig*(path: string): Config =
       if enabledNode.kind != JBool:
         failConfig(ctx & ".enabled must be true or false")
       leg.enabled = enabledNode.getBool()
+    leg.enabledFile = leg.enabled
     # Item 2. The alias table is per leg: one caller name, one provider id per leg.
     let aliasesNode = item{"aliases"}
     if aliasesNode != nil and aliasesNode.kind != JNull:
@@ -826,6 +941,56 @@ proc loadConfig*(path: string): Config =
   if result.legs.len == 0:
     failConfig("config needs at least one leg")
 
+  # DEC-27. `overrides` is the dashboard's switch block: two maps of name -> bool.
+  # It is parsed after the legs so a name that matches nothing is a load error
+  # rather than a switch that silently does nothing.
+  let overrides = root{"overrides"}
+  if overrides != nil and overrides.kind != JNull:
+    if overrides.kind != JObject:
+      failConfig("overrides must be an object")
+    for key, _ in overrides:
+      if key notin ["legs", "models", "updated_at"]:
+        failConfig("overrides." & key & " is not a known key")
+    let updated = overrides{"updated_at"}
+    if updated != nil and updated.kind != JNull:
+      if updated.kind != JString:
+        failConfig("overrides.updated_at must be a string")
+      result.overridesUpdatedAt = updated.getStr()
+    let legOverrides = overrides{"legs"}
+    if legOverrides != nil and legOverrides.kind != JNull:
+      if legOverrides.kind != JObject:
+        failConfig("overrides.legs must be an object")
+      for name, value in legOverrides:
+        if value.kind != JBool:
+          failConfig("overrides.legs." & name & " must be true or false")
+        var known = false
+        for leg in result.legs:
+          if leg.name == name:
+            known = true
+            break
+        if not known:
+          failConfig("overrides.legs." & name & " names no leg")
+        result.overridesLegs[name] = value.getBool()
+    let modelOverrides = overrides{"models"}
+    if modelOverrides != nil and modelOverrides.kind != JNull:
+      if modelOverrides.kind != JObject:
+        failConfig("overrides.models must be an object")
+      for alias, value in modelOverrides:
+        if value.kind != JBool:
+          failConfig("overrides.models." & alias & " must be true or false")
+        var known = false
+        for leg in result.legs:
+          if leg.aliases.hasKey(alias):
+            known = true
+            break
+        if not known:
+          failConfig("overrides.models." & alias & " names no model alias")
+        result.overridesModels[alias] = value.getBool()
+    for index in 0 ..< result.legs.len:
+      let name = result.legs[index].name
+      if result.overridesLegs.hasKey(name):
+        result.legs[index].enabled = result.overridesLegs[name]
+
   # DEC-19. `systemone` is a second door with its own ordered legs. It is
   # optional: a config without it serves the chat door exactly as before and
   # answers 404 on `/v1/systemone`, so no existing config changes behaviour.
@@ -869,9 +1034,29 @@ proc loadConfig*(path: string): Config =
         if enabledNode.kind != JBool:
           failConfig(ctx & ".enabled must be true or false")
         leg.enabled = enabledNode.getBool()
+      # DEC-28. The same 1-1000 share as a chat leg, and the same reason for
+      # refusing 0: it would silently remove a leg from the split. Absent means 1,
+      # so every config written before this key existed balances evenly.
+      let weightNode = item{"weight"}
+      if weightNode != nil and weightNode.kind != JNull:
+        if weightNode.kind != JInt:
+          failConfig(ctx & ".weight must be an integer")
+        leg.weight = weightNode.getInt()
+        if leg.weight < 1 or leg.weight > MaxWeight:
+          failConfig(ctx & ".weight must be 1-" & $MaxWeight)
+      else:
+        leg.weight = 1
       result.systemone.add leg
     if result.systemone.len == 0:
       failConfig("systemone.legs must not be empty when the block is present")
+
+proc loadConfig*(path: string): Config =
+  var raw: string
+  try:
+    raw = readFile(path)
+  except CatchableError as e:
+    failConfig("cannot read config '" & path & "': " & e.msg)
+  loadConfigText(raw, path)
 
 proc applyCli*(cfg: var Config, cli: CliOptions) =
   ## CLI > config > built-in default, in that order (CONTRACT §2).
@@ -927,7 +1112,8 @@ proc requestLogLine*(ts, route: string, status, latencyMs: int,
                      tokensIn, tokensOut: Option[int],
                      failoverFrom, failoverReason: string,
                      stream: bool, alias = "", effortClamped = "",
-                     costUsd = none(float)): string =
+                     costUsd = none(float), promptKib = -1, headerMs = -1,
+                     legsCooling = -1, retryAfterS = -1): string =
   ## The nine keys of SPEC §5.1 in that order, plus `alias` as a tenth when the
   ## caller named a gateway alias, plus `effort_clamped` as an eleventh when the
   ## leg's ceiling pulled the requested effort down, plus `cost_usd` as a twelfth
@@ -953,6 +1139,17 @@ proc requestLogLine*(ts, route: string, status, latencyMs: int,
     result.add ",\"effort_clamped\":" & jsonEscape(effortClamped)
   if costUsd.isSome:
     result.add ",\"cost_usd\":" & jsonUsd6(costUsd.get)
+  # DEC-26. Four more optional keys, last for the same reason as the three above:
+  # a line written by an older binary still parses, and a reader that knows only
+  # the nine keys sees the same row it always did.
+  if promptKib >= 0:
+    result.add ",\"prompt_kib\":" & $promptKib
+  if headerMs >= 0:
+    result.add ",\"header_ms\":" & $headerMs
+  if legsCooling >= 0:
+    result.add ",\"legs_cooling\":" & $legsCooling
+  if retryAfterS >= 0:
+    result.add ",\"retry_after_s\":" & $retryAfterS
   result.add "}"
 
 proc openRequestLog*(path: string, rotateBytes: int64 = 0,
@@ -1255,7 +1452,7 @@ proc newGateway*(cfg: Config, log: RequestLog,
                                     failoversByReason: initTable[string, int](),
                                     cooldownStarts: initTable[string, int](),
                                     statusClasses: initTable[string, int]()),
-                   sessions: initTable[string, float](),
+                   sessions: initTable[string, AdminSession](),
                    staticFiles: staticFileTable())
   # The seeded credential is the starting point, not the truth: a refresh replaces
   # it in memory and, when the file is writable, on disk.
@@ -1279,12 +1476,63 @@ proc legAvailable*(gateway: Gateway, index: int, now: float): bool =
     return false
   not runtime.probeInFlight
 
-proc pickWeighted(legs: seq[Leg], pool: seq[int],
-                  currents: var seq[int]): int =
+proc enabledLegCount*(gateway: Gateway): int =
+  ## DEC-26. The number that decides whether a header rung exists to protect
+  ## another leg or only to tell the caller how long to wait. Overrides are already
+  ## folded into `enabled` at load.
+  for leg in gateway.cfg.legs:
+    if leg.enabled:
+      inc result
+
+proc systemoneEnabledCount*(gateway: Gateway): int =
+  for leg in gateway.cfg.systemone:
+    if leg.enabled:
+      inc result
+
+proc coolingSummary*(gateway: Gateway,
+                     now: float): tuple[enabled, cooling, retryAfterS: int] =
+  ## Every enabled leg is cooling: how many, and how long until the first of them
+  ## is eligible again. `retryAfterS` is the ceiling of that wait, so a caller is
+  ## never told to retry before the gateway will dial.
+  for index, leg in gateway.cfg.legs:
+    if not leg.enabled:
+      continue
+    inc result.enabled
+    let untilAt = gateway.legs[index].coolingUntil
+    if untilAt > now:
+      inc result.cooling
+      let wait = int(untilAt - now) + 1
+      if result.retryAfterS == 0 or wait < result.retryAfterS:
+        result.retryAfterS = wait
+
+proc systemoneCoolingSummary*(gateway: Gateway,
+                              now: float): tuple[enabled, cooling,
+                                                 retryAfterS: int] =
+  for index, leg in gateway.cfg.systemone:
+    if not leg.enabled:
+      continue
+    inc result.enabled
+    let untilAt = gateway.systemone[index].coolingUntil
+    if untilAt > now:
+      inc result.cooling
+      let wait = int(untilAt - now) + 1
+      if result.retryAfterS == 0 or wait < result.retryAfterS:
+        result.retryAfterS = wait
+
+proc modelDisabled*(gateway: Gateway, alias: string): bool =
+  ## DEC-27. Only an explicit `false` switches an alias off; a missing key keeps
+  ## the alias serving.
+  gateway.cfg.overridesModels.hasKey(alias) and
+    not gateway.cfg.overridesModels[alias]
+
+proc pickWeighted[T](legs: seq[T], pool: seq[int],
+                     currents: var seq[int]): int =
   ## DEC-11's smooth weighted round-robin, the nginx algorithm: every turn each
   ## candidate gains its weight, the largest current wins, and the winner pays the
   ## total back. One call per request, no durable state, and a weight of 1 on
   ## every leg degenerates to plain round-robin. `currents` is indexed by leg.
+  ## Generic since DEC-28: the chat legs and the System One legs both carry a
+  ## `weight`, and the same pick decides both doors.
   var total = 0
   for index in pool:
     total += legs[index].weight
@@ -1350,7 +1598,8 @@ proc pickOrder*(gateway: Gateway): seq[int] =
       result.add index
 
 proc cooldownSeconds*(reason: string, headerTimeouts: int,
-                      headerWindowMs: int): float =
+                      headerWindowMs: int, singleLeg = false,
+                      retryAfterS = -1): float =
   ## DEC-23: the class decides the width. A header timeout is the one class that
   ## widens with repetition, and its first rung is the header window that failure
   ## just cost, clamped to [HeaderTimeoutCooldownS, AvailabilityCooldownS].
@@ -1362,30 +1611,49 @@ proc cooldownSeconds*(reason: string, headerTimeouts: int,
   ## costs a minute keeps the old flat 60 s, by construction.
   ##
   ## `headerTimeouts` is the count before this failure, so 0 is the first rung.
+  ##
+  ## DEC-26 adds two shapes: a rate-limited 429 cools for its Retry-After inside
+  ## [5, 120] s, and a one-leg gateway caps a header rung at 15 s because there is
+  ## no other leg a longer skip could protect.
   if reason in [TokenQuota429, TokenBilling402]:
-    return CapacityCooldownS
+    var capacity = CapacityCooldownS
+    if retryAfterS > 0:
+      capacity = min(max(float(retryAfterS), CapacityRetryAfterMinS),
+                     CapacityCooldownS)
+    return capacity
+  if reason == TokenRateLimited:
+    if retryAfterS > 0:
+      return min(max(float(retryAfterS), RateLimitRetryAfterMinS),
+                 RateLimitRetryAfterMaxS)
+    return RateLimitDefaultS
   if reason != TokenHeaderTimeout:
     return AvailabilityCooldownS
   var cooldown = float(headerWindowMs) / 1000.0
   if cooldown < HeaderTimeoutCooldownS:
     cooldown = HeaderTimeoutCooldownS
   if cooldown >= AvailabilityCooldownS:
-    return AvailabilityCooldownS
-  for _ in 1 .. headerTimeouts:
-    cooldown *= 2.0
-    if cooldown >= AvailabilityCooldownS:
-      return AvailabilityCooldownS
+    cooldown = AvailabilityCooldownS
+  else:
+    for _ in 1 .. headerTimeouts:
+      cooldown *= 2.0
+      if cooldown >= AvailabilityCooldownS:
+        cooldown = AvailabilityCooldownS
+        break
+  if singleLeg:
+    cooldown = min(cooldown, SingleLegHeaderMaxMs.float / 1000.0)
   cooldown
 
 proc startCooldown*(gateway: Gateway, index: int, reason: string,
-                    headerWindowMs = HeaderDeadlineNonStreamMs) =
+                    headerWindowMs = HeaderDeadlineNonStreamMs,
+                    singleLeg = false, retryAfterS = -1) =
   ## §3.1 and §3.2: the cooldown starts at the failure, and the leg's failure
   ## counter moves once for this request (D11.1). `headerWindowMs` is the header
   ## deadline this attempt actually waited, so the ladder's first rung can never
   ## be cheaper than the probe that would follow it (DEC-23).
   let now = epochTime()
   var runtime = addr gateway.legs[index]
-  let cooldown = cooldownSeconds(reason, runtime.headerTimeouts, headerWindowMs)
+  let cooldown = cooldownSeconds(reason, runtime.headerTimeouts, headerWindowMs,
+                                 singleLeg, retryAfterS)
   if reason == TokenHeaderTimeout:
     runtime.headerTimeouts.inc
   runtime.attempted = true
@@ -1435,23 +1703,43 @@ proc recordEvent(gateway: Gateway, fromRoute, toRoute, reason: string) =
 # ------------------------------------------------------- systemone router ---
 
 proc systemoneOrder*(gateway: Gateway, now: float): seq[int] =
-  ## DEC-19. Config order, nothing else: this list is a fallback chain, not a
-  ## load balancer. A cooling leg is skipped without a dial exactly as a chat leg
-  ## is, and a leg the config switched off keeps its place in the order.
+  ## DEC-19 as amended by DEC-28. With `systemone_balance: false` (the default)
+  ## this is config order and nothing else: a fallback chain, not a load balancer.
+  ## With it on, the first pick is the same smooth weighted round-robin the chat
+  ## door uses, over the legs that are enabled and not cooling, and the rest of the
+  ## walk stays config order. A cooling leg is skipped without a dial exactly as a
+  ## chat leg is.
+  var pool: seq[int]
   for index, leg in gateway.cfg.systemone:
     if not leg.enabled:
       continue
     if gateway.systemone[index].coolingUntil > now:
       continue
-    result.add index
+    pool.add index
+  if pool.len == 0:
+    return @[]
+  if not gateway.cfg.systemoneBalance:
+    return pool
+  var currents = newSeq[int](gateway.cfg.systemone.len)
+  for index in 0 ..< gateway.cfg.systemone.len:
+    currents[index] = gateway.systemone[index].weightCurrent
+  let chosen = pickWeighted(gateway.cfg.systemone, pool, currents)
+  for index in 0 ..< gateway.cfg.systemone.len:
+    gateway.systemone[index].weightCurrent = currents[index]
+  result.add chosen
+  for index in pool:
+    if index != chosen:
+      result.add index
 
 proc startSystemoneCooldown*(gateway: Gateway, index: int, reason: string,
-                             headerWindowMs = HeaderDeadlineNonStreamMs) =
+                             headerWindowMs = HeaderDeadlineNonStreamMs,
+                             singleLeg = false, retryAfterS = -1) =
   ## The same two cooldowns and the same reason tokens as the chat door, so one
   ## log is readable without knowing which door a line came from.
   let now = epochTime()
   var runtime = addr gateway.systemone[index]
-  let cooldown = cooldownSeconds(reason, runtime.headerTimeouts, headerWindowMs)
+  let cooldown = cooldownSeconds(reason, runtime.headerTimeouts, headerWindowMs,
+                                 singleLeg, retryAfterS)
   if reason == TokenHeaderTimeout:
     runtime.headerTimeouts.inc
   runtime.attempted = true
@@ -1504,15 +1792,18 @@ proc remainingMs(deadline: float): int =
 proc deadlineIn(ms: int): float =
   epochTime() + ms.float / 1000.0
 
+proc streamHeaderDeadlineMs*(baseMs, perKiBMs, maxMs, bodyBytes: int): int =
+  ## SPEC §3b.1 with the size slope of D-2, with the numbers passed in so the
+  ## config owns them (DEC-26). A body of zero bytes still gets the floor.
+  if bodyBytes <= 0 or perKiBMs <= 0:
+    return baseMs
+  min(baseMs + (bodyBytes div 1024) * perKiBMs, maxMs)
+
 proc streamHeaderDeadlineMs*(bodyBytes: int): int =
-  ## SPEC §3b.1 with the size slope of D-2: a provider's first byte arrives later
-  ## the more prompt it was handed, so the streaming header window grows with the
-  ## outbound body from the 15 s floor and stops at the cap. Short prompts keep
-  ## the floor, which is why a3b still measures 15 s.
-  if bodyBytes <= 0:
-    return HeaderDeadlineStreamMs
-  min(HeaderDeadlineStreamMs + (bodyBytes div 1024) * HeaderDeadlineStreamPerKiBMs,
-      HeaderDeadlineStreamMaxMs)
+  ## The compiled defaults, kept for callers that have no config in hand and for
+  ## the unit tests that pin the shipped numbers.
+  streamHeaderDeadlineMs(HeaderDeadlineStreamMs, HeaderDeadlineStreamPerKiBMs,
+                         HeaderDeadlineStreamMaxMs, bodyBytes)
 
 proc awaitRecv(socket: AsyncSocket, maxBytes: int,
                deadline: float): Future[RecvOut] {.async.} =
@@ -1716,6 +2007,10 @@ proc failureToken*(status: int, body: string, aliasMapped = false,
     TokenModelGone
   elif status == 429 and isQuotaBody(body):
     TokenQuota429
+  elif status == 429:
+    ## DEC-26. A 429 that is not a quota is a rate limit: it may clear in seconds,
+    ## so it is its own class rather than inheriting the 900 s capacity rung.
+    TokenRateLimited
   elif status == 402:
     # A provider that has run out of credit answers 402 with its own billing
     # body. It is a dead route, not a caller error: leaving it unclassified
@@ -1958,6 +2253,13 @@ proc unknownAliasBody*(alias: string): string =
   "{\"error\":{\"type\":\"unknown_alias\",\"message\":" &
     jsonEscape("no leg maps the model alias '" & alias & "'") & "}}"
 
+proc aliasDisabledBody*(alias: string): string =
+  ## DEC-27. Fixed shape, the caller's own alias echoed only after the same length
+  ## bound an unknown alias gets.
+  "{\"error\":{\"type\":\"" & TokenAliasDisabled &
+    "\",\"message\":" & jsonEscape("model alias '" & alias &
+    "' is switched off in the gateway") & "}}"
+
 proc aliasTooLong*(alias: string): bool =
   ## Item 3: checked before any leg is touched, so an over-long name never reaches
   ## the walk, the log line at full length, or the response body.
@@ -2076,6 +2378,27 @@ proc sseErrorEvent(reason: string, message: string): string =
 proc allLegsFailedBody(message: string): string =
   "{\"error\":{\"type\":\"all_legs_failed\",\"message\":" &
     jsonEscape(message) & "}}"
+
+proc allLegsCoolingBody(retryAfterS: int): string =
+  ## DEC-26. The gateway never dialled: the code is 503, the body names the state
+  ## and the wait, and no leg name reaches the caller.
+  "{\"error\":{\"type\":\"all_legs_cooling\",\"message\":" &
+    jsonEscape("no leg can serve this request now; retry in " & $retryAfterS &
+               "s") &
+    ",\"retry_after_s\":" & $retryAfterS & "}}"
+
+proc noLegEnabledBody(): string =
+  "{\"error\":{\"type\":\"no_leg_enabled\",\"message\":" &
+    jsonEscape("every provider is switched off in the gateway") & "}}"
+
+proc sendErrorBodyWithHeaders(request: Request, code: int, payload: string,
+                              extra: seq[(string, string)]): Future[void] {.async.} =
+  var headers = @[("Content-Type", "application/json"),
+                  ("Content-Length", $payload.len),
+                  ("Cache-Control", "no-store")]
+  for pair in extra:
+    headers.add pair
+  await request.client.send(buildHead(code, headers) & payload)
 
 proc credentialRefreshBody(reason, detail: string): string =
   ## §4: the type is the reason token, so a caller can tell a credential problem
@@ -2575,7 +2898,7 @@ proc attemptLeg(gateway: Gateway, request: Request, leg: Leg, bearer: string,
     # The head send drives the TLS handshake, so its deadline is the TLS one.
     let handshakeDeadline =
       if isTls: deadlineIn(TlsDeadlineMs)
-      else: deadlineIn(HeaderDeadlineNonStreamMs)
+      else: deadlineIn(gateway.cfg.headerNonStreamMs)
     if not await client.awaitSend(head, handshakeDeadline):
       result.kind = akFailed
       result.reason = if isTls: TokenDialTimeout else: TokenConnRefused
@@ -2588,8 +2911,11 @@ proc attemptLeg(gateway: Gateway, request: Request, leg: Leg, bearer: string,
 
     # ---- response headers: the end of the failover window (§3b.2) ----
     result.headerWindowMs =
-      if stream: streamHeaderDeadlineMs(body.len)
-      else: HeaderDeadlineNonStreamMs
+      if stream: streamHeaderDeadlineMs(gateway.cfg.headerStreamBaseMs,
+                                        gateway.cfg.headerStreamPerKiBMs,
+                                        gateway.cfg.headerStreamMaxMs, body.len)
+      else: gateway.cfg.headerNonStreamMs
+    let headerSentAt = epochTime()
     let headerDeadline = deadlineIn(result.headerWindowMs)
     var raw = ""
     var headDone = false
@@ -2617,6 +2943,18 @@ proc attemptLeg(gateway: Gateway, request: Request, leg: Leg, bearer: string,
     let split = raw.find("\r\n\r\n")
     let (status, headers) = parseHead(raw[0 ..< split])
     let leftover = raw[split + 4 .. ^1]
+    # DEC-26. The measurement the plan asked for: body sent to first byte of the
+    # response head. Only the answering leg records one, so a failed leg leaves it
+    # unknown rather than reporting a wait it did not finish.
+    result.headerMs = max(0, int((epochTime() - headerSentAt) * 1000.0))
+    let retryHeader = headerValue(headers, "retry-after")
+    if retryHeader.len > 0:
+      try:
+        let seconds = parseInt(retryHeader.strip())
+        if seconds >= 0:
+          result.retryAfterS = seconds
+      except ValueError:
+        discard
     if status == 0:
       result.kind = akFailed
       result.reason = TokenUpstream5xx
@@ -2657,6 +2995,11 @@ proc attemptLeg(gateway: Gateway, request: Request, leg: Leg, bearer: string,
       if token.len > 0:
         result.kind = akFailed
         result.reason = token
+        # DEC-26: a rate limit is the one failure whose own words are useful to
+        # the caller. Keep them so the last leg can pass the 429 through.
+        if token == TokenRateLimited:
+          result.passthroughBody = errorBody
+          result.status = status
         return
       # §3.3: any other 4xx is the caller's problem. Returned unchanged.
       let contentType = headerValue(headers, "content-type")
@@ -2807,6 +3150,16 @@ proc handleChat(gateway: Gateway, request: Request): Future[void] {.async.} =
   # Item (cost): the id the answering leg was actually sent, so the price lookup
   # uses the provider's model and not the caller's alias.
   var servedModel = ""
+  # DEC-26. Facts the response and the log both need.
+  var headerMs = -1
+  var legsCooling = -1
+  var retryAfterS = -1
+  var terminalReason = ""
+  var lastRateBody = ""
+  var lastRateStatus = 429
+  var lastRateS = -1
+  let singleLeg = gateway.enabledLegCount() == 1
+  let promptKib = forwardBody.len div 1024
 
   var aliasKnown = false
   if alias.isSome and not aliasTooLong(alias.get):
@@ -2821,6 +3174,13 @@ proc handleChat(gateway: Gateway, request: Request): Future[void] {.async.} =
     status = 400
     answered = true
     chain.firstReason = TokenAliasTooLong
+  elif alias.isSome and gateway.modelDisabled(alias.get):
+    # DEC-27. The alias exists and the operator switched it off, which is a
+    # different fact from a name no leg maps.
+    await request.sendErrorBody(400, aliasDisabledBody(alias.get))
+    status = 400
+    answered = true
+    chain.firstReason = TokenAliasDisabled
   elif alias.isSome and not aliasKnown:
     # No leg in the config maps this name: a client error with a body that says
     # so, not a 500 and not a walk that ends in an all-legs-failed 502.
@@ -2831,10 +3191,22 @@ proc handleChat(gateway: Gateway, request: Request): Future[void] {.async.} =
 
   let order = gateway.pickOrder()
   if not answered and order.len == 0:
-    # Every leg is cooling: no dial at all (D12.3's third sentence).
-    route = gateway.cfg.legs[^1].name
-    await request.sendErrorBody(502, allLegsFailedBody("all_legs_cooling"))
+    # DEC-26. No dial at all (D12.3's third sentence), and an honest answer: what
+    # the caller can do (wait) and for how long. Nothing here names a leg.
+    let summary = gateway.coolingSummary(epochTime())
+    route = ""
+    status = 503
     answered = true
+    if summary.enabled == 0:
+      terminalReason = "no_leg_enabled"
+      legsCooling = 0
+      await request.sendErrorBody(503, noLegEnabledBody())
+    else:
+      terminalReason = "all_legs_cooling"
+      legsCooling = summary.cooling
+      retryAfterS = max(summary.retryAfterS, 1)
+      await request.sendErrorBodyWithHeaders(503,
+        allLegsCoolingBody(retryAfterS), @[("Retry-After", $retryAfterS)])
 
   if not answered:
     for position, index in order:
@@ -2973,7 +3345,8 @@ proc handleChat(gateway: Gateway, request: Request): Future[void] {.async.} =
 
       case outcome.kind
       of akFailed:
-        gateway.startCooldown(index, outcome.reason, outcome.headerWindowMs)
+        gateway.startCooldown(index, outcome.reason, outcome.headerWindowMs,
+                              singleLeg, outcome.retryAfterS)
         chain.lastReason = outcome.reason
         if chain.firstReason.len == 0:
           chain.firstReason = outcome.reason
@@ -2982,6 +3355,12 @@ proc handleChat(gateway: Gateway, request: Request): Future[void] {.async.} =
             chain.capacity = true
           else:
             chain.availability = true
+        if outcome.reason == TokenRateLimited and outcome.passthroughBody.len > 0:
+          # DEC-26. Keep the last 429 in the walk. If no leg serves, the caller
+          # gets the provider's own 429 back instead of a fabricated 502.
+          lastRateBody = outcome.passthroughBody
+          lastRateStatus = outcome.status
+          lastRateS = outcome.retryAfterS
         if position + 1 < order.len:
           gateway.recordEvent(leg.name, gateway.cfg.legs[order[position + 1]].name,
                               outcome.reason)
@@ -2992,6 +3371,8 @@ proc handleChat(gateway: Gateway, request: Request): Future[void] {.async.} =
           abortReason = outcome.reason
         tokensIn = outcome.tokensIn
         tokensOut = outcome.tokensOut
+        if outcome.headerMs >= 0:
+          headerMs = outcome.headerMs
         # A caller that hung up still got a live answer from a live leg, so the
         # leg is marked served: the abort is the caller's fault, not the leg's.
         if outcome.kind != akTerminal:
@@ -3022,6 +3403,20 @@ proc handleChat(gateway: Gateway, request: Request): Future[void] {.async.} =
     route = gateway.cfg.legs[^1].name
     await request.sendErrorBody(400, effortUnsupportedBody(callerEffort))
     status = 400
+    tokensIn = none(int)
+    tokensOut = none(int)
+    answered = true
+
+  if not answered and lastRateBody.len > 0:
+    # DEC-26. The walk ended on a plain 429: return the provider's own body and
+    # its own Retry-After, not an all-legs-failed 502.
+    var extra: seq[(string, string)]
+    if lastRateS >= 0:
+      extra.add ("Retry-After", $lastRateS)
+    await request.sendErrorBodyWithHeaders(lastRateStatus, lastRateBody, extra)
+    status = lastRateStatus
+    retryAfterS = lastRateS
+    terminalReason = TokenRateLimited
     tokensIn = none(int)
     tokensOut = none(int)
     answered = true
@@ -3061,6 +3456,7 @@ proc handleChat(gateway: Gateway, request: Request): Future[void] {.async.} =
     if hardStop.len > 0: hardStop
     elif terminalAbort and abortReason.len > 0: abortReason
     elif terminalAbort: TokenMidStreamAbort
+    elif terminalReason.len > 0: terminalReason
     else: chain.firstReason
 
   let latencyMs = int((epochTime() - started) * 1000.0)
@@ -3090,7 +3486,11 @@ proc handleChat(gateway: Gateway, request: Request): Future[void] {.async.} =
       # never clamped keeps the nine keys it had before this feature.
       effortClamped = effortClampedLog,
       # Absent on a model the config does not price: "not priced" is not "$0.00".
-      costUsd = costUsd))
+      costUsd = costUsd,
+      promptKib = promptKib,
+      headerMs = headerMs,
+      legsCooling = legsCooling,
+      retryAfterS = retryAfterS))
 
 # ------------------------------------------------------------- systemone ---
 
@@ -3139,7 +3539,7 @@ proc attemptSystemone(gateway: Gateway, request: Request, leg: SystemoneLeg,
 
     let handshakeDeadline =
       if isTls: deadlineIn(TlsDeadlineMs)
-      else: deadlineIn(HeaderDeadlineNonStreamMs)
+      else: deadlineIn(gateway.cfg.headerNonStreamMs)
     if not await client.awaitSend(head, handshakeDeadline):
       result.kind = akFailed
       result.reason = if isTls: TokenDialTimeout else: TokenConnRefused
@@ -3150,8 +3550,9 @@ proc attemptSystemone(gateway: Gateway, request: Request, leg: SystemoneLeg,
         result.reason = TokenConnRefused
         return
 
-    let headerDeadline = deadlineIn(HeaderDeadlineNonStreamMs)
-    result.headerWindowMs = HeaderDeadlineNonStreamMs
+    let headerDeadline = deadlineIn(gateway.cfg.headerNonStreamMs)
+    result.headerWindowMs = gateway.cfg.headerNonStreamMs
+    let headerSentAt = epochTime()
     var raw = ""
     var headDone = false
     while not headDone:
@@ -3178,6 +3579,18 @@ proc attemptSystemone(gateway: Gateway, request: Request, leg: SystemoneLeg,
     let split = raw.find("\r\n\r\n")
     let (status, headers) = parseHead(raw[0 ..< split])
     let leftover = raw[split + 4 .. ^1]
+    # DEC-26. The measurement the plan asked for: body sent to first byte of the
+    # response head. Only the answering leg records one, so a failed leg leaves it
+    # unknown rather than reporting a wait it did not finish.
+    result.headerMs = max(0, int((epochTime() - headerSentAt) * 1000.0))
+    let retryHeader = headerValue(headers, "retry-after")
+    if retryHeader.len > 0:
+      try:
+        let seconds = parseInt(retryHeader.strip())
+        if seconds >= 0:
+          result.retryAfterS = seconds
+      except ValueError:
+        discard
     if status == 0:
       result.kind = akFailed
       result.reason = TokenUpstream5xx
@@ -3282,13 +3695,34 @@ proc handleSystemone(gateway: Gateway, request: Request): Future[void] {.async.}
   var servedModel = ""
   var firstFrom = ""
   var firstReason = ""
+  var headerMs = -1
+  var legsCooling = -1
+  var retryAfterS = -1
+  var terminalReason = ""
+  var lastRateBody = ""
+  var lastRateStatus = 429
+  var lastRateS = -1
+  let singleLeg = gateway.systemoneEnabledCount() == 1
+  let promptKib = body.len div 1024
 
   let order = gateway.systemoneOrder(epochTime())
   if order.len == 0:
-    # Every configured System One leg is cooling: no dial at all, same as chat.
-    route = gateway.cfg.systemone[^1].name
-    await request.sendErrorBody(502, allLegsFailedBody("all_legs_cooling"))
+    # DEC-26. Same honest answer as the chat door: no leg is dialled, so the code
+    # is 503 and the body says how long to wait. Nothing here names a leg.
+    let summary = gateway.systemoneCoolingSummary(epochTime())
+    route = ""
+    status = 503
     answered = true
+    if summary.enabled == 0:
+      terminalReason = "no_leg_enabled"
+      legsCooling = 0
+      await request.sendErrorBody(503, noLegEnabledBody())
+    else:
+      terminalReason = "all_legs_cooling"
+      legsCooling = summary.cooling
+      retryAfterS = max(summary.retryAfterS, 1)
+      await request.sendErrorBodyWithHeaders(503,
+        allLegsCoolingBody(retryAfterS), @[("Retry-After", $retryAfterS)])
 
   if not answered and body.strip().len == 0:
     route = gateway.cfg.systemone[0].name
@@ -3308,10 +3742,15 @@ proc handleSystemone(gateway: Gateway, request: Request): Future[void] {.async.}
                                                   totalDeadline)
       if outcome.kind == akFailed:
         gateway.startSystemoneCooldown(index, outcome.reason,
-                                       outcome.headerWindowMs)
+                                       outcome.headerWindowMs, singleLeg,
+                                       outcome.retryAfterS)
         if firstReason.len == 0:
           firstReason = outcome.reason
           firstFrom = leg.name
+        if outcome.reason == TokenRateLimited and outcome.passthroughBody.len > 0:
+          lastRateBody = outcome.passthroughBody
+          lastRateStatus = outcome.status
+          lastRateS = outcome.retryAfterS
         if position + 1 < order.len:
           gateway.recordEvent(leg.name,
                               gateway.cfg.systemone[order[position + 1]].name,
@@ -3323,10 +3762,24 @@ proc handleSystemone(gateway: Gateway, request: Request): Future[void] {.async.}
         abortReason = outcome.reason
       tokensIn = outcome.tokensIn
       tokensOut = outcome.tokensOut
+      if outcome.headerMs >= 0:
+        headerMs = outcome.headerMs
       if outcome.kind != akTerminal:
         gateway.markSystemoneServed(index)
       answered = true
       break
+
+  if not answered and lastRateBody.len > 0:
+    var extra: seq[(string, string)]
+    if lastRateS >= 0:
+      extra.add ("Retry-After", $lastRateS)
+    await request.sendErrorBodyWithHeaders(lastRateStatus, lastRateBody, extra)
+    status = lastRateStatus
+    retryAfterS = lastRateS
+    terminalReason = TokenRateLimited
+    tokensIn = none(int)
+    tokensOut = none(int)
+    answered = true
 
   if not answered:
     let message = if firstReason.len > 0: firstReason else: "all_legs_failed"
@@ -3347,6 +3800,7 @@ proc handleSystemone(gateway: Gateway, request: Request): Future[void] {.async.}
   let logReason =
     if terminalAbort and abortReason.len > 0: abortReason
     elif terminalAbort: TokenMidStreamAbort
+    elif terminalReason.len > 0: terminalReason
     else: firstReason
 
   let latencyMs = int((epochTime() - started) * 1000.0)
@@ -3367,7 +3821,11 @@ proc handleSystemone(gateway: Gateway, request: Request): Future[void] {.async.}
       failoverFrom = firstFrom,
       failoverReason = logReason,
       stream = false,
-      costUsd = costUsd))
+      costUsd = costUsd,
+      promptKib = promptKib,
+      headerMs = headerMs,
+      legsCooling = legsCooling,
+      retryAfterS = retryAfterS))
 
 # ---------------------------------------------------------------- log tail ---
 
@@ -3382,9 +3840,11 @@ const
 ## shows that absence rather than inventing an empty string or a zero.
 const LogRowKeys = ["ts", "route", "status", "latency_ms", "tokens_in",
                     "tokens_out", "failover_from", "failover_reason", "stream",
-                    "alias", "effort_clamped", "cost_usd"]
+                    "alias", "effort_clamped", "cost_usd", "prompt_kib",
+                    "header_ms", "legs_cooling", "retry_after_s"]
 
-const OptionalLogKeys* = ["alias", "effort_clamped", "cost_usd"]
+const OptionalLogKeys* = ["alias", "effort_clamped", "cost_usd", "prompt_kib",
+                          "header_ms", "legs_cooling", "retry_after_s"]
 
 type
   LogFilter* = object
@@ -3611,18 +4071,55 @@ proc badRequestBody(parameter: string): string =
     jsonEscape(parameter) & "}}"
 
 proc redactUrl*(value: string): string =
-  ## §5.4: a base URL is printed in full only when it carries no credential.
+  ## §5.4: a `base_url` that carries a credential prints neither the credential
+  ## nor the host beside it; the answer is `scheme://<redacted>` when it carries
+  ## either. Two shapes carry one:
+  ##
+  ## * an `@` inside the authority (`[^/?#]*` after the scheme) is userinfo;
+  ## * an `@` past a separator whose authority ends in a colon that is not an
+  ##   all-digit port is a password that a `/`, `?` or `#` pushed out of the
+  ##   authority (`user:pa/ss@host`, `user:pw#x@token`).
+  ##
+  ## The host is not salvaged in either case. Salvaging was tried across six
+  ## findings (F1c, F1f, F1g, F1h, F1i, F1j) and each rule that judged the
+  ## survivor taught the next one, because a credential is itself shaped like a
+  ## host (a JWT, `sk.live.…`, any `vendor.env.key`). An `@` in a path or query
+  ## of an otherwise clean authority cannot be userinfo and stays. Dialing is
+  ## unaffected: `parseUri` still reads the configured value; only this print is
+  ## decided.
+  let schemeAt = value.find("://")
+  let authStart =
+    if schemeAt >= 0: schemeAt + 3
+    elif value.startsWith("//"): 2
+    else: 0
+  var sep = value.len
+  for stop in ['/', '?', '#']:
+    let hit = value.find(stop, authStart)
+    if hit >= 0 and hit < sep:
+      sep = hit
+  let span = if authStart < sep: value[authStart ..< sep] else: ""
+  var credential = span.contains('@')
+  if not credential and span.len > 0 and span[0] != '[' and
+     value.find('@', sep) >= 0:
+    let colon = span.rfind(':')
+    if colon >= 0:
+      let after = span[colon + 1 .. ^1]
+      var allDigits = after.len > 0
+      for ch in after:
+        if not isDigit(ch):
+          allDigits = false
+          break
+      credential = not allDigits
+  if credential:
+    return value[0 ..< authStart] & "<redacted>"
   let query = value.find('?')
+  if query >= 0:
+    let tail = value[query + 1 .. ^1].toLowerAscii()
+    if tail.contains("key") or tail.contains("token") or tail.contains("secret") or
+       tail.contains("api"):
+      return value[0 ..< query]
   let fragment = value.find('#')
-  if query < 0:
-    if fragment >= 0:
-      return value[0 ..< fragment]
-    return value
-  let tail = value[query + 1 .. ^1].toLowerAscii()
-  if tail.contains("key") or tail.contains("token") or tail.contains("secret") or
-     tail.contains("api"):
-    return value[0 ..< query]
-  if fragment >= 0 and fragment > query:
+  if fragment >= 0 and (query < 0 or fragment < query):
     return value[0 ..< fragment]
   value
 
@@ -3777,6 +4274,7 @@ proc configJson*(gateway: Gateway): string =
     configNode["modified_at"] = newJNull()
   root["config"] = configNode
   root["balance"] = %gateway.cfg.balance
+  root["systemone_balance"] = %gateway.cfg.systemoneBalance
 
   var legs = newJArray()
   for index, leg in gateway.cfg.legs:
@@ -3787,7 +4285,12 @@ proc configJson*(gateway: Gateway): string =
     node["weight"] = %leg.weight
     node["base_url"] = %redactUrl(leg.baseUrl)
     node["model"] = %leg.model
-    node["enabled"] = %leg.enabled
+    node["enabled"] = %leg.enabledFile
+    node["serving"] = %leg.enabled
+    if gateway.cfg.overridesLegs.hasKey(leg.name):
+      node["override"] = %gateway.cfg.overridesLegs[leg.name]
+    else:
+      node["override"] = newJNull()
     node["retries"] = %leg.retries
     var aliases = newJObject()
     for alias, providerId in leg.aliases:
@@ -3836,12 +4339,12 @@ proc configJson*(gateway: Gateway): string =
   var timeouts = newJObject()
   timeouts["connect_ms"] = %ConnectDeadlineMs
   timeouts["tls_ms"] = %TlsDeadlineMs
-  timeouts["header_ms_stream"] = %HeaderDeadlineStreamMs
+  timeouts["header_ms_stream"] = %gateway.cfg.headerStreamBaseMs
   # D-2: the streaming window is a rule, not a number. The two ends and the slope
   # are published so a reader can compute what a given body gets without the source.
-  timeouts["header_ms_stream_slope_per_kib"] = %HeaderDeadlineStreamPerKiBMs
-  timeouts["header_ms_stream_max"] = %HeaderDeadlineStreamMaxMs
-  timeouts["header_ms_non_stream"] = %HeaderDeadlineNonStreamMs
+  timeouts["header_ms_stream_slope_per_kib"] = %gateway.cfg.headerStreamPerKiBMs
+  timeouts["header_ms_stream_max"] = %gateway.cfg.headerStreamMaxMs
+  timeouts["header_ms_non_stream"] = %gateway.cfg.headerNonStreamMs
   timeouts["idle_ms"] = %ChunkIdleMs
   timeouts["total_ms"] = %TotalNonStreamMs
   root["timeouts"] = timeouts
@@ -3853,6 +4356,9 @@ proc configJson*(gateway: Gateway): string =
   # timeout, so a reader can compute the second rung without the source.
   cooldowns["header_timeout_s"] = %int(HeaderTimeoutCooldownS)
   cooldowns["header_timeout_max_s"] = %int(AvailabilityCooldownS)
+  # DEC-26: a one-leg gateway caps the header rung here, because there is no other
+  # leg a longer skip could protect.
+  cooldowns["single_leg_header_max_s"] = %int(SingleLegHeaderMaxMs div 1000)
   root["cooldowns"] = cooldowns
 
   var logNode = newJObject()
@@ -3881,6 +4387,31 @@ proc configJson*(gateway: Gateway): string =
                      else: newJNull())
   root["reload"] = reload
 
+  # DEC-27. The switch block exactly as the binary holds it, so the dashboard can
+  # say what is overridden without reading the file. Values only; no credential.
+  var overridesNode = newJObject()
+  var legOverrides = newJObject()
+  for name, value in gateway.cfg.overridesLegs:
+    legOverrides[name] = %value
+  var modelOverrides = newJObject()
+  for name, value in gateway.cfg.overridesModels:
+    modelOverrides[name] = %value
+  overridesNode["legs"] = legOverrides
+  overridesNode["models"] = modelOverrides
+  if gateway.cfg.overridesUpdatedAt.len > 0:
+    overridesNode["updated_at"] = %gateway.cfg.overridesUpdatedAt
+  else:
+    overridesNode["updated_at"] = newJNull()
+  root["overrides"] = overridesNode
+
+  var writes = newJObject()
+  writes["count"] = %gateway.adminWrites
+  writes["last_at"] = (if gateway.lastAdminWriteAt.len > 0:
+                         %gateway.lastAdminWriteAt else: newJNull())
+  writes["last_action"] = (if gateway.lastAdminWriteAction.len > 0:
+                             %gateway.lastAdminWriteAction else: newJNull())
+  root["admin_writes"] = writes
+
   # DEC-19. Reported beside the chat legs, never inside them: a System One leg is
   # not part of that walk, and a dashboard that merged the two lists would draw a
   # failover chain that does not exist. The credential is reported the same way,
@@ -3893,6 +4424,7 @@ proc configJson*(gateway: Gateway): string =
       node["name"] = %leg.name
       node["base_url"] = %redactUrl(leg.baseUrl)
       node["model"] = %leg.model
+      node["weight"] = %leg.weight
       node["enabled"] = %leg.enabled
       var headers = newJArray()
       for (headerName, _) in leg.headers:
@@ -4243,10 +4775,17 @@ type
     agNoToken,   ## no token configured: the gated surface answers 404
     agDenied     ## a token exists and this request does not have it
 
+  AdminWriteGate* = enum
+    awOk,        ## the write token, as a bearer or as a write session
+    awNoToken,   ## no write token file: the surface answers 404
+    awDenied,    ## no credential that authenticates anything
+    awForbidden, ## authenticated with the read credential: wrong scope
+    awCsrf       ## a write session without the X-Kori-Write header
+
 proc pruneSessions*(gateway: Gateway, now: float) =
   var expired: seq[string]
-  for id, expiresAt in gateway.sessions:
-    if expiresAt <= now:
+  for id, session in gateway.sessions:
+    if session.expiresAt <= now:
       expired.add id
   for id in expired:
     gateway.sessions.del id
@@ -4258,6 +4797,62 @@ proc pruneLoginFailures*(gateway: Gateway, now: float) =
       kept.add at
   gateway.loginFailures = kept
 
+proc readAdminWriteToken*(): Option[string] =
+  ## DEC-27. The same file contract as the read token, in its own path. A host
+  ## without this file has no write surface at all: the caller gets the 404 the
+  ## read gate answers without a token.
+  let fromEnv = getEnv(AdminWriteTokenEnv)
+  let path = if fromEnv.len > 0: fromEnv else: DefaultAdminWriteTokenFile
+  var raw: string
+  try:
+    if not fileExists(path):
+      return none(string)
+    raw = readFile(path)
+  except CatchableError:
+    return none(string)
+  let token = raw.strip()
+  if token.len == 0:
+    return none(string)
+  some(token)
+
+proc headerIs*(request: Request, name, want: string): bool =
+  ## Exact, case-insensitive header *name* (the table already is), exact value.
+  ## Used for the one non-simple header a cookie write must carry (DEC-27).
+  for value in seq[string](request.headers.getOrDefault(name)):
+    if value.strip() == want:
+      return true
+  false
+
+proc adminWriteGate*(gateway: Gateway, request: Request): AdminWriteGate =
+  ## DEC-27. The same constant-time compare as the read gate, then three facts the
+  ## read gate does not need: the session's scope, the token that minted it, and
+  ## the header a cross-site form cannot set.
+  let token = readAdminWriteToken()
+  if token.isNone:
+    return awNoToken
+  let now = epochTime()
+  pruneSessions(gateway, now)
+  let cookie = sessionCookieValue(request)
+  if cookie.len > 0 and gateway.sessions.hasKey(cookie):
+    let session = gateway.sessions[cookie]
+    if session.expiresAt > now and session.scope == asWrite and
+       session.tokenHash == hash(token.get):
+      if headerIs(request, "X-Kori-Write", "1"):
+        return awOk
+      return awCsrf
+  let bearer = bearerValue(request)
+  if bearer.len > 0 and constantTimeEquals(token.get, bearer):
+    return awOk
+  # A credential that is valid for reads is authenticated but not allowed here.
+  let readToken = readAdminToken()
+  if readToken.isSome and bearer.len > 0 and
+     constantTimeEquals(readToken.get, bearer):
+    return awForbidden
+  if cookie.len > 0 and gateway.sessions.hasKey(cookie) and
+     gateway.sessions[cookie].expiresAt > now:
+    return awForbidden
+  awDenied
+
 proc adminGate*(gateway: Gateway, request: Request): AdminGate =
   ## Session first: it is a table lookup, and a browser sends the cookie on every
   ## request while a script sends the bearer. Either one is enough.
@@ -4268,15 +4863,27 @@ proc adminGate*(gateway: Gateway, request: Request): AdminGate =
   pruneSessions(gateway, now)
   let cookie = sessionCookieValue(request)
   if cookie.len > 0 and gateway.sessions.hasKey(cookie):
-    return agOk
+    let session = gateway.sessions[cookie]
+    if session.expiresAt > now:
+      return agOk
   let bearer = bearerValue(request)
   if bearer.len > 0 and constantTimeEquals(token.get, bearer):
     return agOk
+  # DEC-27, amended: the write token is a superset of the read one. It can already
+  # mint a write session, and a write session reads every GET; refusing the same
+  # credential as a bearer only forced a script to trade it for a cookie first.
+  let writeToken = readAdminWriteToken()
+  if bearer.len > 0 and writeToken.isSome and
+     constantTimeEquals(writeToken.get, bearer):
+    return agOk
   agDenied
 
-proc startSession*(gateway: Gateway): Option[string] =
+proc startSession*(gateway: Gateway, scope = asRead,
+                   tokenHash: Hash = Hash(0)): Option[string] =
   ## A session id that is guessable is not a gate, so no CSPRNG means no session
   ## and the caller is told the surface is unavailable rather than let in.
+  ## DEC-27: the scope and the fingerprint of the token that minted it are stored
+  ## beside the expiry, so a write session cannot outlive a rotated write token.
   var bytes: array[AdminSessionBytes, byte]
   if not urandom(bytes):
     return none(string)
@@ -4292,12 +4899,14 @@ proc startSession*(gateway: Gateway): Option[string] =
     # goes, which is the one a caller is least likely to still be using.
     var oldestId = ""
     var oldestAt = 0.0
-    for existing, expiresAt in gateway.sessions:
-      if oldestId.len == 0 or expiresAt < oldestAt:
+    for existing, session in gateway.sessions:
+      if oldestId.len == 0 or session.expiresAt < oldestAt:
         oldestId = existing
-        oldestAt = expiresAt
+        oldestAt = session.expiresAt
     gateway.sessions.del oldestId
-  gateway.sessions[id] = now + AdminSessionTtlS
+  let ttl = if scope == asWrite: AdminWriteSessionTtlS else: AdminSessionTtlS
+  gateway.sessions[id] = AdminSession(expiresAt: now + ttl, scope: scope,
+                                      tokenHash: tokenHash)
   some(id)
 
 proc sessionCookie*(value: string, maxAge: int): string =
@@ -4325,6 +4934,326 @@ proc respondGateMissing*(request: Request): Future[void] {.async.} =
   ## 401 and never 500: the answer is the same 404 an unknown path gets.
   await respondJson(request, Http404, notFoundBody())
 
+# ------------------------------------------------------------ config write ---
+# DEC-27. The only mutation the admin surface accepts: two switch maps, patched
+# into the config file by text, validated by the same loader the process boots
+# with, and applied in memory without moving the leg list.
+
+const MaxOverridesBodyBytes* = 16_384
+
+type
+  JsonSpan = object
+    found: bool
+    valueStart: int
+    valueEnd: int
+
+proc jsonValueEnd(raw: string, start: int): int =
+  ## The last byte of the JSON value beginning at `start`, or -1. String-aware, so
+  ## a brace inside a token or a URL cannot end an object early.
+  if start < 0 or start >= raw.len:
+    return -1
+  case raw[start]
+  of '{', '[':
+    var depth = 0
+    var inString = false
+    var escaped = false
+    var i = start
+    while i < raw.len:
+      let ch = raw[i]
+      if inString:
+        if escaped: escaped = false
+        elif ch == '\\': escaped = true
+        elif ch == '"': inString = false
+      else:
+        case ch
+        of '"': inString = true
+        of '{', '[': inc depth
+        of '}', ']':
+          dec depth
+          if depth == 0:
+            return i
+        else: discard
+      inc i
+    -1
+  of '"':
+    stringLiteralEnd(raw, start)
+  else:
+    var i = start
+    while i < raw.len and raw[i] notin {',', '}', ']', ' ', '\t', '\r', '\n'}:
+      inc i
+    i - 1
+
+proc overridesSpan(raw: string): JsonSpan =
+  ## The top-level `"overrides"` value. Only a key at depth 1 can match, so an
+  ## `overrides` string inside a leg or a header value is never touched.
+  var depth = 0
+  var inString = false
+  var escaped = false
+  var i = 0
+  while i < raw.len:
+    let ch = raw[i]
+    if inString:
+      if escaped: escaped = false
+      elif ch == '\\': escaped = true
+      elif ch == '"': inString = false
+      inc i
+      continue
+    case ch
+    of '"':
+      let endQuote = stringLiteralEnd(raw, i)
+      if endQuote < 0:
+        return
+      var j = endQuote + 1
+      while j < raw.len and raw[j] in {' ', '\t', '\r', '\n'}:
+        inc j
+      if depth == 1 and j < raw.len and raw[j] == ':' and
+         raw[i + 1 ..< endQuote] == "overrides":
+        inc j
+        while j < raw.len and raw[j] in {' ', '\t', '\r', '\n'}:
+          inc j
+        if j >= raw.len:
+          return
+        let endValue = jsonValueEnd(raw, j)
+        if endValue >= j:
+          return JsonSpan(found: true, valueStart: j, valueEnd: endValue)
+      i = endQuote + 1
+    of '{':
+      inc depth
+      inc i
+    of '}':
+      dec depth
+      inc i
+    else:
+      inc i
+
+proc overrideMapText(pairs: seq[(string, bool)]): string =
+  ## Sorted by name so two writes of the same state produce the same bytes.
+  var parts: seq[string]
+  for pair in pairs:
+    parts.add jsonEscape(pair[0]) & ":" & (if pair[1]: "true" else: "false")
+  parts.sort()
+  "{" & parts.join(",") & "}"
+
+proc patchOverridesText*(raw, valueText: string): string =
+  let span = overridesSpan(raw)
+  if span.found:
+    return raw[0 ..< span.valueStart] & valueText & raw[span.valueEnd + 1 .. ^1]
+  let close = raw.rfind('}')
+  if close < 0:
+    return ""
+  let head = raw[0 ..< close]
+  let needsComma = head.strip().len > 1
+  head & (if needsComma: "," else: "") & "\n  \"overrides\": " & valueText &
+    "\n" & raw[close .. ^1]
+
+proc writeScopeBody*(): string =
+  "{\"error\":{\"type\":\"write_scope_required\",\"message\":\"a write token is required for this endpoint\"}}"
+
+proc csrfHeaderBody*(): string =
+  "{\"error\":{\"type\":\"csrf_header_required\",\"message\":\"X-Kori-Write: 1 is required for a cookie write\"}}"
+
+proc lastLegBody*(): string =
+  "{\"error\":{\"type\":\"last_leg\",\"message\":\"this would switch off the last serving provider; send confirm_last_leg to do it anyway\"}}"
+
+proc adminBadBody*(message: string): string =
+  "{\"error\":{\"type\":\"bad_request\",\"message\":" & jsonEscape(message) & "}}"
+
+proc handleAdminOverrides(gateway: Gateway,
+                          request: Request): Future[void] {.async.} =
+  case gateway.adminWriteGate(request)
+  of awNoToken: await respondGateMissing(request); return
+  of awDenied: await respondGateDenied(request, page = false); return
+  of awForbidden: await respondJson(request, Http403, writeScopeBody()); return
+  of awCsrf: await respondJson(request, Http403, csrfHeaderBody()); return
+  of awOk: discard
+
+  if request.body.len > MaxOverridesBodyBytes:
+    await respondJson(request, Http413,
+      "{\"error\":{\"type\":\"body_too_large\",\"message\":\"overrides body is larger than 16 KiB\"}}")
+    return
+  var node: JsonNode
+  try:
+    node = parseJson(request.body)
+  except CatchableError:
+    await respondJson(request, Http400, adminBadBody("body is not valid JSON"))
+    return
+  if node.kind != JObject:
+    await respondJson(request, Http400, adminBadBody("body must be a JSON object"))
+    return
+
+  var confirmLast = false
+  var legs = initTable[string, bool]()
+  var models = initTable[string, bool]()
+  for key, value in node:
+    case key
+    of "confirm_last_leg":
+      if value.kind != JBool:
+        await respondJson(request, Http400,
+          adminBadBody("confirm_last_leg must be true or false"))
+        return
+      confirmLast = value.getBool()
+    of "legs":
+      if value.kind != JObject:
+        await respondJson(request, Http400, adminBadBody("legs must be an object"))
+        return
+      for name, flag in value:
+        if flag.kind != JBool:
+          await respondJson(request, Http400,
+            adminBadBody("legs." & name & " must be true or false"))
+          return
+        legs[name] = flag.getBool()
+    of "models":
+      if value.kind != JObject:
+        await respondJson(request, Http400, adminBadBody("models must be an object"))
+        return
+      for name, flag in value:
+        if flag.kind != JBool:
+          await respondJson(request, Http400,
+            adminBadBody("models." & name & " must be true or false"))
+          return
+        models[name] = flag.getBool()
+    else:
+      await respondJson(request, Http400,
+        adminBadBody("overrides." & key & " is not a known key"))
+      return
+
+  # Only names the config knows. A typo is refused here rather than written into a
+  # file the next reload would refuse whole.
+  for name in legs.keys:
+    var known = false
+    for leg in gateway.cfg.legs:
+      if leg.name == name:
+        known = true
+        break
+    if not known:
+      await respondJson(request, Http400,
+        adminBadBody("legs." & name & " names no leg"))
+      return
+  for name in models.keys:
+    var known = false
+    for leg in gateway.cfg.legs:
+      if leg.aliases.hasKey(name):
+        known = true
+        break
+    if not known:
+      await respondJson(request, Http400,
+        adminBadBody("models." & name & " names no model alias"))
+      return
+
+  # The last-leg guard: the file's own `enabled` is the baseline, not the value an
+  # earlier override wrote.
+  var serving = 0
+  for leg in gateway.cfg.legs:
+    let effective =
+      if legs.hasKey(leg.name): legs[leg.name] else: leg.enabledFile
+    if effective:
+      inc serving
+  if serving == 0 and not confirmLast:
+    await respondJson(request, Http409, lastLegBody())
+    return
+
+  if gateway.configPath.len == 0:
+    await respondJson(request, Http500,
+      adminBadBody("this process has no config path to write"))
+    return
+  var raw: string
+  try:
+    raw = readFile(gateway.configPath)
+  except CatchableError:
+    await respondJson(request, Http500,
+      adminBadBody("cannot read the config file back"))
+    return
+  let originalSize = raw.len
+  var originalMtime = fromUnix(0)
+  try:
+    originalMtime = getLastModificationTime(gateway.configPath)
+  except CatchableError:
+    discard
+
+  let stamp = nowStamp()
+  var legPairs: seq[(string, bool)]
+  for name, flag in legs:
+    legPairs.add (name, flag)
+  var modelPairs: seq[(string, bool)]
+  for name, flag in models:
+    modelPairs.add (name, flag)
+  let valueText = "{\"legs\":" & overrideMapText(legPairs) &
+    ",\"models\":" & overrideMapText(modelPairs) &
+    ",\"updated_at\":" & jsonEscape(stamp) & "}"
+  let patched = patchOverridesText(raw, valueText)
+  if patched.len == 0:
+    await respondJson(request, Http500,
+      adminBadBody("the config file has no closing object to patch"))
+    return
+  try:
+    discard loadConfigText(patched, gateway.configPath)
+  except ConfigError:
+    await respondJson(request, Http500,
+      adminBadBody("the patched config did not validate; nothing was written"))
+    return
+  # An external hand edit or an OAuth refresh between the read and the write is a
+  # conflict, not a file to clobber.
+  var currentMtime = fromUnix(0)
+  try:
+    currentMtime = getLastModificationTime(gateway.configPath)
+  except CatchableError:
+    discard
+  var sizeChanged = true
+  try:
+    sizeChanged = getFileSize(gateway.configPath) != originalSize.int64
+  except CatchableError:
+    discard
+  if currentMtime != originalMtime or sizeChanged:
+    await respondJson(request, Http409,
+      "{\"error\":{\"type\":\"config_changed\",\"message\":\"the config changed while the write was prepared; retry\"}}")
+    return
+
+  # One generation of backup beside the original, same 0600 mode, then the same
+  # temp-and-rename the OAuth write-back already uses.
+  if not writeFileAtomic(gateway.configPath & ".bak", raw):
+    await respondJson(request, Http500,
+      adminBadBody("cannot write the config backup"))
+    return
+  if not writeFileAtomic(gateway.configPath, patched):
+    await respondJson(request, Http500,
+      adminBadBody("cannot write the config file"))
+    return
+
+  # Apply now without touching the leg list: `enabled` is a field future requests
+  # read, and nothing holds an index across this block. The reload is requested as
+  # well, so the in-memory config and the file converge at the next quiet moment.
+  gateway.cfg.overridesLegs = legs
+  gateway.cfg.overridesModels = models
+  gateway.cfg.overridesUpdatedAt = stamp
+  for index in 0 ..< gateway.cfg.legs.len:
+    let name = gateway.cfg.legs[index].name
+    gateway.cfg.legs[index].enabled =
+      if legs.hasKey(name): legs[name] else: gateway.cfg.legs[index].enabledFile
+  inc gateway.adminWrites
+  gateway.lastAdminWriteAt = stamp
+  gateway.lastAdminWriteAction = "overrides"
+  reloadRequested = true
+  stderr.writeLine("kori: admin overrides written, " & $legs.len &
+                   " leg(s), " & $models.len & " model(s)")
+
+  var root = newJObject()
+  root["written"] = %true
+  root["applied"] = %true
+  root["reload_requested"] = %true
+  root["updated_at"] = %stamp
+  var legNode = newJObject()
+  for name, flag in legs:
+    legNode[name] = %flag
+  var modelNode = newJObject()
+  for name, flag in models:
+    modelNode[name] = %flag
+  var overrides = newJObject()
+  overrides["legs"] = legNode
+  overrides["models"] = modelNode
+  root["overrides"] = overrides
+  await respondJson(request, Http200, $root)
+
+
 proc handleSessionLogin(gateway: Gateway,
                         request: Request): Future[void] {.async.} =
   ## DEC-20 §6 and §8, as narrowed by DEC-21: the window throttles a *failed*
@@ -4338,7 +5267,8 @@ proc handleSessionLogin(gateway: Gateway,
     await respondMethodNotAllowed(request, allow = "POST")
     return
   let token = readAdminToken()
-  if token.isNone:
+  let writeToken = readAdminWriteToken()
+  if token.isNone and writeToken.isNone:
     await respondGateMissing(request)
     return
   let now = epochTime()
@@ -4354,14 +5284,29 @@ proc handleSessionLogin(gateway: Gateway,
       # A body that is not this shape is a failed login, not a 400: the gate has
       # one answer for "no valid token" and this is one of the ways to have none.
       discard
-  if supplied.len > 0 and constantTimeEquals(token.get, supplied):
-    let sessionId = startSession(gateway)
+  # DEC-27: the write token logs in with write scope; the read token keeps the
+  # thirty-day session it always had. When an operator sets both files to the same
+  # value, the write scope wins, because that is the credential they configured for
+  # writing and the shorter session is the safe reading of an ambiguous setup.
+  var scope = asRead
+  var matchedToken = ""
+  if supplied.len > 0 and writeToken.isSome and
+     constantTimeEquals(writeToken.get, supplied):
+    scope = asWrite
+    matchedToken = writeToken.get
+  elif supplied.len > 0 and token.isSome and
+       constantTimeEquals(token.get, supplied):
+    scope = asRead
+    matchedToken = token.get
+  if matchedToken.len > 0:
+    let sessionId = startSession(gateway, scope, hash(matchedToken))
     if sessionId.isNone:
       await respondJson(request, Http500,
         "{\"error\":{\"type\":\"session_unavailable\",\"message\":\"no session could be created\"}}")
       return
     var headers = newHttpHeaders()
-    headers["Set-Cookie"] = sessionCookie(sessionId.get, int(AdminSessionTtlS))
+    let ttl = if scope == asWrite: AdminWriteSessionTtlS else: AdminSessionTtlS
+    headers["Set-Cookie"] = sessionCookie(sessionId.get, int(ttl))
     headers["Cache-Control"] = "no-store"
     await request.respond(Http204, "", headers)
     return
@@ -4473,6 +5418,13 @@ proc routeRequest(gateway: Gateway, request: Request): Future[void] {.async.} =
         # A HEAD gets the same headers and no body, like every other read surface.
         let payload = if request.reqMethod == HttpHead: "" else: body
         await request.client.send(buildHead(200, headers) & payload)
+  elif path == "/admin/overrides":
+    # DEC-27. The one write on the admin surface. Its own gate, its own method,
+    # and a 405 that names PUT for everything else.
+    if request.reqMethod != HttpPut:
+      await respondMethodNotAllowed(request, allow = "PUT")
+    else:
+      await gateway.handleAdminOverrides(request)
   elif path.startsWith("/admin/"):
     # D11 point 4: any method but GET or HEAD under /admin/ is a 405 that names
     # GET, with no upstream dial and no state change. An unknown path under
@@ -4533,7 +5485,6 @@ proc dispatch*(gateway: Gateway, request: Request): Future[void] {.async.} =
 # ----------------------------------------------------------------- shutdown ---
 
 var stopSignalNumber {.volatile.}: cint = 0
-var reloadRequested {.volatile.}: bool = false
 
 proc onStopSignal(signalNumber: cint) {.noconv.} =
   ## Signal context: one store, no allocation, no lock, no logging.

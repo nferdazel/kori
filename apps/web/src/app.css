@@ -83,6 +83,19 @@ a:focus-visible, button:focus-visible, select:focus-visible, input:focus-visible
 }
 .skip:focus { top: 8px; }
 
+/* Read by assistive tech, never drawn: the word that turns a bare name into "opencode-go provider". */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 .mono {
   font-family: "JetBrains Mono", ui-monospace, monospace;
   font-variant-numeric: tabular-nums;
@@ -652,6 +665,28 @@ tr.detail-row .sep { display: none; }
   color: var(--ink-3);
 }
 
+/* ---------------------------------------------------------------- prompt buckets */
+
+/* The shape of this table is the point: five buckets side by side are read down a column, so it
+   keeps its columns and scrolls inside its own box instead of turning into stacked cards. */
+.lat-scroll { overflow-x: auto; }
+.lat-scroll:focus-visible { outline: 2px solid var(--ink); outline-offset: -2px; }
+
+.lat-table { min-width: 420px; }
+.lat-table caption {
+  caption-side: top;
+  text-align: left;
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--hairline);
+  font-family: "JetBrains Mono", monospace;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--ink-3);
+}
+.lat-table .lat-bucket { color: var(--ink); }
+.lat-table th.num { text-align: right; }
+.lat-table td.num { font-variant-numeric: tabular-nums; }
+
 /* ---------------------------------------------------------------- events */
 
 .events { list-style: none; margin: 0; padding: 0; }
@@ -874,6 +909,174 @@ tr.detail-row .sep { display: none; }
   font-size: 12px;
   color: var(--dead);
 }
+/* The one banner: nothing serves. Ink on the paper surface, a rule above and below, so it reads
+   as a state of the page and not as an error toast. */
+.notice.provider-down {
+  border-top: 1px solid var(--hairline);
+  color: var(--ink);
+  font-weight: 400;
+}
+
+/* ---------------------------------------------------------------- switches */
+
+/* One line of state per row, written out: file value, effective value, override. Colour never
+   carries it alone, and the knob's position moves with the value as a second signal. */
+.writehead {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 4px 20px;
+  margin: 0 0 16px;
+  min-height: 18px;
+}
+.writestatus {
+  margin: 0;
+  font-family: "JetBrains Mono", monospace;
+  font-size: 12px;
+  color: var(--ink-2);
+  overflow-wrap: anywhere;
+}
+.writecount {
+  margin: 0;
+  font-family: "JetBrains Mono", monospace;
+  font-size: 11px;
+  color: var(--ink-3);
+}
+
+.legrow .leg-switch,
+.modelrow .leg-switch {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0 12px;
+}
+
+/* The visible track is 44x26, the hit area is the label around it and stands 44px tall. */
+.sw-hit {
+  display: inline-flex;
+  align-items: center;
+  min-height: 44px;
+  padding-right: 4px;
+  cursor: pointer;
+}
+
+.sw-input {
+  -webkit-appearance: none;
+  appearance: none;
+  position: relative;
+  flex: 0 0 auto;
+  width: 44px;
+  height: 26px;
+  margin: 0;
+  background: var(--panel-2);
+  border: 1px solid var(--ink-3);
+  border-radius: 999px;
+  cursor: pointer;
+  transition: background 140ms var(--ease), border-color 140ms var(--ease);
+}
+.sw-input::after {
+  content: "";
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--ink-2);
+  transition: transform 140ms var(--ease), background 140ms var(--ease);
+}
+.sw-input:checked {
+  background: var(--ok);
+  border-color: var(--ok);
+}
+.sw-input:checked::after {
+  transform: translateX(18px);
+  background: var(--base);
+}
+.sw-input:disabled { opacity: 0.45; cursor: progress; }
+/* The global focus rule squares the corners; a switch keeps its track shape when focused. */
+.sw-input:focus-visible { border-radius: 999px; }
+
+.sw-badge {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ink);
+  border: 1px solid var(--ink-3);
+  border-radius: var(--radius);
+  padding: 1px 6px;
+}
+
+.sw-state {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 11px;
+  color: var(--ink-2);
+}
+
+.sw-reset {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 11px;
+  min-height: 32px;
+  padding: 0 10px;
+  background: transparent;
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius);
+  color: var(--ink-2);
+  cursor: pointer;
+}
+.sw-reset:hover { border-color: var(--ink-3); color: var(--ink); }
+.sw-reset[disabled] { opacity: 0.45; cursor: default; }
+
+/* This note carries the config file's path, which is one unbreakable token. */
+.cfg-note { white-space: normal; overflow-wrap: anywhere; line-height: 1.5; }
+
+.modelrow {
+  display: grid;
+  grid-template-columns: minmax(0, 200px) minmax(0, 1fr);
+  gap: 2px 14px;
+  align-items: baseline;
+  padding: 11px 20px;
+  border-bottom: 1px solid var(--hairline);
+  font-family: "JetBrains Mono", monospace;
+  font-size: 12px;
+}
+.modelrow:last-child { border-bottom: 0; }
+.modelrow .nm { color: var(--ink); overflow-wrap: anywhere; }
+.modelrow .provider { color: var(--ink-2); overflow-wrap: anywhere; }
+
+.confirm {
+  width: min(420px, calc(100vw - 32px));
+  padding: 20px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius);
+  background: var(--panel);
+  color: var(--ink);
+}
+.confirm::backdrop { background: rgba(8, 9, 10, 0.72); }
+.confirm h2 {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 500;
+  letter-spacing: -0.01em;
+}
+.confirm p {
+  margin: 8px 0 0;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--ink-2);
+}
+.confirm-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 18px;
+}
+.confirm-actions .btn { min-height: 44px; }
+.confirm-actions .btn.danger { border-color: var(--dead); color: var(--dead); }
+.confirm-actions .btn.danger:hover { border-color: var(--dead); background: var(--panel-2); }
 
 /* ---------------------------------------------------------------- status text */
 
@@ -1186,6 +1389,29 @@ tr.detail-row .sep { display: none; }
   .events .ev-reason { grid-column: 2; }
   .table-note { padding: 10px 14px; }
   .footer { font-size: 10px; }
+
+  .legrow .leg-switch { margin-top: 6px; }
+  .modelrow { grid-template-columns: 1fr; padding: 11px 14px; }
+  .sw-reset { min-height: 44px; }
+  .confirm { padding: 18px; }
+
+  /* Restore the table rules this one table opted out of. It keeps its columns, shrinks to the
+     phone width when they fit, and scrolls inside its labelled box when they do not. */
+  .lat-table thead { position: static; width: auto; height: auto; overflow: visible; clip: auto; clip-path: none; }
+  .lat-table, .lat-table tbody, .lat-table tr, .lat-table td { display: revert; width: auto; }
+  .lat-table { width: 100%; min-width: 0; }
+  .lat-table tbody td {
+    height: 32px;
+    padding: 0 10px 0 0;
+    border-bottom: 1px solid var(--hairline);
+    white-space: nowrap;
+  }
+  .lat-table tbody td:first-child { padding-left: 14px; }
+  .lat-table tbody td:last-child { padding-right: 14px; }
+  .lat-table tbody tr:last-child td { border-bottom: 0; }
+  .lat-table thead th:first-child { padding-left: 14px; }
+  .lat-table td[data-label]::before { content: none; }
+  .lat-table caption { padding: 10px 14px; }
 }
 
 @media (prefers-reduced-motion: reduce) {

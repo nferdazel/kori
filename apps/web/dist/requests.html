@@ -6,9 +6,9 @@
 <title>Requests · kori</title>
 <meta name="description" content="kori gateway read-only dashboard: request log browser.">
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-  <script type="module" crossorigin src="/assets/dom-CBFiVIfW.js"></script>
-  <script type="module" crossorigin src="/assets/main-D8MTnclq.js"></script>
-  <link rel="stylesheet" crossorigin href="/assets/dom-lI3mFCDs.css">
+  <script type="module" crossorigin src="/assets/dom-Dv8Nv8us.js"></script>
+  <script type="module" crossorigin src="/assets/main-B7Kq3aFO.js"></script>
+  <link rel="stylesheet" crossorigin href="/assets/dom-CyOwnlRu.css">
 </head>
 <body data-page="requests.html">
 <a class="skip" href="#main">Skip to content</a>
@@ -102,6 +102,17 @@
             </select>
           </div>
           <div class="field">
+            <label for="f-prompt">Prompt size</label>
+            <select id="f-prompt" name="prompt">
+              <option value="all">any</option>
+              <option value="lt32">under 32 KiB</option>
+              <option value="32-64">32 to 64 KiB</option>
+              <option value="64-128">64 to 128 KiB</option>
+              <option value="128-256">128 to 256 KiB</option>
+              <option value="gte256">256 KiB and over</option>
+            </select>
+          </div>
+          <div class="field">
             <label for="f-range">Time range</label>
             <select id="f-range" name="range">
               <option value="all">since gateway start</option>
@@ -149,6 +160,7 @@
         </div>
 
         <p class="table-note" data-tail-note hidden></p>
+        <p class="table-note" data-prompt-note hidden></p>
         <p class="table-note" data-stale hidden></p>
 
         <div class="pager" data-pager>
