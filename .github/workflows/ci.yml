@@ -1,11 +1,12 @@
 # class: A
 name: CI
 
-# Build in GitHub, pull on the host. image-api builds the container on every PR and pushes
-# ghcr.io/nferdazel/kori-api:sha-<7> plus :main on main, keyless-signs the digest and labels
-# the revision the host compares against. qouver1 never builds: it pulls that tag through
-# ops/scripts/deploy-vps.sh. No job here calls a webhook; the deploy trigger is the repo push
-# webhook, the same path the other apps use.
+# Build in GitHub, pull on the host. image-api builds the container on every PR and, on main,
+# pushes the manifest by digest, keyless-signs that digest, and only then creates
+# ghcr.io/nferdazel/kori-api:sha-<7> plus :main from it, with the revision label the host
+# compares against (F2-5: no tag exists before its digest is signed). qouver1 never builds: it
+# pulls that tag through ops/scripts/deploy-vps.sh. No job here calls a webhook; the deploy
+# trigger is the repo push webhook, the same path the other apps use.
 #
 # Golden CI/CD contract, applied here: every job has timeout-minutes: 15, every job caches its
 # package manager, and no GitHub context expression is interpolated into a shell script — the
@@ -209,20 +210,23 @@ jobs:
       # loudly, rather than trust whatever nim-lang.org serves today. The value was read once and
       # is bumped in review, never automatically.
       #   NIM_SHA256   https://nim-lang.org/download/nim-2.4.2-linux_x64.tar.xz.sha256
-      - name: Build and push
+      # F2-5: this step used to write :sha-<7> and :main itself, so a tag was pullable before
+      # cosign had signed anything. On 2026-11-26 run 45793935946 the run died in the cache
+      # export after that push, cosign never ran, and sha-c6f0a65 stayed unsigned for 42 minutes.
+      # Now the manifest is pushed by digest with no tag, and the tags are created further down,
+      # from this digest, only after the signature exists.
+      - name: Build and push by digest
         id: push
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: apps/api/Dockerfile
           platforms: linux/amd64
-          push: ${{ github.event_name == 'push' }}
+          # cacheonly on a pull request: the same build runs and nothing is pushed.
+          outputs: ${{ github.event_name == 'push' && 'type=image,name=ghcr.io/nferdazel/kori-api,push-by-digest=true,name-canonical=true,push=true' || 'type=cacheonly' }}
           build-args: |
             NIM_SHA256=0ee5b16e81852a956d4fddb4aa44b5958c645c992132fa43be45f489573ee325
             KORI_REVISION=${{ steps.short.outputs.sha7 }}
-          tags: |
-            ghcr.io/nferdazel/kori-api:sha-${{ steps.short.outputs.sha7 }}
-            ghcr.io/nferdazel/kori-api:main
           # The host compares this label with the commit it reset to before it rotates :local.
           labels: |
             org.opencontainers.image.revision=${{ github.sha }}
@@ -239,6 +243,29 @@ jobs:
         env:
           DIGEST: ${{ steps.push.outputs.digest }}
         run: cosign sign --yes "ghcr.io/nferdazel/kori-api@${DIGEST}"
+
+      # The tag is the only thing the host pulls, so it is written last, onto the digest that was
+      # just signed. imagetools copies the pushed manifest rather than rebuilding it, and the
+      # cosign verify below is the fail-closed proof: if a tag ever resolves to bytes this run did
+      # not sign, the run goes red here instead of the host refusing to deploy.
+      - name: Tag the signed digest
+        if: github.event_name == 'push'
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+          SHA7: ${{ steps.short.outputs.sha7 }}
+        run: |
+          set -eu
+          image="ghcr.io/nferdazel/kori-api"
+          docker buildx imagetools create \
+            --tag "${image}:sha-${SHA7}" \
+            --tag "${image}:main" \
+            "${image}@${DIGEST}"
+          for tag in "sha-${SHA7}" main; do
+            cosign verify "${image}:${tag}" \
+              --certificate-identity-regexp "^https://github.com/nferdazel/kori/" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com >/dev/null
+            echo "::notice::${image}:${tag} resolves to the signed digest ${DIGEST}"
+          done
 
   # C3 of the shared contract says a repo with apps/web/ needs its own web job. kori has no
   # separate web container to publish: the built dashboard is embedded into the single kori-api
