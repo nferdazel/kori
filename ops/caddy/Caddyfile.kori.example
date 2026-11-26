@@ -70,11 +70,13 @@ ai.qouver.com {
 	respond @admin "not found" 404
 
 	# Rate limit per real client IP. Needs the caddy-ratelimit module, which is NOT in a stock
-	# Caddy build; Dimas owns that binary. Until it is there, the same limit is a Cloudflare rule
-	# on ai.qouver.com (per-IP, 60 requests/minute) — recorded in OPS-SHIP §4.4 as the interim.
-	# That rule is a precondition for opening the endpoint, not a follow-up: while this block is
-	# commented out the door has no per-IP limit at all, so the Cloudflare rule has to exist before
-	# the site block goes live.
+	# Caddy build: qouver1 runs the RPM binary (v2.11.9, 138 modules, no ratelimit), so this block
+	# stays commented until that binary is replaced, and that swap is a shared-edge window.
+	# Measured 2026-11-26: 620 requests from one IP, all wrong-bearer, returned 401 and not one 429,
+	# and no Cloudflare rule existed either. So the edge currently has no per-IP limit: the bearer
+	# is the only gate. Interim decision (Bagas, 2026-11-26) is a Cloudflare rate-limiting rule,
+	# 60/min per IP on ai.qouver.com, which needs no host change; the module build is the
+	# belt-and-braces path after that.
 	# rate_limit {
 	# 	zone kori_ip {
 	# 		key {client_ip}
@@ -126,6 +128,13 @@ dash.qouver.com {
 	# Chat completions API is strictly for ai.qouver.com with bearer token; keep it blocked here.
 	@api path /v1 /v1/*
 	respond @api "not found" 404
+
+	# /healthz answered {"status":"ok","version":...,"revision":...} to anyone, no credential
+	# (measured 2026-11-26). Both the readyz timer and the deploy health gate probe
+	# 127.0.0.1:8787 directly, past this proxy, so the public edge has no reason to answer it.
+	# Applied live on qouver1 first; this keeps it across the next re-render.
+	@probe path /healthz
+	respond @probe "not found" 404
 
 	# Dashboard UI and /admin/* read endpoints are reverse-proxied to kori on loopback.
 	reverse_proxy 127.0.0.1:8787
