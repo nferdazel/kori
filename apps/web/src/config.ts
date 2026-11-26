@@ -342,9 +342,10 @@ function render(config: AdminConfig): void {
             : "off \u00B7 strict config order",
         ],
       ];
-      // DEC-28: the second door has its own opt-in, and it defaults off. An older binary does not
-      // emit the key at all, so the row appears only when the answer says what the value is.
-      if (typeof config.systemone_balance === "boolean") {
+      // DEC-28: the second door has its own opt-in, and it defaults off. Both this row and the
+      // block below appear only when the config actually carries System One legs, so a config
+      // without that block is still exactly the page it was.
+      if (config.systemone && config.systemone.length > 0 && typeof config.systemone_balance === "boolean") {
         rows.push([
           "systemone_balance",
           config.systemone_balance
