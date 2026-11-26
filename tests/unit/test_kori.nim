@@ -738,10 +738,26 @@ block:
     redactUrl("http://h.test:+443#x@SECRET7") == "http://<redacted>"
   check "F1f: the trailing value never becomes the host",
     not redactUrl("https://h.test:abc?token@SECRET7").contains("SECRET7")
-  # The cost of that rule, pinned so a later widening has to say so: a well
-  # formed URL with userinfo and a fragment now prints no host either.
-  check "F1f: a fragment behind a split credential loses the host too",
-    redactUrl("https://user:pw@h.test#frag") == "https://<redacted>"
+  # F1h: the same hole one character over — a separator or a second `@` behind
+  # the `@` used to switch the guard off, so these printed the token as the host.
+  check "F1h: a path behind the '@' in a fragment does not restore the host",
+    redactUrl("https://h.test:abc#x@SECRET7/y") == "https://<redacted>"
+  check "F1h: the same behind the '@' in a query",
+    redactUrl("https://h.test:abc?x@SECRET7/y") == "https://<redacted>"
+  check "F1h: a query key behind a port that reads as a password",
+    redactUrl("https://h.test:pw/x@SECRET7/y@z") == "https://<redacted>"
+  check "F1h: a real host behind the fragment token is still not printed",
+    not redactUrl("https://user:pw@h.test#x@SECRET7/y").contains("SECRET7")
+  # F1g: `host:` with a port text that parseInt accepts is read as userinfo by
+  # the split, so the token behind it became the authority and dial() used it.
+  check "F1g: a sign-prefixed port does not hand the token over as host",
+    redactUrl("http://127.0.0.1:8099:+443@SECRET7") == "http://<redacted>"
+  # The rule that closes both: a credential was stripped, so what remains has to
+  # look like a host. That keeps this well-formed case's host, which F1f had lost.
+  check "F1f: a fragment behind a well-formed userinfo keeps the host",
+    redactUrl("https://user:pw@h.test#frag") == "https://h.test"
+  check "a single-label host behind userinfo is over-redacted on purpose",
+    redactUrl("https://user:pw@kori/v1") == "https://<redacted>"
 
 block:
   # §5.4 at the surface that prints it: /admin/config never carries the credential
