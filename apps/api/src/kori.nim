@@ -4071,146 +4071,57 @@ proc badRequestBody(parameter: string): string =
     jsonEscape(parameter) & "}}"
 
 proc redactUrl*(value: string): string =
-  ## §5.4: a base URL is printed in full only when it carries no credential.
-  ## `user:pass@host` is one: the authority (up to the first `/`, `?` or `#`)
-  ## is stripped at its last `@`, and the query/fragment rules follow. The last
-  ## `@` matters because a password may itself contain one, and the `?`/`#`
-  ## bounds matter because an `@` past them is path or query data, not userinfo.
-  var url = value
-  let schemeAt = url.find("://")
-  let authStart = if schemeAt >= 0: schemeAt + 3 else: 0
-
-  # A URL's authority is `[userinfo@]host[:port]`, and userinfo may not contain an
-  # unescaped `/`, `?` or `#`: when one is used, the rest of the credential lands
-  # in what now looks like the path, the query or the fragment. A colon in the
-  # authority that does not begin an all-digit port is the tell; a bracketed IPv6
-  # host is never userinfo.
-  block:
-    var sep = url.len
-    for stop in ['/', '?', '#']:
-      let hit = url.find(stop, authStart)
-      if hit >= 0 and hit < sep:
-        sep = hit
-    let bracketed = authStart < url.len and url[authStart] == '['
-    # Judge the port by the LAST colon in the span. `host:`, `host:443` and
-    # `host:443:` all have to land in the right bucket, and the first colon in
-    # `127.0.0.1:8090:` is the real port, not the tell.
-    let span = if authStart < sep: url[authStart ..< sep] else: ""
-    let colon = span.rfind(':')
-    var credential = false
-    var emptyPort = false
-    if not bracketed and colon >= 0:
-      let after = span[colon + 1 .. ^1]
-      # `host:` with nothing after the colon is an empty port, not userinfo.
-      # Digits that fill the rest are a port; anything else is a password
-      # (`user:pa/ss`, `user:1pa/ss`, `user:pa?ss`).
-      emptyPort = after.len == 0
-      if not emptyPort:
-        var allDigits = true
-        for ch in after:
-          if not isDigit(ch):
-            allDigits = false
-            break
-        credential = not allDigits
-    # An empty port with an '@' behind it is the shape that keeps printing a
-    # query or a path value as the host. Nothing in `host:` is a credential, so
-    # there is no terminator to find and nothing safe to print.
-    if emptyPort and url.find('@', authStart) >= 0:
-      return url[0 ..< authStart] & "<redacted>"
-    let atInSpan = url.rfind('@', authStart, sep - 1)
-    if credential:
-      # The credential was split by `sep`, so its terminator is the last `@`
-      # past it. It cannot be further than the next separator: an `@` beyond
-      # that is query or fragment data, and taking it would print the query as
-      # the new authority (`?x=a@b&api_key=S` once printed `https://b&api_key=S`).
-      var nextSep = url.len
-      for stop in ['/', '?', '#']:
-        let hit = url.find(stop, sep + 1)
-        if hit >= 0 and hit < nextSep:
-          nextSep = hit
-      var at = url.rfind('@', authStart, nextSep - 1)
-      # A credential that already ended inside the authority cannot end again
-      # past the separator when both sides are host-shaped: the value is
-      # malformed and nothing after the cut is a proven host.
-      if at >= sep and atInSpan >= 0:
-        let between = url[atInSpan + 1 ..< sep]
-        let colonAt = between.find(':')
-        let betweenHost = if colonAt >= 0: between[0 ..< colonAt] else: between
-        let after = if at + 1 < nextSep: url[at + 1 ..< nextSep] else: ""
-        let afterColon = after.find(':')
-        let afterHost = if afterColon >= 0: after[0 ..< afterColon] else: after
-        if betweenHost.len > 0 and afterHost.len > 0 and
-           (betweenHost[0] == '[' or betweenHost.toLowerAscii() == "localhost" or
-            betweenHost.contains('.')) and
-           (afterHost[0] == '[' or afterHost.toLowerAscii() == "localhost" or
-            afterHost.contains('.')):
-          return url[0 ..< authStart] & "<redacted>"
-      # `=`/`&` before the `@` is query or form data, not the rest of a password.
-      if at >= sep and (url[sep ..< at].contains('=') or url[sep ..< at].contains('&')):
-        at = -1
-      if at >= sep:
-        # The `@` past the separator only ends a credential if the text before
-        # the separator was userinfo. A dotted name in the port slot means the
-        # text was a host with a broken port, so every `@` past it is data.
-        let portText = if colon >= 0: span[colon + 1 .. ^1] else: ""
-        let hostPart = if colon >= 0: span[0 ..< colon] else: span
-        let portLooksLikeData = colon >= 0 and portText.len > 0 and
-          not portText.allCharsInSet(Digits) and
-          (hostPart.len == 0 or hostPart[0] == '[' or
-           hostPart.toLowerAscii() == "localhost" or hostPart.contains('.'))
-        if portLooksLikeData:
-          return url[0 ..< authStart] & "<redacted>"
-        url = url[0 ..< authStart] &
-              (if at + 1 < url.len: url[at + 1 .. ^1] else: "")
-      elif atInSpan < 0 and url.find('@', authStart) >= 0:
-        # An `@` exists but nothing proves where the credential ends. Print no
-        # host rather than guess one out of the middle of a password.
-        return url[0 ..< authStart] & "<redacted>"
-
-  var authEnd = url.len
+  ## §5.4: a `base_url` that carries a credential prints neither the credential
+  ## nor the host beside it; the answer is `scheme://<redacted>` when it carries
+  ## either. Two shapes carry one:
+  ##
+  ## * an `@` inside the authority (`[^/?#]*` after the scheme) is userinfo;
+  ## * an `@` past a separator whose authority ends in a colon that is not an
+  ##   all-digit port is a password that a `/`, `?` or `#` pushed out of the
+  ##   authority (`user:pa/ss@host`, `user:pw#x@token`).
+  ##
+  ## The host is not salvaged in either case. Salvaging was tried across six
+  ## findings (F1c, F1f, F1g, F1h, F1i, F1j) and each rule that judged the
+  ## survivor taught the next one, because a credential is itself shaped like a
+  ## host (a JWT, `sk.live.…`, any `vendor.env.key`). An `@` in a path or query
+  ## of an otherwise clean authority cannot be userinfo and stays. Dialing is
+  ## unaffected: `parseUri` still reads the configured value; only this print is
+  ## decided.
+  let schemeAt = value.find("://")
+  let authStart =
+    if schemeAt >= 0: schemeAt + 3
+    elif value.startsWith("//"): 2
+    else: 0
+  var sep = value.len
   for stop in ['/', '?', '#']:
-    let hit = url.find(stop, authStart)
-    if hit >= 0 and hit < authEnd:
-      authEnd = hit
-  let at = url.rfind('@', authStart, authEnd - 1)
-  if at >= 0:
-    let tail = if at + 1 < url.len: url[at + 1 .. ^1] else: ""
-    url = url[0 ..< authStart] & tail
-  # Whatever survived has to be a host[:port] and nothing else. A '=', '&' or
-  # '@' here means the split stopped inside data and the "host" is really a
-  # query or a path fragment. Only checked when the value carried a credential
-  # at all, so a plain base URL is never rewritten.
-  if value.find('@', authStart) >= 0:
-    var hostEnd = url.len
-    for stop in ['/', '?', '#']:
-      let hit = url.find(stop, authStart)
-      if hit >= 0 and hit < hostEnd:
-        hostEnd = hit
-    let host = url[authStart ..< hostEnd]
-    # A credential was stripped, so what took its place has to look like a host:
-    # a dotted name, `localhost`, or a bracketed address. A bare token is data
-    # far more often than a single-label host, and printing it is the leak this
-    # proc exists to prevent. Checked only when a split actually rewrote the
-    # value, so a URL whose `@` is ordinary path data is left alone.
-    let hostLike = not (url != value) or
-                   (host.len > 0 and
-                    (host[0] == '[' or host.toLowerAscii() == "localhost" or
-                     host.contains('.')))
-    if host.len == 0 or not hostLike or host.contains('=') or host.contains('&') or host.contains('@'):
-      return url[0 ..< authStart] & "<redacted>"
-  let query = url.find('?')
-  let fragment = url.find('#')
-  if query < 0:
-    if fragment >= 0:
-      return url[0 ..< fragment]
-    return url
-  let tail = url[query + 1 .. ^1].toLowerAscii()
-  if tail.contains("key") or tail.contains("token") or tail.contains("secret") or
-     tail.contains("api"):
-    return url[0 ..< query]
-  if fragment >= 0 and fragment > query:
-    return url[0 ..< fragment]
-  url
+    let hit = value.find(stop, authStart)
+    if hit >= 0 and hit < sep:
+      sep = hit
+  let span = if authStart < sep: value[authStart ..< sep] else: ""
+  var credential = span.contains('@')
+  if not credential and span.len > 0 and span[0] != '[' and
+     value.find('@', sep) >= 0:
+    let colon = span.rfind(':')
+    if colon >= 0:
+      let after = span[colon + 1 .. ^1]
+      var allDigits = after.len > 0
+      for ch in after:
+        if not isDigit(ch):
+          allDigits = false
+          break
+      credential = not allDigits
+  if credential:
+    return value[0 ..< authStart] & "<redacted>"
+  let query = value.find('?')
+  if query >= 0:
+    let tail = value[query + 1 .. ^1].toLowerAscii()
+    if tail.contains("key") or tail.contains("token") or tail.contains("secret") or
+       tail.contains("api"):
+      return value[0 ..< query]
+  let fragment = value.find('#')
+  if fragment >= 0 and (query < 0 or fragment < query):
+    return value[0 ..< fragment]
+  value
 
 proc credentialRefs*(configPath: string, legCount: int): seq[string] =
   ## `<path>:<line>` for each leg's api_key, never the value. If the file cannot

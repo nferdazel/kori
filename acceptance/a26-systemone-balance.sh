@@ -131,8 +131,15 @@ assert_absent "A26c no part of the disabled leg's userinfo is printed" \
   "$RUN/a26-config.json" "s3cret"
 assert_absent "A26c no userinfo form is printed at all" \
   "$RUN/a26-config.json" "user:"
-assert_present "A26c the host is still printed" \
-  "$RUN/a26-config.json" "http://127.0.0.1:$off_port/provider/v1"
+# §5.4 after F1j: a credential hides the authority with it, because a credential
+# is shaped like a host and every rule that kept the survivor printed one. The
+# two clean legs prove the rest of the page still carries its hosts.
+assert_present "A26c a credential leg prints no host" \
+  "$RUN/a26-config.json" 'http://<redacted>'
+assert_absent "A26c not the port either" \
+  "$RUN/a26-config.json" "$off_port/provider/v1"
+assert_present "A26c a clean leg still prints its host" \
+  "$RUN/a26-config.json" "$(jq -r '.legs[0].base_url' "$GW_CFG")"
 
 kill_stubs
 finish

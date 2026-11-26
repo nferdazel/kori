@@ -161,8 +161,9 @@ state projected per leg, and it dials nothing, so asking what is broken cannot c
 call or a token.
 
 `/admin/config` reports the config path and a `<path>:<line>` reference per leg credential, never
-the value. A `base_url` printed there loses its `user:pass@` authority, so a credential carried in
-the URL cannot come out through the dashboard. The key pool is reported as a size and a cooling
+the value. A `base_url` that carries a credential prints as `scheme://<redacted>`: the whole
+authority goes, not just the `user:pass@`, because a credential is shaped like a host and keeping the
+survivor printed one six times. A `base_url` with no `@` prints in full. The key pool is reported as a size and a cooling
 count, and an `oauth` leg as a state
 plus its expiry, so the same page can answer "which credential is dead" without carrying one. It
 also reports the log rotation policy, the price table and the last reload (`count`, `at`,

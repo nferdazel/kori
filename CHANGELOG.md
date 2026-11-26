@@ -45,38 +45,24 @@ this one, is the answer to "what is live".
   is unchanged. The cell's `aria-label` already carried the exact milliseconds, so the accessible
   value was correct and only the visible text was not.
 
-- `redactUrl` strips `user:pass@` from the authority, so a `base_url` configured with a credential is
-  printed as `https://host/…` in `/admin/config` instead of in full. When the authority itself is
-  well formed, the split takes the last `@` before the first `/`, `?` or `#`, so a password that
-  contains `@` is removed and an `@` in a path or a query is left alone. A separator inside the
-  password is covered as well (`user:pa/ss@host`, `user:pa?ss@host`, `user:pa#ss@host`,
-  `user:1pa/ss@host`, `user:p@ss/word@host`): an authority whose colon is not followed by digits up to
-  its end is treated as userinfo, and its `@` terminator is searched only up to the next separator.
-  `host:` with nothing after the colon is an empty port, not userinfo, so an `@` behind it is never
-  taken as a credential terminator.
-  Because a split can stop in the wrong place, the rule after it is what closes the class: once a
-  credential has been stripped, whatever is left has to look like a host — a dotted name,
-  `localhost`, or a bracketed address. Anything else (a bare token, a query key, a fragment tail)
-  prints as `scheme://<redacted>` with no host instead. That covers a `?`/`#` cut whose `@` has a
-  path, a query or a second `@` behind it, and a port text that `parseInt` accepts (`+443`, `4_43`,
-  `+0443`) so that `host:` reads as userinfo and the token behind the `@` tried to become the
-  authority. Dialability is not the test in either direction: those ports do dial.
-  "Looks like a host" is not enough on its own, because credentials contain dots too (a JWT, an
-  `sk.live.…` key). Two shapes where both sides of the split are host-shaped are therefore refused
-  as well: a credential that had already ended inside the authority, and a dotted name sitting in
-  the port slot, which means the text was a host with a broken port and every `@` past it is data.
-  The cost, declared: a single-label host behind userinfo (`https://user:pw@kori/v1`) loses its
-  host too, and rows whose survivors do not look like hosts print without one. `localhost` and
-  bracketed addresses are kept.
-  Also declared, not covered: a password that contains a separator followed by a dotted value
-  (`user:pw#x@sk.live.token`) still prints that value, because it is byte-for-byte the supported
-  password split (`user:pa#ss@host` → `https://host`) and telling them apart would mean refusing
-  that feature. Closing it is a product decision, not a code fix.
-  Not covered, tracked as F1c: a password whose digit run fills the port slot itself
-  (`user:8443/rest@host`), and userinfo that follows a path (`https://host/user:pw@h2/v1`). Those
-  still print, and `parseUri` reads `user`/`host` as the host, so `dial()` connects to that host
-  rather than the one written in the string: the credential does not reach the intended leg, but it
-  is not hidden either.
+- `redactUrl` no longer tries to keep the host of a `base_url` that carries a credential. When the
+  authority holds an `@`, or ends in a colon whose tail is not an all-digit port while an `@` sits
+  past the next separator, `/admin/config` prints `scheme://<redacted>` and nothing else from that
+  URL. The credential was already hidden; the host used to be kept beside it, and keeping it is what
+  printed a token as the authority six times in a row (F1c, F1f, F1g, F1h, F1i, F1j): every rule that
+  judged the survivor by shape accepted a dotted credential (a JWT, an `sk.live.…` key) as a host,
+  because a credential is shaped like a host. The rule now reads only the authority and never what
+  survives it, so there is no survivor to judge.
+  Cost, declared: a URL that carries a credential no longer shows which host it points at, and a
+  query or a fragment beside such an authority is not printed either. A `base_url` with no `@` is
+  untouched, including its host, port and path (`https://api.commandcode.ai/provider/v1`,
+  `http://127.0.0.1:8090/v1`), and a query that names a key is still dropped. An `@` in the path or
+  query of an otherwise clean authority stays, because no credential can put it there.
+  Still open, tracked as F1c: a password whose digit run fills the port slot (`user:8443/rest@host`),
+  and userinfo that follows a path (`https://host/user:pw@h2/v1`). Both are indistinguishable from a
+  real port and a real path, so they print. `parseUri` reads `user`/`host` as the host and `dial()`
+  connects there instead of the host written in the string, so the credential does not reach the leg
+  it names, but it is not hidden either. Needs its own ticket.
 
 - A write token now works as a bearer on the read GETs (`/admin/state`, `/admin/config`,
   `/admin/log`) (DEC-27, amended). It could already read through a write session; the bearer form
