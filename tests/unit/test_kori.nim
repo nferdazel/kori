@@ -727,6 +727,21 @@ block:
     redactUrl("https://h.test:/v1") == "https://h.test:/v1"
   check "F1e: a real empty port with a query is untouched",
     redactUrl("http://127.0.0.1:8090/v1") == "http://127.0.0.1:8090/v1"
+  # F1f: a split credential whose only `@` sits in a query or a fragment that
+  # runs to the end of the string. Nothing past the first separator can end
+  # userinfo, so taking that `@` printed the query or the fragment as the host.
+  check "F1f: an '@' in a trailing fragment is not a credential terminator",
+    redactUrl("https://h.test:abc#x@SECRET7") == "https://<redacted>"
+  check "F1f: the same in a trailing query",
+    redactUrl("https://h.test:abc?x@SECRET7") == "https://<redacted>"
+  check "F1f: a port spelled with a sign does not make the '@' a terminator",
+    redactUrl("http://h.test:+443#x@SECRET7") == "http://<redacted>"
+  check "F1f: the trailing value never becomes the host",
+    not redactUrl("https://h.test:abc?token@SECRET7").contains("SECRET7")
+  # The cost of that rule, pinned so a later widening has to say so: a well
+  # formed URL with userinfo and a fragment now prints no host either.
+  check "F1f: a fragment behind a split credential loses the host too",
+    redactUrl("https://user:pw@h.test#frag") == "https://<redacted>"
 
 block:
   # §5.4 at the surface that prints it: /admin/config never carries the credential

@@ -4124,10 +4124,18 @@ proc redactUrl*(value: string): string =
       # that is query or fragment data, and taking it would print the query as
       # the new authority (`?x=a@b&api_key=S` once printed `https://b&api_key=S`).
       var nextSep = url.len
+      var moreSep = false
       for stop in ['/', '?', '#']:
         let hit = url.find(stop, sep + 1)
         if hit >= 0 and hit < nextSep:
           nextSep = hit
+          moreSep = true
+      # A `?` or `#` cut with nothing after it leaves any `@` inside query or
+      # fragment data (`host:abc#x@SECRET`, `user:pw@host#x@SECRET`), not a
+      # credential terminator. A `/` cut is a path and may end the string.
+      if not moreSep and sep < url.len and url[sep] in {'?', '#'} and
+         url.find('@', authStart) >= 0:
+        return url[0 ..< authStart] & "<redacted>"
       var at = url.rfind('@', authStart, nextSep - 1)
       # `=`/`&` before the `@` is query or form data, not the rest of a password.
       if at >= sep and (url[sep ..< at].contains('=') or url[sep ..< at].contains('&')):

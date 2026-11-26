@@ -46,9 +46,13 @@ this one, is the answer to "what is live".
   `user:1pa/ss@host`, `user:p@ss/word@host`): an authority whose colon is not followed by digits up to
   its end is treated as userinfo, and its `@` terminator is searched only up to the next separator.
   `host:` with nothing after the colon is an empty port, not userinfo, so an `@` behind it is never
-  taken as a credential terminator. Where the authority cannot be read unambiguously the URL prints
-  as `scheme://<redacted>` with no host, which loses the host in `/admin/config` but never prints a
-  credential.
+  taken as a credential terminator, and an `@` that sits in a query or a fragment running to the end
+  of the string is data rather than a terminator, so nothing is printed rather than guessed. Where
+  the authority cannot be read unambiguously the URL prints as `scheme://<redacted>` with no host.
+  That loses the host in `/admin/config` — for those rows, and for a well-formed `userinfo@host#frag`
+  — in exchange for not printing a value that may be a credential. Dialability is not the test in
+  either direction: `parseInt` accepts `+443`, `4_43` and `+0443`, so a port text that is not all
+  digits can still dial.
   Not covered, tracked as F1c: a password whose digit run fills the port slot itself
   (`user:8443/rest@host`), and userinfo that follows a path (`https://host/user:pw@h2/v1`). Those
   still print, and `parseUri` reads `user`/`host` as the host, so `dial()` connects to that host
