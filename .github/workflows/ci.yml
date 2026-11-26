@@ -227,7 +227,8 @@ jobs:
           labels: |
             org.opencontainers.image.revision=${{ github.sha }}
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # mode=min: 2026-11-26 run 45793935946 died in the GHA cache export, so cosign never ran.
+          cache-to: type=gha,mode=min
 
       - name: Install cosign
         if: github.event_name == 'push'
