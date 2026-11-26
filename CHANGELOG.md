@@ -61,9 +61,17 @@ this one, is the answer to "what is live".
   path, a query or a second `@` behind it, and a port text that `parseInt` accepts (`+443`, `4_43`,
   `+0443`) so that `host:` reads as userinfo and the token behind the `@` tried to become the
   authority. Dialability is not the test in either direction: those ports do dial.
+  "Looks like a host" is not enough on its own, because credentials contain dots too (a JWT, an
+  `sk.live.…` key). Two shapes where both sides of the split are host-shaped are therefore refused
+  as well: a credential that had already ended inside the authority, and a dotted name sitting in
+  the port slot, which means the text was a host with a broken port and every `@` past it is data.
   The cost, declared: a single-label host behind userinfo (`https://user:pw@kori/v1`) loses its
   host too, and rows whose survivors do not look like hosts print without one. `localhost` and
   bracketed addresses are kept.
+  Also declared, not covered: a password that contains a separator followed by a dotted value
+  (`user:pw#x@sk.live.token`) still prints that value, because it is byte-for-byte the supported
+  password split (`user:pa#ss@host` → `https://host`) and telling them apart would mean refusing
+  that feature. Closing it is a product decision, not a code fix.
   Not covered, tracked as F1c: a password whose digit run fills the port slot itself
   (`user:8443/rest@host`), and userinfo that follows a path (`https://host/user:pw@h2/v1`). Those
   still print, and `parseUri` reads `user`/`host` as the host, so `dial()` connects to that host

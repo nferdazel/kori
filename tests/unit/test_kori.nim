@@ -758,6 +758,23 @@ block:
     redactUrl("https://user:pw@h.test#frag") == "https://h.test"
   check "a single-label host behind userinfo is over-redacted on purpose",
     redactUrl("https://user:pw@kori/v1") == "https://<redacted>"
+  # F1j: a credential that contains dots looks like a host to the rule above, so
+  # a JWT or an `sk.live.…` key behind the separator printed as the authority.
+  # Both sides of the split being host-shaped is what gives it away.
+  check "F1j: a dotted key behind a fragment '@' is not a host",
+    redactUrl("https://h.test:abc#x@sk.live.SECRET7") == "https://<redacted>"
+  check "F1j: the same behind a sign-prefixed port",
+    redactUrl("https://h.test:+443#x@sk.live.SECRET7") == "https://<redacted>"
+  check "F1j: a JWT behind the fragment 'at' is not a host",
+    redactUrl("http://h.test:+443#x@eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig") == "http://<redacted>"
+  check "F1j: a dotted key behind well-formed userinfo is not a host",
+    redactUrl("https://user:pw@h.test#x@sk.live.SECRET7") == "https://<redacted>"
+  # The residual, pinned so nobody thinks it was missed. `user:pw#x@sk.live.SECRET7`
+  # is byte-for-byte the deliberately supported password split (`user:pa#ss@h.test`
+  # also prints `https://h.test`), so closing it means refusing that feature
+  # outright. Declared in the CHANGELOG, not closed.
+  check "the password-split residual still prints, declared not closed",
+    redactUrl("https://user:pw#x@sk.live.SECRET7") == "https://sk.live.SECRET7"
 
 block:
   # §5.4 at the surface that prints it: /admin/config never carries the credential

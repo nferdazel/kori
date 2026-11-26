@@ -4129,10 +4129,37 @@ proc redactUrl*(value: string): string =
         if hit >= 0 and hit < nextSep:
           nextSep = hit
       var at = url.rfind('@', authStart, nextSep - 1)
+      # A credential that already ended inside the authority cannot end again
+      # past the separator when both sides are host-shaped: the value is
+      # malformed and nothing after the cut is a proven host.
+      if at >= sep and atInSpan >= 0:
+        let between = url[atInSpan + 1 ..< sep]
+        let colonAt = between.find(':')
+        let betweenHost = if colonAt >= 0: between[0 ..< colonAt] else: between
+        let after = if at + 1 < nextSep: url[at + 1 ..< nextSep] else: ""
+        let afterColon = after.find(':')
+        let afterHost = if afterColon >= 0: after[0 ..< afterColon] else: after
+        if betweenHost.len > 0 and afterHost.len > 0 and
+           (betweenHost[0] == '[' or betweenHost.toLowerAscii() == "localhost" or
+            betweenHost.contains('.')) and
+           (afterHost[0] == '[' or afterHost.toLowerAscii() == "localhost" or
+            afterHost.contains('.')):
+          return url[0 ..< authStart] & "<redacted>"
       # `=`/`&` before the `@` is query or form data, not the rest of a password.
       if at >= sep and (url[sep ..< at].contains('=') or url[sep ..< at].contains('&')):
         at = -1
       if at >= sep:
+        # The `@` past the separator only ends a credential if the text before
+        # the separator was userinfo. A dotted name in the port slot means the
+        # text was a host with a broken port, so every `@` past it is data.
+        let portText = if colon >= 0: span[colon + 1 .. ^1] else: ""
+        let hostPart = if colon >= 0: span[0 ..< colon] else: span
+        let portLooksLikeData = colon >= 0 and portText.len > 0 and
+          not portText.allCharsInSet(Digits) and
+          (hostPart.len == 0 or hostPart[0] == '[' or
+           hostPart.toLowerAscii() == "localhost" or hostPart.contains('.'))
+        if portLooksLikeData:
+          return url[0 ..< authStart] & "<redacted>"
         url = url[0 ..< authStart] &
               (if at + 1 < url.len: url[at + 1 .. ^1] else: "")
       elif atInSpan < 0 and url.find('@', authStart) >= 0:
