@@ -349,8 +349,8 @@ function render(config: AdminConfig): void {
         rows.push([
           "systemone_balance",
           config.systemone_balance
-            ? "on \u00B7 smooth weighted round-robin over the System One legs (DEC-28)"
-            : "off \u00B7 strict config order (DEC-19)",
+            ? "on \u00B7 smooth weighted round-robin picks the first leg, the tail stays config order (DEC-28)"
+            : "off \u00B7 every request walks the legs in config order (DEC-19)",
         ]);
       }
       panel.appendChild(kvList(rows));
@@ -446,13 +446,13 @@ function render(config: AdminConfig): void {
   if (config.systemone && config.systemone.length > 0) {
     const systemone = cfgBlock(
       "System One",
-      "config order \u00B7 only used when systemone_balance is on",
+      "config order \u00B7 weight used when systemone_balance is on",
       (panel) => {
         config.systemone?.forEach((leg) => {
           const row = el("div", "legrow");
           row.appendChild(el("span", "ord", String(leg.order)));
           row.appendChild(el("span", "nm", leg.name));
-          row.appendChild(el("span", "role", leg.enabled ? "enabled" : "disabled"));
+          row.appendChild(el("span", leg.enabled ? "role" : "role dead-text", leg.enabled ? "enabled" : "disabled"));
           row.appendChild(el("span", "wt", "weight " + leg.weight));
           const rest = el("span", "rest");
           rest.appendChild(el("b", undefined, leg.base_url));
