@@ -11,6 +11,8 @@ this one, is the answer to "what is live".
 
 ## [Unreleased]
 
+## [0.10.7] - 2026-11-26
+
 ### Fixed
 
 - `redactUrl` now redacts after the scheme prefix whenever the value carries an `@` anywhere, so the
