@@ -654,16 +654,20 @@ block:
     redactUrl("user:pw@h.test/v1") == "<redacted>"
   check "a scheme-less '//' base loses its authority",
     redactUrl("//user:pw@h.test/v1") == "//<redacted>"
-  # An '@' in a path or a query of a clean authority cannot be userinfo: the
-  # authority ended before it. Those stay, so a normal URL is never rewritten.
-  check "an '@' in the path is not userinfo",
-    redactUrl("https://h.test/v1/a@b") == "https://h.test/v1/a@b"
-  check "an '@' in the query is not userinfo",
-    redactUrl("https://h.test/v1?user=a@b") == "https://h.test/v1?user=a@b"
-  check "an '@' in a query with no path is not userinfo",
-    redactUrl("https://h.test?user=a@b") == "https://h.test?user=a@b"
-  check "a port is not mistaken for userinfo",
-    redactUrl("https://h.test:8443/v1/a@b") == "https://h.test:8443/v1/a@b"
+  # F1c closed 2026-11-26: any '@' anywhere redacts, because every shape rule
+  # that tried to tell a safe '@' from a credential got it wrong in a new way.
+  # The cost is visible here on purpose: a path or query that legitimately
+  # carries '@' now redacts too. Over-redaction is the safe direction.
+  check "an '@' in the path redacts (the F1c cost, declared)",
+    redactUrl("https://h.test/v1/a@b") == "https://<redacted>"
+  check "an '@' in the query redacts (the F1c cost, declared)",
+    redactUrl("https://h.test/v1?user=a@b") == "https://<redacted>"
+  check "an '@' in a query with no path redacts (the F1c cost, declared)",
+    redactUrl("https://h.test?user=a@b") == "https://<redacted>"
+  check "a port without an '@' is not userinfo",
+    redactUrl("https://h.test:8443/v1") == "https://h.test:8443/v1"
+  check "a port with an '@' behind it still redacts",
+    redactUrl("https://h.test:8443/v1/a@b") == "https://<redacted>"
   check "an empty port is not userinfo either",
     redactUrl("https://h.test:/v1") == "https://h.test:/v1"
   check "a bracketed IPv6 host is left intact",
@@ -688,16 +692,23 @@ block:
     redactUrl("https://user:1pa/ss@h.test/v1") == "https://<redacted>"
   check "the split password never survives",
     not redactUrl("https://user:pa/ss@h.test/v1").contains("pa/ss")
-  # F1c, still open and named in the CHANGELOG: a digit run that fills the port
-  # slot, and userinfo that follows a path, are indistinguishable from a real
-  # port and a real path, so they still print. They are pinned so a future
-  # widening of the rule has to say so out loud. Neither reaches the host named
-  # in the string: `parseUri` reads `user`/`corp` as the host and `dial()`
-  # connects there.
-  check "F1c: a digit run reaching the separator still prints",
-    redactUrl("https://user:8443/rest@h.test/v1") == "https://user:8443/rest@h.test/v1"
-  check "F1c: userinfo after a path still prints",
-    redactUrl("https://corp/user:pw@h.test/v1") == "https://corp/user:pw@h.test/v1"
+  # F1c, closed 2026-11-26: these three used to print and are the reason the rule
+  # is now "any '@' anywhere". Each one is a credential that a pass shape rule
+  # judged safe. They no longer reach the host named in the string either, because
+  # `parseUri` reads `user`/`corp` as the host and `dial()` connects there, so the
+  # leg was already broken; it is now also not printed.
+  check "F1c: a digit run filling the port slot no longer prints",
+    redactUrl("https://user:8443/rest@h.test/v1") == "https://<redacted>"
+  check "F1c: userinfo after a path no longer prints",
+    redactUrl("https://corp/user:pw@h.test/v1") == "https://<redacted>"
+  check "F1c: an empty authority carrying userinfo no longer prints",
+    redactUrl("https://////user:pw@h.test") == "https://<redacted>"
+  check "F1c: the payload of the port-slot shape is gone",
+    not redactUrl("http://user:8443/rest@SECRET7/v1").contains("SECRET7")
+  check "F1c: the payload after a path is gone",
+    not redactUrl("https://host/user:pw@h2/v1").contains("pw")
+  check "F1c: the payload behind the empty authority is gone",
+    not redactUrl("https://////user:pw@h.test").contains("h.test")
   # F1d..F1j, one rule: an empty port or a non-digit port past the cut is a
   # password, and the token behind it is never a host.
   check "F1d: an '@' after an empty port hides the authority",
