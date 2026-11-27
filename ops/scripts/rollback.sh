@@ -48,13 +48,21 @@ env_knob() { # env_knob <NAME> -> the file's value for NAME, quotes stripped, em
   [ -r "$ENV_FILE" ] || return 0
   local raw
   raw="$(sed -n -E "s/^[[:space:]]*(export[[:space:]]+)?$1=(.*)$/\2/p" "$ENV_FILE" | tail -1)"
+  raw="${raw%%[[:space:]]#*}"                # a trailing comment is not part of the value
+  raw="${raw%"${raw##*[![:space:]]}"}"       # nor is trailing whitespace
   raw="${raw#\"}"; raw="${raw%\"}"; raw="${raw#\'}"; raw="${raw%\'}"
   printf '%s\n' "$raw"
 }
+env_knob_defined() { # the file names this variable at all, even with an empty value
+  [ -r "$ENV_FILE" ] || return 1
+  [ -n "$(sed -n -E "s/^[[:space:]]*(export[[:space:]]+)?$1=.*/1/p" "$ENV_FILE" | tail -1)" ]
+}
 knob_number() { # knob_number <NAME> <default> -> a plain number for the arithmetic below
   local name="$1" default="$2" value
-  value="$(env_knob "$name")"
-  [ -n "$value" ] || value="${!name:-}"
+  # The file decides when it mentions the name, exactly as sourcing does: an empty assignment in
+  # the file leaves the deploy on the default, so it must not let a caller's value through here.
+  if env_knob_defined "$name"; then value="$(env_knob "$name")"
+  else value="${!name:-}"; fi
   case "$value" in
     '') printf '%s\n' "$default" ;;
     *[!0-9]*)

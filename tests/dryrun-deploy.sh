@@ -1035,6 +1035,35 @@ else
     && pass "lock wait (${lock_wait}s) covers two image windows plus slack (${lock_floor}s)" \
     || fail "lock wait ${lock_wait:-0}s is below the two-window floor ${lock_floor}s (${script_attempts} x ${script_interval} s)"
 fi
+# The floor is computed from the knob declaration, so the loop that actually waits has to consume
+# those same knobs, once and verbatim. A substring grep for the sleep line was beaten three ways
+# while the suite stayed green: the text parked in a comment with the real sleep doubled, the loop
+# bound widened to $((IMAGE_WAIT_ATTEMPTS * 2)), and IMAGE_WAIT_INTERVAL reassigned inside the loop
+# (Galih, 2026-11-27). Every line is anchored now and each knob is assigned once, so any change to
+# the real window has to move the declaration this floor is computed from.
+wait_sleep='^[[:space:]]+sleep "\$IMAGE_WAIT_INTERVAL"[[:space:]]*$'
+wait_bound='^[[:space:]]*\[ "\$attempt" -lt "\$IMAGE_WAIT_ATTEMPTS" \] \|\| return 1[[:space:]]*$'
+wait_step='^[[:space:]]*attempt=\$\(\(attempt \+ 1\)\)[[:space:]]*$'
+grep -qE "$wait_sleep" "$DEPLOY" \
+  && pass "the image wait loop sleeps exactly IMAGE_WAIT_INTERVAL per attempt (anchored)" \
+  || fail "no line sleeps exactly IMAGE_WAIT_INTERVAL; the lock floor no longer describes the window"
+grep -qE "$wait_bound" "$DEPLOY" \
+  && pass "the image wait loop stops at exactly IMAGE_WAIT_ATTEMPTS attempts (anchored)" \
+  || fail "the image wait loop bound no longer compares attempt against IMAGE_WAIT_ATTEMPTS verbatim"
+grep -qE "$wait_step" "$DEPLOY" \
+  && pass "the image wait loop counts one attempt per poll (anchored)" \
+  || fail "the image wait loop no longer increments attempt by one per poll"
+# A knob reassigned anywhere — including inside the loop, where a rebind of IMAGE_WAIT_INTERVAL
+# doubles the real delay while every line above still reads correct — makes the floor a lie. The
+# count is taken over the whole file, so an indented or exported second assignment is caught too.
+# The KORI_-prefixed read on the right-hand side is deliberately not matched: only a real
+# assignment to the knob itself counts.
+for knob in IMAGE_WAIT_ATTEMPTS IMAGE_WAIT_INTERVAL; do
+  knob_assignments="$(grep -cE "(^|[^A-Za-z0-9_])${knob}=" "$DEPLOY" || true)"
+  [ "$knob_assignments" = "1" ] \
+    && pass "$knob is assigned once, where the floor reads it" \
+    || fail "$knob is assigned $knob_assignments time(s); a second assignment moves the window without moving the floor"
+done
 FIRST_REV="$(cat "$APP_DIR/.deployed_rev")"
 # A second push lands while the first deploy holds the lock. Its run must deploy that commit, not
 # drop it: this is the 2026-11-18 drift (098e29b on the host, f76887a on main) reproduced.

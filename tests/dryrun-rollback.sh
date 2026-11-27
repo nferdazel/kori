@@ -253,6 +253,33 @@ printf 'this is not shell: ((\n'"'"'unterminated\n' >"$APP_DIR/env/kori-prod.env
 rc="$(run)"
 [ "$rc" = "0" ] && pass "a non-shell env file still rolls back ($rc)" \
   || fail "a non-shell env file blocked the rollback (exit $rc): $(tail -2 "$ROOT/out.txt")"
+# The deploy sources this file, so a shell-legal line must read the same on both sides: a trailing
+# comment and a trailing space both mean 120 there. A parser that kept them fell back to 3000 while
+# the deploy held 5400 s, the same one-timeout-becomes-two the scenario above closes (Galih,
+# 2026-11-27).
+for style in '120 # widened' '120 '; do
+  reset_state
+  printf 'KORI_IMAGE_WAIT_ATTEMPTS=%s\n' "$style" >"$APP_DIR/env/kori-prod.env"
+  rc="$(run)"
+  [ "$rc" = "0" ] && pass "a '$style' value still rolls back ($rc)" \
+    || fail "a '$style' value blocked the rollback (exit $rc): $(tail -2 "$ROOT/out.txt")"
+  style_wait="$(sed -n 's/^flock -w \([0-9][0-9]*\) 9$/\1/p' "$STATE/flock.log" 2>/dev/null | head -1)"
+  [ "${style_wait:-0}" = "5400" ] \
+    && pass "the rollback lock reads '$style' as the deploy does (${style_wait}s)" \
+    || fail "the rollback lock read '$style' differently from the deploy (${style_wait:-?}s, expected 5400s)"
+done
+# An empty assignment in the file shadows the caller's value for the deploy: sourcing sets the
+# variable to empty, so `${KORI_...:-60}` uses the default. A rollback that fell through to the
+# caller's exported 120 would wait 5400 s behind a 3000 s deploy.
+reset_state
+printf 'KORI_IMAGE_WAIT_ATTEMPTS=\n' >"$APP_DIR/env/kori-prod.env"
+rc="$(KORI_IMAGE_WAIT_ATTEMPTS=120 bash "$ROLLBACK" >"$ROOT/out.txt" 2>&1; echo $?)"
+[ "$rc" = "0" ] && pass "an empty file value still rolls back ($rc)" \
+  || fail "an empty file value blocked the rollback (exit $rc): $(tail -2 "$ROOT/out.txt")"
+empty_wait="$(sed -n 's/^flock -w \([0-9][0-9]*\) 9$/\1/p' "$STATE/flock.log" 2>/dev/null | head -1)"
+[ "${empty_wait:-0}" = "3000" ] \
+  && pass "an empty file value shadows the caller's env, as sourcing does (${empty_wait}s)" \
+  || fail "an empty file value let the caller's env through (${empty_wait:-?}s, expected 3000s)"
 rm -rf "$APP_DIR/env"
 
 printf '\n%s\n' "artifacts: $ROOT"

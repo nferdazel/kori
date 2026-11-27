@@ -37,6 +37,15 @@ this one, is the answer to "what is live".
   `${KORI_...:-60}` and an `export` prefix, and an unreadable tunable now fails instead of sinking
   to zero. A parse that found nothing collapsed the floor to 600 s, so a hardcoded 640 s lock
   passed with a 120-attempt window; `tests/dryrun-rollback.sh` reads its floor the same way.
+- `ops/scripts/rollback.sh` reads a knob the way the deploy's sourcing does: a trailing comment
+  (`KORI_IMAGE_WAIT_ATTEMPTS=120 # widened`) and trailing whitespace are stripped before the value
+  is validated. Keeping them made the rollback fall back to 3000 s while the deploy held 5400 s
+  for the same file, which is the same one-timeout-becomes-two this release set out to remove.
+  A name the file defines, even with an empty value, now shadows the caller's environment the way
+  sourcing does. `tests/dryrun-rollback.sh` runs all three forms against the resulting lock wait.
+- `tests/dryrun-deploy.sh` scenario 16 asserts the image wait loop sleeps `IMAGE_WAIT_INTERVAL`
+  verbatim. The floor is derived from the tunable declaration, so doubling the delay inside the
+  loop widened the real window while the floor, the lock and the suite all stayed put.
 
 ## [0.10.8] - 2026-11-27
 
