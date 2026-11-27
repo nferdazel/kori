@@ -11,6 +11,22 @@ this one, is the answer to "what is live".
 
 ## [Unreleased]
 
+### Changed
+
+- `ops/scripts/deploy-vps.sh` waits 20 minutes for the image instead of 15
+  (`KORI_IMAGE_WAIT_ATTEMPTS`, default 45 -> 60 attempts of 20 s). The 0.10.7 webhook gave up 26
+  seconds before the image existed: merge 14:44:50Z, image published 15:00:41Z, 15 min 51 s end to
+  end. Only that default changed; the fail-closed "nothing to deploy" exit and the cosign verify
+  in front of the container swap are byte-identical to 0.10.7.
+
+### Fixed
+
+- `ops/caddy/Caddyfile.kori.example` describes the live edge instead of the one it hoped for.
+  Since 2026-11-26 the zone runs a single `http_ratelimit` rule, 20 requests per 10 s keyed on
+  `ip.src` + `cf.colo.id` with a 10 s block, and `ai.qouver.com` shares that one bucket with
+  `api.qouver.com` because the plan allows a single such rule. The ceiling is 120 req/min per IP
+  per colo, not 60. Comment only: no config line and no `rate_limit` block changed.
+
 ## [0.10.7] - 2026-11-26
 
 ### Fixed
