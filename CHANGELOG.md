@@ -11,6 +11,24 @@ this one, is the answer to "what is live".
 
 ## [Unreleased]
 
+### Fixed
+
+- `ops/scripts/deploy-vps.sh` derives the deploy lock's timeout from the image wait instead of
+  keeping a separate 1800 s constant. A queued run waits for the one ahead of it, and that run can
+  now spend up to 20 minutes polling the registry (`IMAGE_WAIT_ATTEMPTS` x 20 s), so the lock
+  expired before the run it was waiting for finished and the push was dropped. The default is now
+  two windows plus ten minutes (`IMAGE_WAIT_SECONDS * 2 + 600`, 3000 s), still overridable with
+  `KORI_LOCK_WAIT_SECONDS`. The wait interval is one constant (`IMAGE_WAIT_INTERVAL`) rather than
+  a literal in the loop, and the dry-run computes the floor from the script's own defaults instead
+  of a copy of the numbers.
+- The env file is now sourced before those tunables are expanded, so `KORI_IMAGE_WAIT_ATTEMPTS`
+  set in `kori-prod.env` reaches both the wait loop and the lock; the derivation must not read
+  them from above the sourcing. `tests/dryrun-deploy.sh` scenario 16d runs a 1-attempt window from
+  the file and asserts the give-up line and the lock both used it.
+- `ops/scripts/rollback.sh` takes the same deploy lock with the same derivation (1800 s predated
+  the 20-minute window), so a manual rollback queued behind a deploy waits as long as that deploy
+  can run instead of timing out on a run that is still healthy.
+
 ## [0.10.8] - 2026-11-27
 
 ### Changed

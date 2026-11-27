@@ -22,7 +22,9 @@ SERVICE="${KORI_SERVICE:-kori-api}"
 HEALTH_URL="${KORI_HEALTH_URL:-http://127.0.0.1:8787/healthz}"
 HEALTH_GATE_SECONDS="${KORI_HEALTH_GATE_SECONDS:-60}"
 LOCK_FILE="$APP_DIR/.deploy.lock"
-LOCK_WAIT_SECONDS="${KORI_LOCK_WAIT_SECONDS:-1800}"
+# The lock bound is derived from the image window below, after the env file has been read: a
+# deploy ahead of this run may have taken its window from that file, and a bound that read only
+# the caller's environment would give up while that deploy was still inside its own limit.
 STATE_FILE="$APP_DIR/.deployed_rev"
 LOG="$APP_DIR/logs/deploy.log"
 
@@ -31,6 +33,44 @@ mkdir -p "$APP_DIR/logs"
 chmod 0600 "$LOG"
 log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" | tee -a "$LOG"; }
 die() { log "ERROR: $*"; exit 1; }
+
+# ── Host config, the same file deploy-vps.sh reads ──────────────────────────
+# Read here for the same reason deploy reads it before its lock: the three tunables below can be
+# set in this file, and an override that reaches the deploy but not this run turns one timeout
+# into two (a deploy holding 5400 s while the rollback gives up at 3000 s, Galih, 2026-11-27).
+# Only these three names are parsed, and the file is never sourced: it carries the edge token, a
+# recovery run has no use for it, and a line that is not shell must not be able to abort a
+# rollback. A missing file, a value that is not a number, or no value at all falls back to the
+# same defaults deploy uses, with the file's value winning over the caller's environment exactly
+# as it does in deploy.
+ENV_FILE="$APP_DIR/env/kori-prod.env"
+env_knob() { # env_knob <NAME> -> the file's value for NAME, quotes stripped, empty if absent
+  [ -r "$ENV_FILE" ] || return 0
+  local raw
+  raw="$(sed -n -E "s/^[[:space:]]*(export[[:space:]]+)?$1=(.*)$/\2/p" "$ENV_FILE" | tail -1)"
+  raw="${raw#\"}"; raw="${raw%\"}"; raw="${raw#\'}"; raw="${raw%\'}"
+  printf '%s\n' "$raw"
+}
+knob_number() { # knob_number <NAME> <default> -> a plain number for the arithmetic below
+  local name="$1" default="$2" value
+  value="$(env_knob "$name")"
+  [ -n "$value" ] || value="${!name:-}"
+  case "$value" in
+    '') printf '%s\n' "$default" ;;
+    *[!0-9]*)
+      printf 'WARN: %s=%s in %s is not a number; using %s\n' "$name" "$value" "$ENV_FILE" "$default" >&2
+      printf '%s\n' "$default" ;;
+    *) printf '%s\n' "$value" ;;
+  esac
+}
+# The same lock deploy-vps.sh takes, so the same bound: a deploy ahead of this one can spend its
+# whole image window (KORI_IMAGE_WAIT_ATTEMPTS x KORI_IMAGE_WAIT_INTERVAL, 20 min by default)
+# waiting for a tag, and one more can be queued behind it. The flat 1800 s predates the widened
+# window (Galih, 2026-11-27), so it is derived from the same two knobs and the same formula.
+WAIT_ATTEMPTS="$(knob_number KORI_IMAGE_WAIT_ATTEMPTS 60)"
+WAIT_INTERVAL="$(knob_number KORI_IMAGE_WAIT_INTERVAL 20)"
+IMAGE_WAIT_SECONDS=$(( WAIT_ATTEMPTS * WAIT_INTERVAL ))
+LOCK_WAIT_SECONDS="$(knob_number KORI_LOCK_WAIT_SECONDS $((IMAGE_WAIT_SECONDS * 2 + 600)))"
 
 command -v flock >/dev/null 2>&1 \
   || die "flock missing; refusing to roll back without the deploy's concurrency lock"

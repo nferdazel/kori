@@ -1008,6 +1008,33 @@ rc="$(run refs/heads/main)"
 grep -qE '^flock -w [0-9]+ 9$' "$STATE/flock_calls.log" 2>/dev/null \
   && pass "lock taken with -w (waits), not -n (skips)" \
   || fail "lock not taken with a bounded wait: $(cat "$STATE/flock_calls.log" 2>/dev/null)"
+# The wait has to outlast the runs queued ahead of this one, and the longest those can take is
+# spent polling the registry for an image CI has not published yet. Two such windows plus slack
+# is the floor, and it is computed from the script's own defaults: a hardcoded number here passed
+# while a raised window and an unchanged lock were still wrong together (Galih, 2026-11-27).
+lock_wait="$(sed -n 's/^flock -w \([0-9][0-9]*\) 9$/\1/p' "$STATE/flock_calls.log" 2>/dev/null | head -1)"
+# The numeric default of a tunable as the script writes it, covering `export NAME=`, a bare
+# `NAME=60` and the `${KORI_NAME:-60}` form the script actually uses. A parse that finds nothing
+# must not degrade to 0: the floor then collapsed to 600 and a hardcoded 640 s lock passed while
+# the window was 120 (Galih, 2026-11-27). An unreadable tunable is a FAIL here, never a zero.
+script_default() { # script_default <NAME>
+  local raw
+  raw="$(sed -n -E "s/^(export[[:space:]]+)?$1=//p" "$DEPLOY" | head -1)"
+  case "$raw" in
+    *':-'*) raw="${raw#*:-}"; raw="${raw%%\}*}" ;;
+  esac
+  printf '%s\n' "$raw" | tr -cd '0-9'
+}
+script_attempts="$(script_default IMAGE_WAIT_ATTEMPTS)"
+script_interval="$(script_default IMAGE_WAIT_INTERVAL)"
+if [ -z "$script_attempts" ] || [ -z "$script_interval" ]; then
+  fail "could not read IMAGE_WAIT_ATTEMPTS/IMAGE_WAIT_INTERVAL from $DEPLOY (attempts='${script_attempts}', interval='${script_interval}'); the lock floor was not computed"
+else
+  lock_floor=$(( script_attempts * script_interval * 2 + 600 ))
+  [ "${lock_wait:-0}" -ge "$lock_floor" ] \
+    && pass "lock wait (${lock_wait}s) covers two image windows plus slack (${lock_floor}s)" \
+    || fail "lock wait ${lock_wait:-0}s is below the two-window floor ${lock_floor}s (${script_attempts} x ${script_interval} s)"
+fi
 FIRST_REV="$(cat "$APP_DIR/.deployed_rev")"
 # A second push lands while the first deploy holds the lock. Its run must deploy that commit, not
 # drop it: this is the 2026-11-18 drift (098e29b on the host, f76887a on main) reproduced.
@@ -1060,6 +1087,33 @@ grep -q 'refusing to take a lock someone else controls' "$APP_DIR/logs/deploy.lo
 grep -q '^podman pull' "$STATE/calls.log" && fail "pulled with an untrusted lock" \
   || pass "nothing was pulled with an untrusted lock"
 rm -f "$APP_DIR/.deploy.lock"
+
+# ── scenario 16d: the env file's window override is honoured, not shadowed ──
+# 0.10.9 read IMAGE_WAIT_ATTEMPTS above the `. "$ENV_FILE"` sourcing, so a value documented as
+# tunable in kori-prod.env was silently ignored while the same knob in the caller's environment
+# still worked (Galih, 2026-11-27). The attempt count is in the give-up line, so it says which one
+# the script actually used: 1 here is the env file's value, 60 would be the default.
+reset_state
+printf 'local\n' >"$STATE/tags"
+happy_image
+export FAKE_PULL=late FAKE_PULL_LATE=99 FAKE_CURL=ok
+printf 'KORI_EDGE_TOKEN=dryrun-token\nKORI_IMAGE_WAIT_ATTEMPTS=1\n' >"$APP_DIR/env/kori-prod.env"
+rc="$(run refs/heads/main)"
+[ "$rc" = "0" ] && pass "env-file window override run exits 0 ($rc)" || fail "env-file window override exited $rc: $(tail -3 "$ROOT/out.txt")"
+grep -q 'no image for .* after 1 attempts' "$APP_DIR/logs/deploy.log" \
+  && pass "kori-prod.env's KORI_IMAGE_WAIT_ATTEMPTS reached the wait loop" \
+  || fail "env-file window override ignored: $(grep -o 'after [0-9]* attempts' "$APP_DIR/logs/deploy.log" | tail -1)"
+rb_lock="$(sed -n 's/^flock -w \([0-9][0-9]*\) 9$/\1/p' "$STATE/flock_calls.log" 2>/dev/null | head -1)"
+if [ -z "$script_interval" ]; then
+  fail "IMAGE_WAIT_INTERVAL unreadable from $DEPLOY; the expected lock for a 1-attempt window cannot be computed"
+else
+  expected_lock=$(( 1 * script_interval * 2 + 600 ))
+  [ "${rb_lock:-0}" = "$expected_lock" ] \
+    && pass "the lock timeout follows the overridden window (${rb_lock}s = ${expected_lock}s), not the default" \
+    || fail "lock timeout ${rb_lock:-0}s did not follow the overridden window (expected ${expected_lock}s)"
+fi
+unset FAKE_PULL FAKE_PULL_LATE
+printf 'KORI_EDGE_TOKEN=dryrun-token\n' >"$APP_DIR/env/kori-prod.env"
 
 # ── scenario 17: the self-update re-exec keeps the lock, does not re-take it ─
 # The script copies itself and re-execs when the repo copy differs. That exec must inherit the
