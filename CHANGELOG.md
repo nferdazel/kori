@@ -11,6 +11,8 @@ this one, is the answer to "what is live".
 
 ## [Unreleased]
 
+## [0.10.8] - 2026-11-27
+
 ### Changed
 
 - `ops/scripts/deploy-vps.sh` waits 20 minutes for the image instead of 15

@@ -1,4 +1,4 @@
-version     = "0.10.7"
+version     = "0.10.8"
 author      = "Team C"
 description = "kori — in-house LLM provider gateway"
 license     = "MIT"
