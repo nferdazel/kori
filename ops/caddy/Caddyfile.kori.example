@@ -72,11 +72,17 @@ ai.qouver.com {
 	# Rate limit per real client IP. Needs the caddy-ratelimit module, which is NOT in a stock
 	# Caddy build: qouver1 runs the RPM binary (v2.11.9, 138 modules, no ratelimit), so this block
 	# stays commented until that binary is replaced, and that swap is a shared-edge window.
-	# Measured 2026-11-26: 620 requests from one IP, all wrong-bearer, returned 401 and not one 429,
-	# and no Cloudflare rule existed either. So the edge currently has no per-IP limit: the bearer
-	# is the only gate. Interim decision (Bagas, 2026-11-26) is a Cloudflare rate-limiting rule,
-	# 60/min per IP on ai.qouver.com, which needs no host change; the module build is the
-	# belt-and-braces path after that.
+	# What actually limits a client today is Cloudflare, not this block. Since 2026-11-26 the zone
+	# runs one http_ratelimit rule (ref 84620b894b214a4ba5dceaf11a1b65f7, ruleset
+	# c6d8613663094277b18297576f232c47 v2): 20 requests per 10 s, keyed on ip.src + cf.colo.id,
+	# mitigation block 10 s with body "error code 1015". Measured from the host: a 60-request burst
+	# from one IP came back 42 x 401 and 18 x 429, the 429s carrying cf-ray and retry-after: 10.
+	# The ceiling is 120 req/min per IP per colo, not 60.
+	# Two caveats a reader needs. The host condition includes ai.qouver.com, and the zone plan
+	# allows exactly one http_ratelimit rule (400 code 50001), so kori has no bucket of its own:
+	# it shares one with api.qouver.com /hooks and /api, and a burst against either spends the
+	# other's slots. With the busiest client already at 14 of the 20 slots, headroom is 1.4x, not
+	# the 2x+ a dedicated rule would give. The module build below stays the belt-and-braces path.
 	# rate_limit {
 	# 	zone kori_ip {
 	# 		key {client_ip}
