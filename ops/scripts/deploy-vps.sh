@@ -414,8 +414,10 @@ fi
 # before that. A tag that is not in the registry yet is therefore waited for, not read as "this
 # commit built none": the single attempt used to keep the previous revision for good whenever
 # the gate was slower than the webhook. Anything other than a missing tag (auth, network, 5xx)
-# still fails at once. 45 x 20s = 15 min covers gate + queue + build on a busy runner.
-IMAGE_WAIT_ATTEMPTS="${KORI_IMAGE_WAIT_ATTEMPTS:-45}"
+# still fails at once. 60 x 20s = 20 min covers gate + queue + one cold Nim build: the 0.10.7
+# main run took 15 min 51 s from merge to image published, and the 15 min window gave up 26 s
+# short of it (2026-11-26). Overridable, as before.
+IMAGE_WAIT_ATTEMPTS="${KORI_IMAGE_WAIT_ATTEMPTS:-60}"
 
 # 0 = pulled, 1 = still absent after the window, 2 = a real pull error
 pull_when_published() {
