@@ -11,6 +11,8 @@ this one, is the answer to "what is live".
 
 ## [Unreleased]
 
+## [0.10.9] - 2026-11-27
+
 ### Fixed
 
 - `ops/scripts/deploy-vps.sh` derives the deploy lock's timeout from the image wait instead of
@@ -27,7 +29,14 @@ this one, is the answer to "what is live".
   the file and asserts the give-up line and the lock both used it.
 - `ops/scripts/rollback.sh` takes the same deploy lock with the same derivation (1800 s predated
   the 20-minute window), so a manual rollback queued behind a deploy waits as long as that deploy
-  can run instead of timing out on a run that is still healthy.
+  can run instead of timing out on a run that is still healthy. It reads the same three knobs from
+  `kori-prod.env`, by parsing the names rather than sourcing the file: a window raised in that file
+  reaches both scripts, and a recovery run still starts when the file holds a line that is not
+  shell. A value that is not a number warns and falls back to the default.
+- The dry run's lock floor is computed from the tunables as the script writes them, including
+  `${KORI_...:-60}` and an `export` prefix, and an unreadable tunable now fails instead of sinking
+  to zero. A parse that found nothing collapsed the floor to 600 s, so a hardcoded 640 s lock
+  passed with a 120-attempt window; `tests/dryrun-rollback.sh` reads its floor the same way.
 
 ## [0.10.8] - 2026-11-27
 
