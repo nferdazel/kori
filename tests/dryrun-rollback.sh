@@ -150,6 +150,21 @@ grep -q 'a line from a previous deploy' "$APP_DIR/logs/deploy.log" \
 grep -qE '^flock -w ' "$STATE/flock.log" 2>/dev/null \
   && pass "rollback takes the deploy lock with a wait" \
   || fail "rollback did not take the deploy lock with -w: $(cat "$STATE/flock.log" 2>/dev/null)"
+# The bound has to match deploy-vps.sh, not a leftover constant: a manual rollback waits behind
+# the same deploy, and that deploy can spend its whole image window plus the run queued before it.
+# The floor is read from the script's own defaults so raising the window without raising the lock
+# fails here too, instead of a copied number passing while the two drift (Galih, 2026-11-27).
+rb_wait="$(sed -n 's/^flock -w \([0-9][0-9]*\) 9$/\1/p' "$STATE/flock.log" 2>/dev/null | head -1)"
+rb_attempts="$(sed -n 's/.*knob_number KORI_IMAGE_WAIT_ATTEMPTS \([0-9][0-9]*\).*/\1/p' "$ROLLBACK" | head -1)"
+rb_interval="$(sed -n 's/.*knob_number KORI_IMAGE_WAIT_INTERVAL \([0-9][0-9]*\).*/\1/p' "$ROLLBACK" | head -1)"
+if [ -z "$rb_attempts" ] || [ -z "$rb_interval" ]; then
+  fail "could not read KORI_IMAGE_WAIT_ATTEMPTS/KORI_IMAGE_WAIT_INTERVAL from $ROLLBACK (attempts='${rb_attempts}', interval='${rb_interval}')"
+else
+  rb_floor=$(( rb_attempts * rb_interval * 2 + 600 ))
+  [ "${rb_wait:-0}" -ge "$rb_floor" ] \
+    && pass "rollback lock wait (${rb_wait}s) covers two image windows (${rb_floor}s)" \
+    || fail "rollback lock wait ${rb_wait:-0}s is below the two-window floor (${rb_floor}s)"
+fi
 grep -qE 'flock -n' "$STATE/flock.log" 2>/dev/null \
   && fail "rollback uses the non-blocking lock, so a push mid-deploy is dropped" \
   || pass "rollback does not use the non-blocking lock"
@@ -207,6 +222,65 @@ rc="$(run)"
   && pass "a non-sha label is not written to the state file" \
   || fail "a non-sha label reached the state file: $(cat "$APP_DIR/.deployed_rev")"
 unset FAKE_REV
+
+# ── scenario 11: the env file's window reaches the rollback lock too ────────
+# deploy-vps.sh reads kori-prod.env before deriving its lock bound, so a window raised only in
+# that file gives the deploy 5400 s and, before this scenario existed, left the rollback at 3000 s
+# (Galih, 2026-11-27): one timeout for the same lock, and the recovery run gives up while the
+# deploy it waits behind is still inside its own limit.
+reset_state
+mkdir -p "$APP_DIR/env"
+printf 'KORI_EDGE_TOKEN=dryrun-token\nKORI_IMAGE_WAIT_ATTEMPTS=120\n' >"$APP_DIR/env/kori-prod.env"
+rc="$(run)"
+[ "$rc" = "0" ] && pass "rollback with an env-file window exits 0 ($rc)" || fail "env-file window run exited $rc: $(cat "$ROOT/out.txt")"
+env_wait="$(sed -n 's/^flock -w \([0-9][0-9]*\) 9$/\1/p' "$STATE/flock.log" 2>/dev/null | head -1)"
+[ "${env_wait:-0}" = "5400" ] \
+  && pass "the rollback lock follows the env file's window (${env_wait}s)" \
+  || fail "the rollback lock ignored the env file's window (${env_wait:-?}s, expected 5400s)"
+# A value that is not a number must warn and fall back, not block the recovery path or turn into
+# an arithmetic error before the lock is even taken.
+reset_state
+printf 'KORI_IMAGE_WAIT_ATTEMPTS=soon\n' >"$APP_DIR/env/kori-prod.env"
+rc="$(run)"
+[ "$rc" = "0" ] && pass "an unparsable value still rolls back ($rc)" \
+  || fail "an unparsable value blocked the rollback (exit $rc): $(tail -2 "$ROOT/out.txt")"
+grep -q 'is not a number; using 60' "$ROOT/out.txt" \
+  && pass "the unusable value is named with the default used" \
+  || fail "the unusable value is not named: $(tail -3 "$ROOT/out.txt")"
+# A file that is not shell at all must not abort the run either: it is parsed for three names,
+# never sourced.
+printf 'this is not shell: ((\n'"'"'unterminated\n' >"$APP_DIR/env/kori-prod.env"
+rc="$(run)"
+[ "$rc" = "0" ] && pass "a non-shell env file still rolls back ($rc)" \
+  || fail "a non-shell env file blocked the rollback (exit $rc): $(tail -2 "$ROOT/out.txt")"
+# The deploy sources this file, so a shell-legal line must read the same on both sides: a trailing
+# comment and a trailing space both mean 120 there. A parser that kept them fell back to 3000 while
+# the deploy held 5400 s, the same one-timeout-becomes-two the scenario above closes (Galih,
+# 2026-11-27).
+for style in '120 # widened' '120 '; do
+  reset_state
+  printf 'KORI_IMAGE_WAIT_ATTEMPTS=%s\n' "$style" >"$APP_DIR/env/kori-prod.env"
+  rc="$(run)"
+  [ "$rc" = "0" ] && pass "a '$style' value still rolls back ($rc)" \
+    || fail "a '$style' value blocked the rollback (exit $rc): $(tail -2 "$ROOT/out.txt")"
+  style_wait="$(sed -n 's/^flock -w \([0-9][0-9]*\) 9$/\1/p' "$STATE/flock.log" 2>/dev/null | head -1)"
+  [ "${style_wait:-0}" = "5400" ] \
+    && pass "the rollback lock reads '$style' as the deploy does (${style_wait}s)" \
+    || fail "the rollback lock read '$style' differently from the deploy (${style_wait:-?}s, expected 5400s)"
+done
+# An empty assignment in the file shadows the caller's value for the deploy: sourcing sets the
+# variable to empty, so `${KORI_...:-60}` uses the default. A rollback that fell through to the
+# caller's exported 120 would wait 5400 s behind a 3000 s deploy.
+reset_state
+printf 'KORI_IMAGE_WAIT_ATTEMPTS=\n' >"$APP_DIR/env/kori-prod.env"
+rc="$(KORI_IMAGE_WAIT_ATTEMPTS=120 bash "$ROLLBACK" >"$ROOT/out.txt" 2>&1; echo $?)"
+[ "$rc" = "0" ] && pass "an empty file value still rolls back ($rc)" \
+  || fail "an empty file value blocked the rollback (exit $rc): $(tail -2 "$ROOT/out.txt")"
+empty_wait="$(sed -n 's/^flock -w \([0-9][0-9]*\) 9$/\1/p' "$STATE/flock.log" 2>/dev/null | head -1)"
+[ "${empty_wait:-0}" = "3000" ] \
+  && pass "an empty file value shadows the caller's env, as sourcing does (${empty_wait}s)" \
+  || fail "an empty file value let the caller's env through (${empty_wait:-?}s, expected 3000s)"
+rm -rf "$APP_DIR/env"
 
 printf '\n%s\n' "artifacts: $ROOT"
 if [ "$FAILS" -eq 0 ]; then

@@ -11,6 +11,42 @@ this one, is the answer to "what is live".
 
 ## [Unreleased]
 
+## [0.10.9] - 2026-11-27
+
+### Fixed
+
+- `ops/scripts/deploy-vps.sh` derives the deploy lock's timeout from the image wait instead of
+  keeping a separate 1800 s constant. A queued run waits for the one ahead of it, and that run can
+  now spend up to 20 minutes polling the registry (`IMAGE_WAIT_ATTEMPTS` x 20 s), so the lock
+  expired before the run it was waiting for finished and the push was dropped. The default is now
+  two windows plus ten minutes (`IMAGE_WAIT_SECONDS * 2 + 600`, 3000 s), still overridable with
+  `KORI_LOCK_WAIT_SECONDS`. The wait interval is one constant (`IMAGE_WAIT_INTERVAL`) rather than
+  a literal in the loop, and the dry-run computes the floor from the script's own defaults instead
+  of a copy of the numbers.
+- The env file is now sourced before those tunables are expanded, so `KORI_IMAGE_WAIT_ATTEMPTS`
+  set in `kori-prod.env` reaches both the wait loop and the lock; the derivation must not read
+  them from above the sourcing. `tests/dryrun-deploy.sh` scenario 16d runs a 1-attempt window from
+  the file and asserts the give-up line and the lock both used it.
+- `ops/scripts/rollback.sh` takes the same deploy lock with the same derivation (1800 s predated
+  the 20-minute window), so a manual rollback queued behind a deploy waits as long as that deploy
+  can run instead of timing out on a run that is still healthy. It reads the same three knobs from
+  `kori-prod.env`, by parsing the names rather than sourcing the file: a window raised in that file
+  reaches both scripts, and a recovery run still starts when the file holds a line that is not
+  shell. A value that is not a number warns and falls back to the default.
+- The dry run's lock floor is computed from the tunables as the script writes them, including
+  `${KORI_...:-60}` and an `export` prefix, and an unreadable tunable now fails instead of sinking
+  to zero. A parse that found nothing collapsed the floor to 600 s, so a hardcoded 640 s lock
+  passed with a 120-attempt window; `tests/dryrun-rollback.sh` reads its floor the same way.
+- `ops/scripts/rollback.sh` reads a knob the way the deploy's sourcing does: a trailing comment
+  (`KORI_IMAGE_WAIT_ATTEMPTS=120 # widened`) and trailing whitespace are stripped before the value
+  is validated. Keeping them made the rollback fall back to 3000 s while the deploy held 5400 s
+  for the same file, which is the same one-timeout-becomes-two this release set out to remove.
+  A name the file defines, even with an empty value, now shadows the caller's environment the way
+  sourcing does. `tests/dryrun-rollback.sh` runs all three forms against the resulting lock wait.
+- `tests/dryrun-deploy.sh` scenario 16 asserts the image wait loop sleeps `IMAGE_WAIT_INTERVAL`
+  verbatim. The floor is derived from the tunable declaration, so doubling the delay inside the
+  loop widened the real window while the floor, the lock and the suite all stayed put.
+
 ## [0.10.8] - 2026-11-27
 
 ### Changed

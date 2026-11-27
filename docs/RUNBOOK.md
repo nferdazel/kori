@@ -162,7 +162,8 @@ normal deploy:
 This name is still down to the second only, with no pid. It is a **known pattern, not a bug to fix
 in this release**:
 
-- `flock` serialises deploys (`ops/scripts/deploy-vps.sh:116`), so two deploys cannot overlap;
+- `flock` serialises deploys (`ops/scripts/deploy-vps.sh`, the `flock -w "$LOCK_WAIT_SECONDS" 9`
+  block), so two deploys cannot overlap;
 - a single run is far longer than one second, so two runs cannot share a timestamp even back to
   back.
 

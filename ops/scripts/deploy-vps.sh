@@ -85,6 +85,32 @@ install -d -m 0700 "$APP_DIR/etc"
 log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" | tee -a "$LOG"; }
 die() { log "ERROR: $*"; exit 1; }
 
+# ── 1b. Host config, read before anything derived from it ───────────────────
+# Sourced here rather than after the lock, because the deploy tunables below (the image window
+# and the lock timeout derived from it) may be set in this file, and an override has to reach the
+# expansion that uses it. The file is 0600 and read by the deploy user; reading it creates
+# nothing. A missing file still fails before any git or container state is touched.
+[ -f "$ENV_FILE" ] || die "env file missing: $ENV_FILE (mode 600, holds the edge token and nothing else)"
+# `set -a` so the values reach the child processes this script starts. A sourced file otherwise
+# leaves plain shell variables, and smoke.sh would then run with KORI_EDGE_URL set but no token —
+# the one combination it treats as a failed edge rather than a skipped one.
+set -a
+# shellcheck disable=SC1090
+. "$ENV_FILE"
+set +a
+
+# CI publishes the sha tag only after the gate job is green, and the webhook reaches this host
+# before that. A tag that is not in the registry yet is therefore waited for, not read as "this
+# commit built none": the single attempt used to keep the previous revision for good whenever
+# the gate was slower than the webhook. Anything other than a missing tag (auth, network, 5xx)
+# still fails at once. 60 x 20 s = 20 min covers gate + queue + one cold Nim build: the 0.10.7
+# main run took 15 min 51 s from merge to image published, and the 15 min window gave up 26 s
+# short of it (2026-11-26). Overridable from the environment and from kori-prod.env above;
+# tests/dryrun-deploy.sh scenario 16d holds both.
+IMAGE_WAIT_ATTEMPTS="${KORI_IMAGE_WAIT_ATTEMPTS:-60}"
+IMAGE_WAIT_INTERVAL="${KORI_IMAGE_WAIT_INTERVAL:-20}"
+IMAGE_WAIT_SECONDS=$((IMAGE_WAIT_ATTEMPTS * IMAGE_WAIT_INTERVAL))
+
 # ── 2. Concurrency lock ──────────────────────────────────────────────────────
 # Waits, it does not skip. With `-n` a push that landed while another deploy was pulling was
 # dropped and never retried by the webhook, so main and the running revision drifted apart
@@ -97,7 +123,7 @@ die() { log "ERROR: $*"; exit 1; }
 # deploy user, which is where sds and qouver already keep theirs. The fd, the wait and the queue
 # behaviour are unchanged; only the path moved. preflight.sh reads the same path.
 LOCK_FILE="$APP_DIR/.deploy.lock"
-LOCK_WAIT_SECONDS="${KORI_LOCK_WAIT_SECONDS:-1800}"
+LOCK_WAIT_SECONDS="${KORI_LOCK_WAIT_SECONDS:-$((IMAGE_WAIT_SECONDS * 2 + 600))}"
 # The self-update below re-execs this same process. `exec 9>...` in the re-executed script would
 # replace the open file description and release the lock for a moment; a queued run could take it
 # and this one would then wait its whole timeout for nothing. The marker is set only after the
@@ -120,15 +146,6 @@ if [ -z "${KORI_LOCK_HELD:-}" ] || [ ! -e /dev/fd/9 ]; then
   KORI_LOCK_HELD=1
   export KORI_LOCK_HELD
 fi
-
-[ -f "$ENV_FILE" ] || die "env file missing: $ENV_FILE (mode 600, holds the edge token and nothing else)"
-# `set -a` so the values reach the child processes this script starts. A sourced file otherwise
-# leaves plain shell variables, and smoke.sh would then run with KORI_EDGE_URL set but no token —
-# the one combination it treats as a failed edge rather than a skipped one.
-set -a
-# shellcheck disable=SC1090
-. "$ENV_FILE"
-set +a
 
 MONO_DIR="$APP_DIR/src"
 [ -d "$MONO_DIR/.git" ] || die "checkout missing: $MONO_DIR (clone $REPO there once, by hand)"
@@ -410,14 +427,9 @@ if [ "${KORI_FORCE_DEPLOY:-0}" != "1" ] && [ -n "$PREV_DEPLOYED" ] && [ "$PREV_D
   exit 0
 fi
 
-# CI publishes this tag only after the gate job is green, and the webhook reaches this host
-# before that. A tag that is not in the registry yet is therefore waited for, not read as "this
-# commit built none": the single attempt used to keep the previous revision for good whenever
-# the gate was slower than the webhook. Anything other than a missing tag (auth, network, 5xx)
-# still fails at once. 60 x 20s = 20 min covers gate + queue + one cold Nim build: the 0.10.7
-# main run took 15 min 51 s from merge to image published, and the 15 min window gave up 26 s
-# short of it (2026-11-26). Overridable, as before.
-IMAGE_WAIT_ATTEMPTS="${KORI_IMAGE_WAIT_ATTEMPTS:-60}"
+# The wait window (IMAGE_WAIT_ATTEMPTS above, defined with the other tunables because the lock
+# timeout is derived from it) is what makes a tag that CI has not published yet a wait and not a
+# "this commit built none". A missing tag is retried; anything else fails at once.
 
 # 0 = pulled, 1 = still absent after the window, 2 = a real pull error
 pull_when_published() {
@@ -430,7 +442,7 @@ pull_when_published() {
     [ "$attempt" -lt "$IMAGE_WAIT_ATTEMPTS" ] || return 1
     log "==> $ref not in the registry yet (gate or image job still running), attempt $attempt of $IMAGE_WAIT_ATTEMPTS"
     attempt=$((attempt + 1))
-    sleep 20
+    sleep "$IMAGE_WAIT_INTERVAL"
   done
 }
 
